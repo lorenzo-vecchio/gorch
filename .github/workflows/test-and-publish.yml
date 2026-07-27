@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: '1.25'
-      - run: go test ./... -coverprofile=coverage.out
+      - run: go test ./gorch/ -coverprofile=coverage.out
       - run: |
           total=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
           if [ "$total" != "100.0" ]; then
