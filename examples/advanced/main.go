@@ -144,7 +144,7 @@ func main() {
 
 	// Orchestrator with hooks. Health checks run every 2s (demo pace).
 	orch := gorch.New(gorch.Config{
-		LogLevel:          gorch.LogLevelDebug,
+		LogLevel:        gorch.LogLevelDebug,
 		HealthInterval:  2 * time.Second,
 		HealthTimeout:   1 * time.Second,
 		HealthThreshold: 2,
@@ -180,7 +180,7 @@ func main() {
 	orch.Register(&ConfigLoader{config: cfg},
 		gorch.WithName("config-loader"),
 		gorch.WithGroup("infra"),
-		gorch.WithRunOnce(),                    // one-shot init: runs before persistent services
+		gorch.WithRunOnce(),                   // one-shot init: runs before persistent services
 		gorch.WithStartTimeout(2*time.Second), // guard against stuck init
 	)
 
