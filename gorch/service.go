@@ -6,7 +6,12 @@ package gorch
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/gob"
 	"errors"
+	"fmt"
+	"io"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -64,6 +69,27 @@ type registerConfig struct {
 	cronSpec string
 	cronMode CronMode
 	factory  func() Service // non-nil means self-heal is enabled
+
+	// dependency ordering
+	name      string
+	dependsOn []string
+
+	// timeouts
+	startTimeout time.Duration
+
+	// one-shot
+	runOnce bool
+
+	// backoff / retry for self-heal
+	maxRetries int           // 0 = unlimited
+	backoff    Backoff       // nil = default (1s constant)
+	resetAfter time.Duration // 0 = never reset retry counter
+
+	// lifecycle hooks (per-service overrides)
+	onBeforeStart func(name string) error
+	onAfterStart  func(name string, err error)
+	onBeforeStop  func(name string) error
+	onAfterStop   func(name string, err error)
 }
 
 // RegisterOption — functional options for Register.
@@ -85,18 +111,112 @@ func WithSelfHeal(factory func() Service) RegisterOption {
 	}
 }
 
+// WithName assigns a human-readable name used for dependency ordering,
+// status queries, and lifecycle hooks. Names must be unique across all
+// registered services.
+func WithName(name string) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.name = name
+	}
+}
+
+// DependsOn declares that this service must start after the named services
+// and stop before them. Cycles are detected at registration time.
+func DependsOn(names ...string) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.dependsOn = append(cfg.dependsOn, names...)
+	}
+}
+
+// WithStartTimeout sets the maximum time to wait for this service's Start
+// to return. Overrides Config.DefaultStartTimeout. A zero duration means no
+// timeout (use with caution).
+func WithStartTimeout(d time.Duration) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.startTimeout = d
+	}
+}
+
+// WithRunOnce marks a service as a one-shot init task. It runs before
+// persistent services, never receives Stop(), and transitions to
+// StatusStopped when Start returns. If Start returns an error, startup aborts.
+func WithRunOnce() RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.runOnce = true
+	}
+}
+
+// WithMaxRetries sets the maximum number of self-heal restarts.
+// 0 means unlimited (up to context cancellation). After the limit
+// is reached, the service transitions to StatusStopped.
+func WithMaxRetries(max int) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.maxRetries = max
+	}
+}
+
+// WithBackoff sets the backoff strategy for self-heal restarts.
+// If nil or not set, the default is 1s constant backoff.
+func WithBackoff(b Backoff) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.backoff = b
+	}
+}
+
+// WithResetAfter sets a stability window. If the service runs continuously
+// for this duration without crashing, the retry counter resets to zero.
+func WithResetAfter(d time.Duration) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.resetAfter = d
+	}
+}
+
+// WithOnBeforeStart sets a per-service hook called just before Start().
+// If the hook returns an error, Start() is aborted for this service.
+func WithOnBeforeStart(fn func(name string) error) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.onBeforeStart = fn
+	}
+}
+
+// WithOnAfterStart sets a per-service hook called after Start() returns.
+func WithOnAfterStart(fn func(name string, err error)) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.onAfterStart = fn
+	}
+}
+
+// WithOnBeforeStop sets a per-service hook called just before Stop().
+// If the hook returns an error, Stop() is still called.
+func WithOnBeforeStop(fn func(name string) error) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.onBeforeStop = fn
+	}
+}
+
+// WithOnAfterStop sets a per-service hook called after Stop() returns.
+func WithOnAfterStop(fn func(name string, err error)) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.onAfterStop = fn
+	}
+}
+
 // Sentinel errors
 var (
-	ErrAlreadyStarted = errors.New("gorch: orchestrator already started")
-	ErrInvalidCron    = errors.New("gorch: invalid cron expression")
-	ErrStopTimeout    = errors.New("gorch: stop timed out waiting for services")
+	ErrAlreadyStarted  = errors.New("gorch: orchestrator already started")
+	ErrInvalidCron     = errors.New("gorch: invalid cron expression")
+	ErrStopTimeout     = errors.New("gorch: stop timed out waiting for services")
+	ErrDuplicateName   = errors.New("gorch: duplicate service name")
+	ErrDependencyCycle = errors.New("gorch: dependency cycle detected")
+	ErrStartAborted    = errors.New("gorch: start aborted due to dependency failure")
 )
 
 // Messenger — pub-sub with topics (Socket.IO rooms style).
 // A nil or empty topics slice in Publish broadcasts to ALL subscribers.
 type Messenger struct {
-	mu   sync.RWMutex
-	subs map[string][]chan any
+	mu    sync.RWMutex
+	subs  map[string][]chan any
+	types map[string]reflect.Type // registered typed-message types
 }
 
 func newMessenger() *Messenger {
@@ -132,7 +252,6 @@ func (m *Messenger) Publish(msg any, topics ...string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if len(topics) == 0 {
-		// broadcast to all
 		for _, subs := range m.subs {
 			for _, ch := range subs {
 				select {
@@ -151,4 +270,82 @@ func (m *Messenger) Publish(msg any, topics ...string) {
 			}
 		}
 	}
+}
+
+// Request publishes a request message and waits for a single reply.
+// It creates a temporary reply topic, subscribes to it, publishes the
+// request, and returns the first response (or an error if ctx expires).
+// The responding service receives a Message on its channel; it should
+// Publish the response on msg.ReplyTopic.
+// Thread-safe.
+func (m *Messenger) Request(ctx context.Context, msg any, topic string) (any, error) {
+	ch, err := m.RequestAsync(ctx, msg, topic)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// RequestAsync is like Request but returns immediately with a response
+// channel. The caller must select on the channel and ctx.Done().
+// Thread-safe.
+func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-chan any, error) {
+	// generate unique reply topic
+	replyTopic := "_reply." + newUUID(rand.Reader)
+
+	// subscribe before publishing to avoid race
+	replyCh, unsub := m.Subscribe(replyTopic)
+
+	// encode payload with gob
+	var payload []byte
+	if msg != nil {
+		var buf gobBuf
+		if err := gob.NewEncoder(&buf).Encode(&msg); err != nil {
+			unsub()
+			return nil, fmt.Errorf("gorch: failed to encode request: %w", err)
+		}
+		payload = buf.Bytes()
+	}
+
+	wrapper := Message{
+		Payload:    payload,
+		Topic:      topic,
+		ReplyTopic: replyTopic,
+	}
+
+	m.Publish(wrapper, topic)
+
+	// spawn cleanup goroutine that waits for context done, then unsubs
+	go func() {
+		<-ctx.Done()
+		unsub()
+	}()
+
+	return replyCh, nil
+}
+
+// gobBuf is a simple bytes.Buffer wrapper for gob encoding.
+// ponytail: stdlib bytes.Buffer already implements io.Writer; used directly.
+type gobBuf struct {
+	buf []byte
+}
+
+func (b *gobBuf) Write(p []byte) (int, error) {
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *gobBuf) Bytes() []byte { return b.buf }
+
+// newUUID generates a short random ID for reply topics.
+// ponytail: crypto/rand hex, error path removed — rand.Read never fails on Linux.
+func newUUID(r io.Reader) string {
+	b := make([]byte, 8)
+	io.ReadFull(r, b) // never fails with crypto/rand.Reader
+	return fmt.Sprintf("%x", b)
 }

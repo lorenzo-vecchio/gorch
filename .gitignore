@@ -3,5 +3,5 @@ basic
 pubsub
 
 # Coverage
-coverage.out
-coverage.html
+coverage*.out
+coverage*.html

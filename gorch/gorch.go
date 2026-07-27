@@ -2,9 +2,12 @@ package gorch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"reflect"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +43,25 @@ func (l LogLevel) String() string {
 // Config holds orchestrator configuration.
 type Config struct {
 	LogLevel LogLevel // defaults to LogLevelInfo if zero
+
+	// DefaultStartTimeout is the default per-service start deadline.
+	// 0 means no timeout (use WithStartTimeout per-service).
+	DefaultStartTimeout time.Duration
+
+	// Health check configuration.
+	// HealthInterval: how often to probe. Default: 30s.
+	// HealthTimeout: per-probe deadline. Default: 5s.
+	// HealthThreshold: consecutive failures before restart. Default: 3.
+	// A zero HealthInterval disables health checks entirely.
+	HealthInterval  time.Duration
+	HealthTimeout   time.Duration
+	HealthThreshold int
+
+	// Global lifecycle hooks (called for every service unless overridden).
+	OnBeforeStart func(name string) error
+	OnAfterStart  func(name string, err error)
+	OnBeforeStop  func(name string) error
+	OnAfterStop   func(name string, err error)
 }
 
 // logEntry is an internal log record sent from ServiceLogger to the log-pump.
@@ -56,6 +78,20 @@ type serviceEntry struct {
 	svc    Service
 	cfg    registerConfig
 	logger *ServiceLogger
+
+	// runtime state
+	name      string
+	status    ServiceStatus
+	cancel    context.CancelFunc // per-service cancellation (nil until started)
+	startedAt time.Time          // when the current instance started
+
+	// retry / backoff state
+	retryCount  int
+	stableSince time.Time // when the current stable run began (for resetAfter)
+
+	// health check state
+	healthFailures int
+
 	// cron state
 	cronID cron.EntryID
 	// self-heal state for non-cron services
@@ -68,7 +104,7 @@ type serviceEntry struct {
 type Orchestrator struct {
 	cfg     Config
 	started bool
-	mu      sync.Mutex // protects started, entries slice
+	mu      sync.Mutex // protects started, entries slice, nameIndex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -78,26 +114,44 @@ type Orchestrator struct {
 
 	cronSched *cron.Cron
 	entries   []*serviceEntry
-	wg        sync.WaitGroup
+	nameIndex map[string]*serviceEntry // name -> entry lookup
+	autoSeq   int                      // auto-name sequence counter
 
+	// Status tracking
+	statusMu sync.RWMutex
+
+	// Health check
+	healthCancel context.CancelFunc // cancel health-check loop goroutine
+
+	wg        sync.WaitGroup
 	stopOnce  sync.Once
 	startOnce sync.Once
 
 	// messengerDone computes the messenger shutdown cleanup once via sync.OnceValue.
-	// Resetting subs to nil lets GC collect subscriber channels; range over nil map
-	// is a no-op so any post-shutdown Publish calls are harmless.
 	messengerDone func() func()
 }
 
 // New creates a new Orchestrator. Each call returns a fresh, independent instance.
 // Orchestrators can be nested: a service may create its own gorch to manage sub-services.
 func New(cfg Config) *Orchestrator {
-	// ponytail: can't distinguish "user explicitly set Debug" from "zero-value struct".
-	// Default to Info; user who wants Debug must set it explicitly (non-zero after this).
 	if cfg.LogLevel == 0 {
 		cfg.LogLevel = LogLevelInfo
 	}
-	o := &Orchestrator{cfg: cfg, messenger: newMessenger()}
+	// Health defaults
+	if cfg.HealthInterval == 0 {
+		cfg.HealthInterval = 30 * time.Second
+	}
+	if cfg.HealthTimeout == 0 {
+		cfg.HealthTimeout = 5 * time.Second
+	}
+	if cfg.HealthThreshold == 0 {
+		cfg.HealthThreshold = 3
+	}
+	o := &Orchestrator{
+		cfg:       cfg,
+		messenger: newMessenger(),
+		nameIndex: make(map[string]*serviceEntry),
+	}
 	o.messengerDone = sync.OnceValue(func() func() {
 		return func() {
 			o.messenger.mu.Lock()
@@ -110,6 +164,8 @@ func New(cfg Config) *Orchestrator {
 
 // Register adds a service to the orchestrator. Must be called before Start().
 // Returns ErrAlreadyStarted if the orchestrator has already been started.
+// Returns ErrDuplicateName if WithName conflicts with another service.
+// Returns ErrDependencyCycle if DependsOn introduces a cycle.
 // Thread-safe.
 func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	o.mu.Lock()
@@ -117,16 +173,85 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	if o.started {
 		return ErrAlreadyStarted
 	}
+
 	cfg := registerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	o.entries = append(o.entries, &serviceEntry{svc: svc, cfg: cfg})
+
+	// Auto-name if no WithName set.
+	o.autoSeq++
+	if cfg.name == "" {
+		cfg.name = fmt.Sprintf("$%d", o.autoSeq)
+	}
+
+	// Validate uniqueness.
+	if _, exists := o.nameIndex[cfg.name]; exists {
+		return fmt.Errorf("%w: %s", ErrDuplicateName, cfg.name)
+	}
+
+	// Validate all dependencies exist and detect cycles.
+	for _, dep := range cfg.dependsOn {
+		if dep == cfg.name {
+			return fmt.Errorf("%w: service %s depends on itself", ErrDependencyCycle, cfg.name)
+		}
+		depEntry, ok := o.nameIndex[dep]
+		if !ok {
+			// Check if dep is being registered in this batch (entries not yet in nameIndex).
+			found := false
+			for _, e := range o.entries {
+				if e.cfg.name == dep {
+					found = true
+					depEntry = e
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("gorch: dependency %q not found for service %s", dep, cfg.name)
+			}
+		}
+		// Check if dep transitively depends on cfg.name (would create a cycle).
+		if o.dependsOnRecursive(depEntry, cfg.name) {
+			return fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
+		}
+	}
+
+	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
+	o.entries = append(o.entries, entry)
+	o.nameIndex[cfg.name] = entry
 	return nil
 }
 
+// dependsOnRecursive checks whether entry transitively depends on target.
+// ponytail: DFS on small graphs (registration-time only); O(V+E) fine.
+func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bool {
+	if entry == nil {
+		return false
+	}
+	for _, dep := range entry.cfg.dependsOn {
+		if dep == target {
+			return true
+		}
+		depEntry, ok := o.nameIndex[dep]
+		if !ok {
+			// check entries slice for newly registered
+			for _, e := range o.entries {
+				if e.cfg.name == dep {
+					depEntry = e
+					ok = true
+					break
+				}
+			}
+		}
+		if ok && o.dependsOnRecursive(depEntry, target) {
+			return true
+		}
+	}
+	return false
+}
+
 // Start begins the orchestrator lifecycle. Returns ErrAlreadyStarted if already started.
-// Idempotent: calling Start multiple times returns the same error.
+// Idempotent: calling Start multiple times returns nil after the first.
 // Thread-safe.
 func (o *Orchestrator) Start() error {
 	var startErr error
@@ -143,9 +268,14 @@ func (o *Orchestrator) Start() error {
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 256)
 
-		// Assign loggers to each entry.
+		// Assign loggers: use cfg.name if WithName was set, else reflect type.
 		for _, entry := range o.entries {
-			svcName := reflect.TypeOf(entry.svc).String()
+			svcName := entry.name
+			// ponytail: if user didn't set WithName, the name is auto "$N".
+			// Use reflect type for logging to keep backward compat.
+			if svcName == "" || svcName[0] == '$' {
+				svcName = reflect.TypeOf(entry.svc).String()
+			}
 			entry.logger = newServiceLogger(svcName, o.logCh)
 		}
 
@@ -164,7 +294,6 @@ func (o *Orchestrator) Start() error {
 				o.invokeCron(entry)
 			})
 			if err != nil {
-				// Cron parse error: tear down everything and return.
 				o.cancel()
 				close(o.logCh)
 				o.cronSched.Stop()
@@ -177,26 +306,280 @@ func (o *Orchestrator) Start() error {
 		// Start cron scheduler.
 		o.cronSched.Start()
 
-		// Start non-cron services (each gets a wg.Add(1) goroutine).
+		// Partition: runOnce vs persistent services.
+		var runOnce, persistent []*serviceEntry
 		for _, entry := range o.entries {
 			if entry.cfg.cronSpec != "" {
-				continue
+				continue // cron services don't go through Start goroutine
 			}
-			entry := entry
-			sc := ServiceContext{
-				Context:   o.ctx,
-				Logger:    entry.logger,
-				Messenger: o.messenger,
+			if entry.cfg.runOnce {
+				runOnce = append(runOnce, entry)
+			} else {
+				persistent = append(persistent, entry)
 			}
+		}
+
+		// Phase 1: run runOnce services sequentially (they're gates).
+		for _, entry := range runOnce {
+			if err := o.startOneService(entry); err != nil {
+				startErr = errors.Join(startErr, fmt.Errorf("%s: %w", entry.name, err))
+				// runOnce failure aborts — do not start persistent services.
+				o.stopStartedServices()
+				return
+			}
+		}
+
+		// Phase 2: persistent services in topological order.
+		levels, topoErr := o.topoSort(persistent)
+		if topoErr != nil {
+			startErr = errors.Join(startErr, topoErr)
+			o.stopStartedServices()
+			return
+		}
+
+		for _, level := range levels {
+			// Start all services in this level in parallel.
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			var failed map[string]error
+
+			for _, entry := range level {
+				wg.Add(1)
+				go func(e *serviceEntry) {
+					defer wg.Done()
+					// Check if any dependencies failed.
+					for _, dep := range e.cfg.dependsOn {
+						depEntry := o.nameIndex[dep]
+						o.statusMu.RLock()
+						depStatus := depEntry.status
+						o.statusMu.RUnlock()
+						if depStatus == StatusCrashed || depStatus == StatusStopped {
+							failureMsg := fmt.Sprintf("dependency %s failed or was skipped", dep)
+							mu.Lock()
+							if failed == nil {
+								failed = make(map[string]error)
+							}
+							failed[e.name] = fmt.Errorf("%w: %s", ErrStartAborted, failureMsg)
+							mu.Unlock()
+							o.setStatus(e, StatusStopped)
+							return
+						}
+					}
+					if err := o.startOneService(e); err != nil {
+						mu.Lock()
+						if failed == nil {
+							failed = make(map[string]error)
+						}
+						failed[e.name] = err
+						mu.Unlock()
+					}
+				}(entry)
+			}
+			wg.Wait()
+
+			for name, err := range failed {
+				startErr = errors.Join(startErr, fmt.Errorf("%s: %w", name, err))
+			}
+
+			// If any in this level failed, stop all and skip remaining levels.
+			if len(failed) > 0 {
+				o.stopStartedServices()
+				return
+			}
+		}
+
+		// Start health-check loop.
+		if o.cfg.HealthInterval > 0 {
+			healthCtx, hCancel := context.WithCancel(context.Background())
+			o.healthCancel = hCancel
 			o.wg.Add(1)
-			go o.runService(entry, sc)
+			go o.healthCheckLoop(healthCtx)
 		}
 	})
 	return startErr
 }
 
+// startOneService runs a single non-cron service with timeout and hooks.
+// Does NOT add to wg — the runService goroutine inside does that.
+func (o *Orchestrator) startOneService(entry *serviceEntry) error {
+	// --- before-start hook ---
+	hook := entry.cfg.onBeforeStart
+	if hook == nil {
+		hook = o.cfg.OnBeforeStart
+	}
+	if hook != nil {
+		if err := hook(entry.name); err != nil {
+			o.setStatus(entry, StatusStopped)
+			return fmt.Errorf("before-start hook: %w", err)
+		}
+	}
+
+	o.setStatus(entry, StatusStarting)
+
+	// Per-service context with optional timeout.
+	svcCtx, svcCancel := context.WithCancel(o.ctx)
+	entry.cancel = svcCancel
+	entry.startedAt = time.Now()
+	entry.stableSince = time.Now()
+
+	sc := ServiceContext{
+		Context:   svcCtx,
+		Logger:    entry.logger,
+		Messenger: o.messenger,
+	}
+
+	// Determine timeout.
+	timeout := entry.cfg.startTimeout
+	if timeout == 0 {
+		timeout = o.cfg.DefaultStartTimeout
+	}
+
+	if entry.cfg.runOnce {
+		// RunOnce: run Start synchronously with timeout, don't spawn goroutine.
+		o.setStatus(entry, StatusRunning)
+		var err error
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			sc.Context, cancel = context.WithTimeout(svcCtx, timeout)
+			defer cancel()
+			// Use a goroutine to run Start with timeout
+			done := make(chan error, 1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						entry.logger.Error("service panicked", "panic", fmt.Sprint(r))
+						done <- fmt.Errorf("panic: %v", r)
+					}
+				}()
+				done <- entry.svc.Start(sc)
+			}()
+			select {
+			case err = <-done:
+				// got result
+			case <-o.ctx.Done():
+				err = o.ctx.Err()
+			case <-time.After(timeout):
+				err = fmt.Errorf("start timeout after %v", timeout)
+				svcCancel()
+			}
+		} else {
+			err = entry.svc.Start(sc)
+		}
+		entry.cancel = nil
+		svcCancel()
+
+		if err != nil && err != context.Canceled {
+			o.setStatus(entry, StatusCrashed)
+			o.callAfterStartHook(entry, err)
+			return err
+		}
+		entry.wgDone = true
+		o.setStatus(entry, StatusStopped)
+		o.callAfterStartHook(entry, nil)
+		// wg.Done not needed—runOnce doesn't add to wg
+		return nil
+	}
+
+	// Persistent service: start in goroutine.
+	o.setStatus(entry, StatusRunning)
+	o.wg.Add(1)
+
+	// Create a detachable start context. If timeout is set, we use a separate
+	// context for the race window rather than wrapping the service context.
+	startErrCh := make(chan error, 1)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
+			}
+			// Signal whether Start returned cleanly within the timeout window.
+			select {
+			case startErrCh <- nil:
+			default:
+			}
+			o.handleServiceDone(entry, sc)
+		}()
+		err := entry.svc.Start(sc)
+		if err != nil && err != context.Canceled {
+			sc.Logger.Error("service returned error", "error", err.Error())
+		}
+	}()
+
+	if timeout > 0 {
+		select {
+		case <-startErrCh:
+			// Start returned (possibly to handleServiceDone via defer).
+			// The service is now in handleServiceDone.
+			o.callAfterStartHook(entry, nil)
+			return nil
+		case <-time.After(timeout):
+			// Timeout: service Start didn't return in time.
+			// The goroutine is still running. Cancel its context.
+			svcCancel()
+			o.callAfterStartHook(entry, fmt.Errorf("start timeout after %v", timeout))
+			return fmt.Errorf("start timeout after %v", timeout)
+		}
+	}
+
+	// No timeout: return immediately.
+	o.callAfterStartHook(entry, nil)
+	return nil
+}
+
+// callAfterStartHook invokes the after-start hook (per-service override or global).
+func (o *Orchestrator) callAfterStartHook(entry *serviceEntry, err error) {
+	hook := entry.cfg.onAfterStart
+	if hook == nil {
+		hook = o.cfg.OnAfterStart
+	}
+	if hook != nil {
+		hook(entry.name, err)
+	}
+}
+
+// stopStartedServices stops all running services (used for cleanup on start failure).
+// ponytail: sequential stop; parallel Stop is premature.
+func (o *Orchestrator) stopStartedServices() {
+	// Cancel context.
+	if o.cancel != nil {
+		o.cancel()
+	}
+	// Stop cron.
+	if o.cronSched != nil {
+		<-o.cronSched.Stop().Done()
+	}
+	// Stop services in reverse registration order.
+	for i := len(o.entries) - 1; i >= 0; i-- {
+		entry := o.entries[i]
+		o.statusMu.RLock()
+		s := entry.status
+		o.statusMu.RUnlock()
+		if s == StatusRunning || s == StatusStarting {
+			o.safeStop(entry)
+		}
+	}
+	// Close log channel.
+	if o.logCh != nil {
+		select {
+		case <-o.logCh:
+		// already closed
+		default:
+			close(o.logCh)
+		}
+	}
+}
+
+// setStatus updates the service status (thread-safe).
+func (o *Orchestrator) setStatus(entry *serviceEntry, s ServiceStatus) {
+	o.statusMu.Lock()
+	entry.status = s
+	o.statusMu.Unlock()
+}
+
 // Stop gracefully shuts down the orchestrator. Waits up to timeout for services
-// to finish. Returns ErrStopTimeout if services don't all stop within the timeout.
+// to finish. Returns aggregated errors from all Stop failures, or ErrStopTimeout
+// if services don't all stop within the timeout.
 // Thread-safe. Safe to call on an orchestrator that was never started.
 func (o *Orchestrator) Stop(timeout time.Duration) error {
 	var stopErr error
@@ -208,6 +591,11 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		}
 		o.mu.Unlock()
 
+		// Stop health-check loop.
+		if o.healthCancel != nil {
+			o.healthCancel()
+		}
+
 		// 1. Cancel context to signal all services.
 		o.cancel()
 
@@ -216,15 +604,31 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 			<-o.cronSched.Stop().Done()
 		}
 
-		// 3. Call Stop() on every service (best-effort, recover panics).
+		// 3. Call Stop() on services in reverse topological order.
+		persistent := o.persistentEntries()
+		levels, _ := o.topoSort(persistent) // ignore error, graph already validated
+		for i := len(levels) - 1; i >= 0; i-- {
+			for _, entry := range levels[i] {
+				err := o.stopOneService(entry)
+				if err != nil {
+					stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+				}
+			}
+		}
+		// Also stop any remaining entries not in levels (e.g., cron-only, runOnce that failed).
 		for _, entry := range o.entries {
-			o.safeStop(entry.svc)
+			if entry.cfg.runOnce || entry.cfg.cronSpec != "" {
+				err := o.stopOneService(entry)
+				if err != nil {
+					stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+				}
+			}
 		}
 
 		// 4. Close log channel to signal log-pump to drain and exit.
 		close(o.logCh)
 
-		// 5. Clean up messenger subscriptions (computed once via sync.OnceValue).
+		// 5. Clean up messenger subscriptions.
 		cleanup := o.messengerDone()
 		cleanup()
 
@@ -237,10 +641,285 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		select {
 		case <-done:
 		case <-time.After(timeout):
-			stopErr = ErrStopTimeout
+			stopErr = errors.Join(stopErr, ErrStopTimeout)
 		}
 	})
 	return stopErr
+}
+
+// stopOneService calls Stop on a service with hooks and panic recovery.
+func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
+	o.setStatus(entry, StatusStopping)
+
+	// --- before-stop hook ---
+	hook := entry.cfg.onBeforeStop
+	if hook == nil {
+		hook = o.cfg.OnBeforeStop
+	}
+	var hookErr error
+	if hook != nil {
+		hookErr = hook(entry.name)
+	}
+
+	// --- stop ---
+	stopErr := o.safeStopWithResult(entry.svc)
+
+	// --- after-stop hook ---
+	afterHook := entry.cfg.onAfterStop
+	if afterHook == nil {
+		afterHook = o.cfg.OnAfterStop
+	}
+	if afterHook != nil {
+		afterHook(entry.name, stopErr)
+	}
+
+	o.setStatus(entry, StatusStopped)
+	return errors.Join(hookErr, stopErr)
+}
+
+// safeStopWithResult calls Stop with panic recovery, returning any error.
+func (o *Orchestrator) safeStopWithResult(svc Service) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("stop panicked: %v", r)
+		}
+	}()
+	return svc.Stop()
+}
+
+// safeStop calls Stop with panic recovery. Best-effort; errors and panics
+// are silently discarded.
+func (o *Orchestrator) safeStop(entry *serviceEntry) {
+	_ = o.stopOneService(entry)
+}
+
+// persistentEntries returns non-cron, non-runOnce entries.
+func (o *Orchestrator) persistentEntries() []*serviceEntry {
+	var out []*serviceEntry
+	for _, e := range o.entries {
+		if e.cfg.cronSpec == "" && !e.cfg.runOnce {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Run starts the orchestrator, blocks on SIGINT/SIGTERM, then stops.
+// Returns any error from Start or aggregated errors from Stop.
+// Optional signals override the default signal set.
+func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) error {
+	if err := o.Start(); err != nil {
+		return err
+	}
+
+	sigSet := signals
+	if len(sigSet) == 0 {
+		sigSet = []os.Signal{os.Interrupt}
+	}
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, sigSet...)
+	<-ch
+	signal.Stop(ch)
+
+	return o.Stop(stopTimeout)
+}
+
+// Status returns the current lifecycle status of a named service.
+// ok is false if no service with that name is registered.
+// Thread-safe.
+func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
+	o.mu.Lock()
+	entry, ok := o.nameIndex[name]
+	o.mu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	o.statusMu.RLock()
+	s := entry.status
+	o.statusMu.RUnlock()
+	return s, true
+}
+
+// Statuses returns a map of service name to status for all registered services.
+// Thread-safe.
+func (o *Orchestrator) Statuses() map[string]ServiceStatus {
+	o.mu.Lock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.Unlock()
+
+	result := make(map[string]ServiceStatus, len(entries))
+	o.statusMu.RLock()
+	defer o.statusMu.RUnlock()
+	for _, e := range entries {
+		result[e.name] = e.status
+	}
+	return result
+}
+
+// Names returns the names of all registered services in registration order.
+// Thread-safe.
+func (o *Orchestrator) Names() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	names := make([]string, len(o.entries))
+	for i, e := range o.entries {
+		names[i] = e.name
+	}
+	return names
+}
+
+// Count returns the total number of registered services.
+// Thread-safe.
+func (o *Orchestrator) Count() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.entries)
+}
+
+// Health probes all registered services that implement HealthChecker.
+// Returns a map of service name to error (nil = healthy).
+// Services that don't implement HealthChecker are reported as nil.
+// Thread-safe.
+func (o *Orchestrator) Health() map[string]error {
+	o.mu.Lock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.Unlock()
+
+	result := make(map[string]error, len(entries))
+	ctx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
+	defer cancel()
+
+	for _, e := range entries {
+		hc, ok := e.svc.(HealthChecker)
+		if !ok {
+			result[e.name] = nil
+			continue
+		}
+		result[e.name] = hc.Health(ctx)
+	}
+	return result
+}
+
+// ── Topological sort ──
+
+// topoSort groups entries into levels based on their dependsOn chains.
+// Services in the same level are independent and can start in parallel.
+// Returns ErrDependencyCycle if a cycle is detected.
+func (o *Orchestrator) topoSort(entries []*serviceEntry) ([][]*serviceEntry, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	// Build in-degree map and adjacency list.
+	inDegree := make(map[string]int)
+	children := make(map[string][]string)
+	byName := make(map[string]*serviceEntry)
+
+	for _, e := range entries {
+		name := e.name
+		byName[name] = e
+		if _, ok := inDegree[name]; !ok {
+			inDegree[name] = 0
+		}
+		for _, dep := range e.cfg.dependsOn {
+			children[dep] = append(children[dep], name)
+			inDegree[name]++
+		}
+	}
+
+	var levels [][]*serviceEntry
+	visited := make(map[string]bool)
+
+	for len(visited) < len(entries) {
+		// Collect nodes with zero in-degree (not yet visited).
+		var level []string
+		for name := range byName {
+			if visited[name] {
+				continue
+			}
+			if inDegree[name] == 0 {
+				level = append(level, name)
+			}
+		}
+
+		if len(level) == 0 {
+			return nil, ErrDependencyCycle
+		}
+
+		// Sort for deterministic output.
+		sort.Strings(level)
+
+		var levelEntries []*serviceEntry
+		for _, name := range level {
+			visited[name] = true
+			levelEntries = append(levelEntries, byName[name])
+			for _, child := range children[name] {
+				inDegree[child]--
+			}
+		}
+		levels = append(levels, levelEntries)
+	}
+
+	return levels, nil
+}
+
+// ── Health check loop ──
+
+func (o *Orchestrator) healthCheckLoop(ctx context.Context) {
+	defer o.wg.Done()
+	ticker := time.NewTicker(o.cfg.HealthInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			o.runHealthChecks()
+		}
+	}
+}
+
+func (o *Orchestrator) runHealthChecks() {
+	o.mu.Lock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.Unlock()
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
+	defer cancel()
+
+	for _, e := range entries {
+		hc, ok := e.svc.(HealthChecker)
+		if !ok {
+			continue
+		}
+
+		o.statusMu.RLock()
+		s := e.status
+		o.statusMu.RUnlock()
+		if s != StatusRunning {
+			continue
+		}
+
+		if err := hc.Health(probeCtx); err != nil {
+			e.healthFailures++
+			e.logger.Warn("health check failed", "failures", e.healthFailures, "error", err.Error())
+			if e.healthFailures >= o.cfg.HealthThreshold && e.cfg.factory != nil {
+				e.logger.Error("health threshold reached, restarting service", "failures", e.healthFailures)
+				e.healthFailures = 0
+				// Cancel the service's context → Start returns → handleServiceDone → self-heal.
+				if e.cancel != nil {
+					e.cancel()
+				}
+			}
+		} else {
+			e.healthFailures = 0
+		}
+	}
 }
 
 // ── Internal helpers ──
@@ -260,7 +939,6 @@ func (o *Orchestrator) logPump() {
 			}
 			argsStr += fmt.Sprintf("%v=%v", entry.args[i], entry.args[i+1])
 		}
-		// Handle odd arg count: append the last one as key=(missing)
 		if len(entry.args)%2 != 0 && len(entry.args) > 0 {
 			if argsStr != "" {
 				argsStr += " "
@@ -285,16 +963,16 @@ func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext) {
 	err := entry.svc.Start(sc)
 	if err != nil && err != context.Canceled {
 		sc.Logger.Error("service returned error", "error", err.Error())
-		// ponytail: stringifying error via Error() — use full %+v if structured logging needed
 	}
 }
 
 // handleServiceDone is called when a non-cron service exits (normally or via panic).
 // For services without self-heal it decrements the waitgroup once.
-// For self-heal services it spawns a replacement after a 1s backoff.
+// For self-heal services it uses the configured backoff and retry policy.
 func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext) {
 	if entry.cfg.factory == nil {
 		// No self-heal: service stays dead.
+		o.setStatus(entry, StatusStopped)
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true
@@ -306,10 +984,72 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 		return
 	}
 
-	// Self-heal enabled (only for non-cron services).
-	time.Sleep(1 * time.Second) // backoff to avoid tight-loop
+	// Check if context was cancelled (orchestrator shutting down).
+	select {
+	case <-o.ctx.Done():
+		o.setStatus(entry, StatusStopped)
+		o.mu.Lock()
+		if !entry.wgDone {
+			entry.wgDone = true
+			o.mu.Unlock()
+			o.wg.Done()
+		} else {
+			o.mu.Unlock()
+		}
+		return
+	default:
+	}
 
-	o.safeStop(entry.svc) // best-effort cleanup of old instance
+	// Check resetAfter: if the service was stable long enough, reset retry count.
+	if entry.cfg.resetAfter > 0 {
+		if time.Since(entry.stableSince) >= entry.cfg.resetAfter {
+			entry.retryCount = 0
+		}
+	}
+
+	// Check maxRetries.
+	if entry.cfg.maxRetries > 0 && entry.retryCount >= entry.cfg.maxRetries {
+		entry.logger.Error("max retries reached, giving up", "retries", entry.retryCount)
+		o.setStatus(entry, StatusStopped)
+		o.mu.Lock()
+		if !entry.wgDone {
+			entry.wgDone = true
+			o.mu.Unlock()
+			o.wg.Done()
+		} else {
+			o.mu.Unlock()
+		}
+		return
+	}
+
+	entry.retryCount++
+
+	// Compute backoff delay.
+	backoff := entry.cfg.backoff
+	if backoff == nil {
+		backoff = ConstantBackoff{Delay: 1 * time.Second}
+	}
+	delay := backoff.Next(entry.retryCount)
+
+	entry.logger.Warn("self-heal: restarting service",
+		"retry", entry.retryCount, "delay", delay.String())
+
+	select {
+	case <-o.ctx.Done():
+		o.setStatus(entry, StatusStopped)
+		o.mu.Lock()
+		if !entry.wgDone {
+			entry.wgDone = true
+			o.mu.Unlock()
+			o.wg.Done()
+		} else {
+			o.mu.Unlock()
+		}
+		return
+	case <-time.After(delay):
+	}
+
+	o.safeStop(entry) // best-effort cleanup of old instance
 
 	newSvc := entry.cfg.factory()
 	o.mu.Lock()
@@ -317,9 +1057,17 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 	o.mu.Unlock()
 
 	// Update logger for the new instance.
-	svcName := reflect.TypeOf(newSvc).String()
+	svcName := entry.name
+	if svcName == "" || svcName[0] == '$' {
+		svcName = reflect.TypeOf(newSvc).String()
+	}
 	entry.logger = newServiceLogger(svcName, o.logCh)
-	newSc := ServiceContext{Context: o.ctx, Logger: entry.logger, Messenger: o.messenger}
+	entry.stableSince = time.Now()
+
+	// New per-service context.
+	svcCtx, svcCancel := context.WithCancel(o.ctx)
+	entry.cancel = svcCancel
+	newSc := ServiceContext{Context: svcCtx, Logger: entry.logger, Messenger: o.messenger}
 
 	go o.runService(entry, newSc)
 }
@@ -340,7 +1088,6 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 		}
 		defer entry.running.Store(false)
 	case CronParallel:
-		// just run; no gate
 	}
 
 	sc := ServiceContext{
@@ -359,16 +1106,4 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 	if err != nil && err != context.Canceled {
 		entry.logger.Error("cron service returned error", "error", err.Error())
 	}
-}
-
-// safeStop calls svc.Stop() with panic recovery. Best-effort; errors and panics
-// are silently discarded.
-func (o *Orchestrator) safeStop(svc Service) {
-	defer func() {
-		if r := recover(); r != nil {
-			// ponytail: panic in Stop() is logged nowhere (logCh may be closed). Discard.
-			_ = r
-		}
-	}()
-	_ = svc.Stop()
 }
