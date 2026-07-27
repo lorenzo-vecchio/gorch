@@ -90,6 +90,19 @@ type registerConfig struct {
 	onAfterStart  func(name string, err error)
 	onBeforeStop  func(name string) error
 	onAfterStop   func(name string, err error)
+
+	// group / labels for filtering
+	group  string
+	labels map[string]string
+
+	// soft dependencies: start after if present, ignore if missing
+	softDependsOn []string
+
+	// per-service stop timeout
+	stopTimeout time.Duration
+
+	// startCondition: if set and returns false, service is skipped at startup
+	startCondition func() bool
 }
 
 // RegisterOption — functional options for Register.
@@ -201,6 +214,41 @@ func WithOnAfterStop(fn func(name string, err error)) RegisterOption {
 	}
 }
 
+// WithGroup assigns the service to a named group for filtering.
+func WithGroup(name string) RegisterOption {
+	return func(cfg *registerConfig) { cfg.group = name }
+}
+
+// WithLabel attaches a key-value label to the service for filtering.
+func WithLabel(key, value string) RegisterOption {
+	return func(cfg *registerConfig) {
+		if cfg.labels == nil {
+			cfg.labels = make(map[string]string)
+		}
+		cfg.labels[key] = value
+	}
+}
+
+// DependsOnSoft declares soft dependencies: start after the named services
+// if they are present, but ignore any that are not registered.
+func DependsOnSoft(names ...string) RegisterOption {
+	return func(cfg *registerConfig) {
+		cfg.softDependsOn = append(cfg.softDependsOn, names...)
+	}
+}
+
+// WithStopTimeout sets a per-service timeout on Stop(). If Stop() does not
+// return within this duration, the orchestrator proceeds with shutdown.
+func WithStopTimeout(d time.Duration) RegisterOption {
+	return func(cfg *registerConfig) { cfg.stopTimeout = d }
+}
+
+// WithStartCondition sets a function called at startup. If it returns false,
+// the service is skipped (not started). nil or not set means always start.
+func WithStartCondition(fn func() bool) RegisterOption {
+	return func(cfg *registerConfig) { cfg.startCondition = fn }
+}
+
 // Sentinel errors
 var (
 	ErrAlreadyStarted  = errors.New("gorch: orchestrator already started")
@@ -210,6 +258,20 @@ var (
 	ErrDependencyCycle = errors.New("gorch: dependency cycle detected")
 	ErrStartAborted    = errors.New("gorch: start aborted due to dependency failure")
 )
+
+// funcService wraps closures as a Service. Used by RegisterFunc.
+type funcService struct {
+	startFn func(ctx context.Context) error
+	stopFn  func() error
+}
+
+func (f *funcService) Start(ctx context.Context) error { return f.startFn(ctx) }
+func (f *funcService) Stop() error {
+	if f.stopFn != nil {
+		return f.stopFn()
+	}
+	return nil
+}
 
 // Messenger — pub-sub with topics (Socket.IO rooms style).
 // A nil or empty topics slice in Publish broadcasts to ALL subscribers.
@@ -229,6 +291,29 @@ func (m *Messenger) Subscribe(topic string) (<-chan any, func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ch := make(chan any, 16)
+	m.subs[topic] = append(m.subs[topic], ch)
+	unsubscribe := sync.OnceValue(func() struct{} {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		subs := m.subs[topic]
+		for i, c := range subs {
+			if c == ch {
+				m.subs[topic] = append(subs[:i], subs[i+1:]...)
+				return struct{}{}
+			}
+		}
+		return struct{}{}
+	})
+	return ch, func() { unsubscribe() }
+}
+
+// SubscribeWithBuffer registers interest in a topic with a caller-specified
+// buffer size. Returns a receive-only channel and an unsubscribe function.
+// Thread-safe.
+func (m *Messenger) SubscribeWithBuffer(topic string, bufSize int) (<-chan any, func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch := make(chan any, bufSize)
 	m.subs[topic] = append(m.subs[topic], ch)
 	unsubscribe := sync.OnceValue(func() struct{} {
 		m.mu.Lock()
@@ -327,6 +412,24 @@ func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-
 	}()
 
 	return replyCh, nil
+}
+
+// Drain closes all subscriber channels and clears all subscriptions.
+// After Drain, the Messenger is empty and no new publishes will be
+// received by prior subscribers. Thread-safe.
+func (m *Messenger) Drain() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for topic, subs := range m.subs {
+		for _, ch := range subs {
+			select {
+			case <-ch:
+			default:
+			}
+			close(ch)
+		}
+		delete(m.subs, topic)
+	}
 }
 
 // gobBuf is a simple bytes.Buffer wrapper for gob encoding.

@@ -2,7 +2,9 @@ package gorch
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
+	"fmt"
 	"reflect"
 )
 
@@ -97,4 +99,29 @@ func TypedSubscribe[T any](m *Messenger, topic string) (<-chan T, func()) {
 	}()
 
 	return typedCh, unsub
+}
+
+// TypedRequest sends a typed request and waits for a typed response.
+// It gob-encodes the request, publishes it via Request, and gob-decodes
+// the response. Returns the decoded response or an error.
+func TypedRequest[TReq, TResp any](m *Messenger, ctx context.Context, req TReq, topic string) (TResp, error) {
+	var zero TResp
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(&req); err != nil {
+		return zero, fmt.Errorf("gorch: failed to encode request: %w", err)
+	}
+	wrapper := Message{Payload: buf.Bytes(), Topic: topic, TypeName: reflect.TypeOf(req).String()}
+	raw, err := m.Request(ctx, wrapper, topic)
+	if err != nil {
+		return zero, err
+	}
+	respMsg, ok := raw.(Message)
+	if !ok {
+		return zero, fmt.Errorf("gorch: expected Message response, got %T", raw)
+	}
+	var result TResp
+	if err := gob.NewDecoder(bytes.NewReader(respMsg.Payload)).Decode(&result); err != nil {
+		return zero, fmt.Errorf("gorch: failed to decode response: %w", err)
+	}
+	return result, nil
 }

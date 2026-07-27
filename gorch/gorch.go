@@ -62,6 +62,23 @@ type Config struct {
 	OnAfterStart  func(name string, err error)
 	OnBeforeStop  func(name string) error
 	OnAfterStop   func(name string, err error)
+
+	// State-change callbacks.
+	OnStateChange func(name string, from, to ServiceStatus)
+	OnCrash       func(name string, err error)
+
+	// Health check hooks.
+	BeforeHealthCheck func(name string) error
+	AfterHealthCheck  func(name string, err error)
+}
+
+// Metrics holds counter snapshots for orchestrator-level events.
+type Metrics struct {
+	Starts      int64
+	Stops       int64
+	Crashes     int64
+	Restarts    int64
+	HealthFails int64
 }
 
 // logEntry is an internal log record sent from ServiceLogger to the log-pump.
@@ -122,6 +139,7 @@ type Orchestrator struct {
 
 	// Health check
 	healthCancel context.CancelFunc // cancel health-check loop goroutine
+	healthDone   chan struct{}      // closed when health-check loop exits
 
 	wg        sync.WaitGroup
 	stopOnce  sync.Once
@@ -129,6 +147,12 @@ type Orchestrator struct {
 
 	// messengerDone computes the messenger shutdown cleanup once via sync.OnceValue.
 	messengerDone func() func()
+
+	metricsStarts      atomic.Int64
+	metricsStops       atomic.Int64
+	metricsCrashes     atomic.Int64
+	metricsRestarts    atomic.Int64
+	metricsHealthFails atomic.Int64
 }
 
 // New creates a new Orchestrator. Each call returns a fresh, independent instance.
@@ -213,6 +237,13 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 		// Check if dep transitively depends on cfg.name (would create a cycle).
 		if o.dependsOnRecursive(depEntry, cfg.name) {
 			return fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
+		}
+	}
+
+	// Check Validator interface.
+	if v, ok := svc.(Validator); ok {
+		if err := v.Validate(); err != nil {
+			return fmt.Errorf("gorch: service %s validation failed: %w", cfg.name, err)
 		}
 	}
 
@@ -365,6 +396,27 @@ func (o *Orchestrator) Start() error {
 							return
 						}
 					}
+					// Soft dependencies: check if registered, skip if missing.
+					for _, dep := range e.cfg.softDependsOn {
+						depEntry, ok := o.nameIndex[dep]
+						if !ok {
+							continue
+						}
+						o.statusMu.RLock()
+						depStatus := depEntry.status
+						o.statusMu.RUnlock()
+						if depStatus == StatusCrashed || depStatus == StatusStopped {
+							failureMsg := fmt.Sprintf("soft dependency %s failed or was skipped", dep)
+							mu.Lock()
+							if failed == nil {
+								failed = make(map[string]error)
+							}
+							failed[e.name] = fmt.Errorf("%w: %s", ErrStartAborted, failureMsg)
+							mu.Unlock()
+							o.setStatus(e, StatusStopped)
+							return
+						}
+					}
 					if err := o.startOneService(e); err != nil {
 						mu.Lock()
 						if failed == nil {
@@ -392,6 +444,7 @@ func (o *Orchestrator) Start() error {
 		if o.cfg.HealthInterval > 0 {
 			healthCtx, hCancel := context.WithCancel(context.Background())
 			o.healthCancel = hCancel
+			o.healthDone = make(chan struct{})
 			o.wg.Add(1)
 			go o.healthCheckLoop(healthCtx)
 		}
@@ -412,6 +465,12 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 			o.setStatus(entry, StatusStopped)
 			return fmt.Errorf("before-start hook: %w", err)
 		}
+	}
+
+	// Check start condition.
+	if entry.cfg.startCondition != nil && !entry.cfg.startCondition() {
+		o.setStatus(entry, StatusStopped)
+		return nil
 	}
 
 	o.setStatus(entry, StatusStarting)
@@ -437,6 +496,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	if entry.cfg.runOnce {
 		// RunOnce: run Start synchronously with timeout, don't spawn goroutine.
 		o.setStatus(entry, StatusRunning)
+		o.metricsStarts.Add(1)
 		var err error
 		if timeout > 0 {
 			var cancel context.CancelFunc
@@ -482,6 +542,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 
 	// Persistent service: start in goroutine.
 	o.setStatus(entry, StatusRunning)
+	o.metricsStarts.Add(1)
 	o.wg.Add(1)
 
 	// Create a detachable start context. If timeout is set, we use a separate
@@ -573,8 +634,19 @@ func (o *Orchestrator) stopStartedServices() {
 // setStatus updates the service status (thread-safe).
 func (o *Orchestrator) setStatus(entry *serviceEntry, s ServiceStatus) {
 	o.statusMu.Lock()
+	old := entry.status
 	entry.status = s
 	o.statusMu.Unlock()
+
+	if o.cfg.OnStateChange != nil && old != s {
+		o.cfg.OnStateChange(entry.name, old, s)
+	}
+	if s == StatusCrashed {
+		o.metricsCrashes.Add(1)
+	}
+	if o.cfg.OnCrash != nil && s == StatusCrashed {
+		o.cfg.OnCrash(entry.name, fmt.Errorf("service %s crashed", entry.name))
+	}
 }
 
 // Stop gracefully shuts down the orchestrator. Waits up to timeout for services
@@ -594,6 +666,7 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		// Stop health-check loop.
 		if o.healthCancel != nil {
 			o.healthCancel()
+			<-o.healthDone // wait for health loop goroutine to exit before touching logCh
 		}
 
 		// 1. Cancel context to signal all services.
@@ -649,6 +722,10 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 
 // stopOneService calls Stop on a service with hooks and panic recovery.
 func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
+	o.statusMu.RLock()
+	wasActive := entry.status == StatusRunning || entry.status == StatusStarting
+	o.statusMu.RUnlock()
+
 	o.setStatus(entry, StatusStopping)
 
 	// --- before-stop hook ---
@@ -662,7 +739,19 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 	}
 
 	// --- stop ---
-	stopErr := o.safeStopWithResult(entry.svc)
+	var stopErr error
+	timeout := entry.cfg.stopTimeout
+	if timeout > 0 {
+		done := make(chan error, 1)
+		go func() { done <- o.safeStopWithResult(entry.svc) }()
+		select {
+		case stopErr = <-done:
+		case <-time.After(timeout):
+			stopErr = fmt.Errorf("stop timeout after %v", timeout)
+		}
+	} else {
+		stopErr = o.safeStopWithResult(entry.svc)
+	}
 
 	// --- after-stop hook ---
 	afterHook := entry.cfg.onAfterStop
@@ -674,6 +763,9 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 	}
 
 	o.setStatus(entry, StatusStopped)
+	if wasActive {
+		o.metricsStops.Add(1)
+	}
 	return errors.Join(hookErr, stopErr)
 }
 
@@ -803,6 +895,168 @@ func (o *Orchestrator) Health() map[string]error {
 	return result
 }
 
+// RegisterFunc registers a closure-based service.
+func (o *Orchestrator) RegisterFunc(name string, startFn func(ctx ServiceContext) error, stopFn func() error, opts ...RegisterOption) error {
+	svc := &funcService{startFn: func(ctx context.Context) error { return startFn(ctx.(ServiceContext)) }, stopFn: stopFn}
+	allOpts := make([]RegisterOption, 0, len(opts)+1)
+	allOpts = append(allOpts, WithName(name))
+	allOpts = append(allOpts, opts...)
+	return o.Register(svc, allOpts...)
+}
+
+// IsReady reports whether a named service is running and ready to serve.
+func (o *Orchestrator) IsReady(name string) bool {
+	o.mu.Lock()
+	entry, ok := o.nameIndex[name]
+	o.mu.Unlock()
+	if !ok {
+		return false
+	}
+	o.statusMu.RLock()
+	s := entry.status
+	o.statusMu.RUnlock()
+	if s != StatusRunning {
+		return false
+	}
+	rc, ok := entry.svc.(ReadinessChecker)
+	if !ok {
+		return true
+	}
+	return rc.Ready(context.Background()) == nil
+}
+
+// StartGroup starts all services in the named group in topological order.
+func (o *Orchestrator) StartGroup(group string) error {
+	o.mu.Lock()
+	entries := make([]*serviceEntry, 0)
+	for _, e := range o.entries {
+		if e.cfg.group == group {
+			entries = append(entries, e)
+		}
+	}
+	o.mu.Unlock()
+	levels, err := o.topoSort(entries)
+	if err != nil {
+		return err
+	}
+	for _, level := range levels {
+		for _, entry := range level {
+			if err := o.startOneService(entry); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// StopGroup stops all non-cron, non-runOnce services in the named group in
+// reverse topological order. Errors are aggregated via errors.Join.
+func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
+	o.mu.Lock()
+	persistent := make([]*serviceEntry, 0)
+	for _, e := range o.entries {
+		if e.cfg.group == group && e.cfg.cronSpec == "" && !e.cfg.runOnce {
+			persistent = append(persistent, e)
+		}
+	}
+	o.mu.Unlock()
+	levels, _ := o.topoSort(persistent)
+	var stopErr error
+	for i := len(levels) - 1; i >= 0; i-- {
+		for _, entry := range levels[i] {
+			if err := o.stopOneService(entry); err != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+			}
+		}
+	}
+	return stopErr
+}
+
+// StatusesByGroup returns a map of service name to status for all services
+// in the named group. Thread-safe.
+func (o *Orchestrator) StatusesByGroup(group string) map[string]ServiceStatus {
+	o.mu.Lock()
+	entries := make([]*serviceEntry, 0)
+	for _, e := range o.entries {
+		if e.cfg.group == group {
+			entries = append(entries, e)
+		}
+	}
+	o.mu.Unlock()
+	result := make(map[string]ServiceStatus, len(entries))
+	o.statusMu.RLock()
+	defer o.statusMu.RUnlock()
+	for _, e := range entries {
+		result[e.name] = e.status
+	}
+	return result
+}
+
+// StatusesByLabel returns a map of service name to status for all services
+// matching the given label key-value pair. Thread-safe.
+func (o *Orchestrator) StatusesByLabel(key, value string) map[string]ServiceStatus {
+	o.mu.Lock()
+	entries := make([]*serviceEntry, 0)
+	for _, e := range o.entries {
+		if e.cfg.labels != nil && e.cfg.labels[key] == value {
+			entries = append(entries, e)
+		}
+	}
+	o.mu.Unlock()
+	result := make(map[string]ServiceStatus, len(entries))
+	o.statusMu.RLock()
+	defer o.statusMu.RUnlock()
+	for _, e := range entries {
+		result[e.name] = e.status
+	}
+	return result
+}
+
+// WaitFor blocks until the named service reaches target status or timeout expires.
+// Polls at 50ms intervals. Returns an error on timeout or if the service is not found.
+func (o *Orchestrator) WaitFor(name string, target ServiceStatus, timeout time.Duration) error {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status, ok := o.Status(name)
+		if !ok {
+			return fmt.Errorf("gorch: service %s not found", name)
+		}
+		if status == target {
+			return nil
+		}
+		select {
+		case <-deadline:
+			return fmt.Errorf("gorch: WaitFor %s -> %s timed out after %v (current: %s)", name, target, timeout, status)
+		case <-ticker.C:
+		}
+	}
+}
+
+// Metrics returns a snapshot of orchestrator-level event counters.
+func (o *Orchestrator) Metrics() Metrics {
+	return Metrics{
+		Starts:      o.metricsStarts.Load(),
+		Stops:       o.metricsStops.Load(),
+		Crashes:     o.metricsCrashes.Load(),
+		Restarts:    o.metricsRestarts.Load(),
+		HealthFails: o.metricsHealthFails.Load(),
+	}
+}
+
+// Done returns a channel that closes when all managed goroutines (services,
+// log-pump, health-check loop) have exited. The orchestrator must be stopped
+// (via Stop or Run returning) before the channel closes.
+func (o *Orchestrator) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		o.wg.Wait()
+		close(ch)
+	}()
+	return ch
+}
+
 // ── Topological sort ──
 
 // topoSort groups entries into levels based on their dependsOn chains.
@@ -870,6 +1124,7 @@ func (o *Orchestrator) topoSort(entries []*serviceEntry) ([][]*serviceEntry, err
 
 func (o *Orchestrator) healthCheckLoop(ctx context.Context) {
 	defer o.wg.Done()
+	defer close(o.healthDone)
 	ticker := time.NewTicker(o.cfg.HealthInterval)
 	defer ticker.Stop()
 
@@ -905,9 +1160,20 @@ func (o *Orchestrator) runHealthChecks() {
 			continue
 		}
 
-		if err := hc.Health(probeCtx); err != nil {
+		if o.cfg.BeforeHealthCheck != nil {
+			if err := o.cfg.BeforeHealthCheck(e.name); err != nil {
+				e.logger.Warn("before-health-check hook failed", "error", err.Error())
+			}
+		}
+
+		healthErr := hc.Health(probeCtx)
+		if o.cfg.AfterHealthCheck != nil {
+			o.cfg.AfterHealthCheck(e.name, healthErr)
+		}
+		if healthErr != nil {
 			e.healthFailures++
-			e.logger.Warn("health check failed", "failures", e.healthFailures, "error", err.Error())
+			o.metricsHealthFails.Add(1)
+			e.logger.Warn("health check failed", "failures", e.healthFailures, "error", healthErr.Error())
 			if e.healthFailures >= o.cfg.HealthThreshold && e.cfg.factory != nil {
 				e.logger.Error("health threshold reached, restarting service", "failures", e.healthFailures)
 				e.healthFailures = 0
@@ -972,7 +1238,24 @@ func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext) {
 func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext) {
 	if entry.cfg.factory == nil {
 		// No self-heal: service stays dead.
+		// If orchestrator is shutting down, Stop() handles status transitions
+		// via stopOneService (running→stopping→stopped). Don't double-transition.
+		if o.ctx != nil {
+			select {
+			case <-o.ctx.Done():
+				o.mu.Lock()
+				alreadyDone := entry.wgDone
+				entry.wgDone = true
+				o.mu.Unlock()
+				if !alreadyDone {
+					o.wg.Done()
+				}
+				return
+			default:
+			}
+		}
 		o.setStatus(entry, StatusStopped)
+		o.metricsStops.Add(1)
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true
@@ -1011,6 +1294,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 	if entry.cfg.maxRetries > 0 && entry.retryCount >= entry.cfg.maxRetries {
 		entry.logger.Error("max retries reached, giving up", "retries", entry.retryCount)
 		o.setStatus(entry, StatusStopped)
+		o.metricsStops.Add(1)
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true
@@ -1070,6 +1354,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 	newSc := ServiceContext{Context: svcCtx, Logger: entry.logger, Messenger: o.messenger}
 
 	go o.runService(entry, newSc)
+	o.metricsRestarts.Add(1)
 }
 
 // invokeCron executes a cron-triggered service tick. Concurrency policy is

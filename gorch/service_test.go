@@ -1223,3 +1223,211 @@ func TestTypedSubscribe_ChannelFullDefault(t *testing.T) {
 		}
 	}
 }
+
+// ── SubscribeWithBuffer: double-unsubscribe (fallthrough return) ──
+
+func TestSubscribeWithBuffer_DoubleUnsubscribe(t *testing.T) {
+	m := newMessenger()
+	_, unsub := m.SubscribeWithBuffer("topic", 4)
+	unsub()
+	// Second unsubscribe: channel not found in slice — hits the
+	// fallthrough return struct{}{} path.
+	unsub()
+}
+
+// ── TypedRequest ──
+
+func TestTypedRequest_HappyPath(t *testing.T) {
+	m := newMessenger()
+	gob.Register(Message{})
+	RegisterType[int](m)
+
+	// Responder: TypedRequest double-wraps via RequestAsync.
+	// 1. TypedRequest gob-encodes req → inner Message.Payload
+	// 2. RequestAsync gob-encodes inner Message through *any → outer Message.Payload
+	// 3. Outer Message is published
+	// So responder must: decode outer Payload → any → Message → decode inner Payload → req.
+	rawCh, _ := m.Subscribe("req")
+	go func() {
+		outer := (<-rawCh).(Message)
+		var decodedAny any
+		gob.NewDecoder(bytes.NewReader(outer.Payload)).Decode(&decodedAny)
+		inner := decodedAny.(Message)
+		var req int
+		gob.NewDecoder(bytes.NewReader(inner.Payload)).Decode(&req)
+		resp := Message{
+			Payload:  gobEncode(req * 2),
+			TypeName: "int",
+		}
+		m.Publish(resp, outer.ReplyTopic)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	result, err := TypedRequest[int, int](m, ctx, 21, "req")
+	if err != nil {
+		t.Fatalf("TypedRequest failed: %v", err)
+	}
+	if result != 42 {
+		t.Errorf("expected 42, got %v", result)
+	}
+}
+
+func TestTypedRequest_RequestError(t *testing.T) {
+	m := newMessenger()
+	gob.Register(Message{})
+	RegisterType[int](m)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	_, err := TypedRequest[int, string](m, ctx, 42, "no-responder")
+	if err == nil {
+		t.Fatal("expected error from TypedRequest with no responder")
+	}
+}
+
+func TestTypedRequest_NonMessageResponse(t *testing.T) {
+	m := newMessenger()
+	gob.Register(Message{})
+	RegisterType[int](m)
+
+	rawCh, _ := m.Subscribe("req")
+	go func() {
+		outer := (<-rawCh).(Message)
+		// Reply with a raw string, not a Message — TypedRequest should fail.
+		m.Publish("raw string, not Message", outer.ReplyTopic)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := TypedRequest[int, string](m, ctx, 42, "req")
+	if err == nil {
+		t.Fatal("expected error for non-Message response")
+	}
+	if !strings.Contains(err.Error(), "expected Message response") {
+		t.Errorf("expected 'expected Message response' in error, got: %v", err)
+	}
+}
+
+func TestTypedRequest_DecodeError(t *testing.T) {
+	m := newMessenger()
+	gob.Register(Message{})
+	RegisterType[int](m)
+
+	rawCh, _ := m.Subscribe("req")
+	go func() {
+		msg := (<-rawCh).(Message)
+		// Reply with garbage that won't decode as string.
+		resp := Message{
+			Payload:  []byte("garbage-not-gob"),
+			Topic:    "req",
+			TypeName: "string",
+		}
+		m.Publish(resp, msg.ReplyTopic)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := TypedRequest[int, string](m, ctx, 42, "req")
+	if err == nil {
+		t.Fatal("expected decode error from TypedRequest")
+	}
+	if !strings.Contains(err.Error(), "failed to decode response") {
+		t.Errorf("expected 'failed to decode response' in error, got: %v", err)
+	}
+}
+
+// gobEncode gob-encodes v and returns the bytes.
+func gobEncode(v any) []byte {
+	var buf bytes.Buffer
+	gob.NewEncoder(&buf).Encode(v)
+	return buf.Bytes()
+}
+
+// ── Drain (regression test) ──
+
+func TestDrain_Complete(t *testing.T) {
+	t.Run("drain_with_subscribers", func(t *testing.T) {
+		m := newMessenger()
+		ch1, _ := m.Subscribe("a")
+		ch2, _ := m.Subscribe("b")
+		m.Drain()
+
+		// Channels should be closed.
+		_, ok1 := <-ch1
+		if ok1 {
+			t.Error("ch1 should be closed")
+		}
+		_, ok2 := <-ch2
+		if ok2 {
+			t.Error("ch2 should be closed")
+		}
+
+		// Publish after drain should not panic.
+		m.Publish("x", "a")
+		m.Publish("broadcast")
+	})
+
+	t.Run("drain_empty", func(t *testing.T) {
+		m := newMessenger()
+		m.Drain()
+		// Should not panic.
+	})
+
+	t.Run("drain_with_full_channel", func(t *testing.T) {
+		m := newMessenger()
+		ch, _ := m.Subscribe("t")
+		m.Publish("fill", "t")
+		// Channel has data; drain should clear it via select default and close.
+		m.Drain()
+		_, ok := <-ch
+		if ok {
+			t.Error("channel should be closed after drain")
+		}
+	})
+}
+
+// ── FuncService.Stop: nil stopFn path ──
+
+func TestFuncService_StopNil(t *testing.T) {
+	f := &funcService{startFn: func(ctx context.Context) error { return nil }}
+	if err := f.Stop(); err != nil {
+		t.Errorf("Stop with nil stopFn should return nil, got %v", err)
+	}
+}
+
+// ── SubscribeWithBuffer: double-unsubscribe with raw-managed subs ──
+
+func TestSubscribeWithBuffer_DoubleUnsubscribe_Raw(t *testing.T) {
+	m := newMessenger()
+	_, unsub := m.SubscribeWithBuffer("topic", 4)
+	// Clear subscribers BEFORE first unsubscribe so the for-loop
+	// over nil slice hits the fallthrough return struct{}{}.
+	m.mu.Lock()
+	m.subs["topic"] = nil
+	m.mu.Unlock()
+	unsub()
+}
+
+// ── TypedRequest: encode error path ──
+
+func TestTypedRequest_EncodeError(t *testing.T) {
+	m := newMessenger()
+	gob.Register(Message{})
+	RegisterType[chan int](m)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := TypedRequest[chan int, string](m, ctx, make(chan int), "req")
+	if err == nil {
+		t.Fatal("expected encode error from TypedRequest with channel type")
+	}
+	if !strings.Contains(err.Error(), "failed to encode request") {
+		t.Errorf("expected 'failed to encode request' in error, got: %v", err)
+	}
+}

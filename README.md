@@ -31,6 +31,22 @@ Requires Go 1.25+.
 - **Error aggregation** — `errors.Join` in `Start`/`Stop` so all failures are reported, not just the first.
 - **Nestable orchestrators** — a service can create its own gorch for sub-services.
 - **Structured logging** — channel-based log-pump; services call `Info/Error/Debug/Warn` on a `ServiceLogger`, no slog dependency.
+- **RegisterFunc** — closure-based services for simple cases; no boilerplate struct needed.
+- **Service groups** — `WithGroup`, `StartGroup`, `StopGroup`, `StatusesByGroup` for operating on subsets.
+- **Labels** — `WithLabel` + `StatusesByLabel` for metadata filtering.
+- **Soft dependencies** — `DependsOnSoft` for optional service ordering; start after if present, no error if missing.
+- **Readiness checks** — `ReadinessChecker` interface + `IsReady()`; separate "alive" from "ready to serve."
+- **State-change hooks** — `OnStateChange` + `OnCrash` callbacks for external observability without polling.
+- **WaitFor** — Block until a service reaches a target status.
+- **TypedRequest** — Typed request-reply without losing type safety: `TypedRequest[TReq, TResp](messenger, ctx, req, topic)`.
+- **Metrics** — atomic int64 counters (`Starts`, `Stops`, `Crashes`, `Restarts`, `HealthFails`), exposed via `Metrics()` snapshot.
+- **Validator interface** — `Validate() error` called at `Register` for early config checks.
+- **WithStartCondition** — Skip a service at runtime via a `func() bool`.
+- **Per-service stop timeout** — `WithStopTimeout` controls how long to wait for `Stop()`.
+- **Configurable channel buffer** — `SubscribeWithBuffer` for the Messenger.
+- **Health check hooks** — `BeforeHealthCheck` / `AfterHealthCheck` for instrumenting probes.
+- **Messenger.Drain** — Gracefully close all subscriber channels and clear subscriptions.
+- **Done() channel** — Non-blocking shutdown notification; closes when all goroutines finish.
 
 ## Quick start
 
@@ -274,6 +290,215 @@ sc.Logger.Info("request completed", "status", 200, "latency", 12*time.Millisecon
 ```
 
 The log-pump writes to `os.Stderr`. Log level filters entries: `Debug < Info < Warn < Error`.
+
+### RegisterFunc
+
+For simple services where a struct is boilerplate, `RegisterFunc` accepts closures directly.
+
+```go
+orch.RegisterFunc("health-server", func(ctx gorch.ServiceContext) error {
+    srv := &http.Server{Addr: ":8080"}
+    go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
+    return srv.ListenAndServe()
+}, nil) // nil Stop func — stops purely via context cancellation
+```
+
+A `Stop` func can be nil if the service cleans up via context cancellation alone.
+
+### Groups
+
+Assign services to named groups with `WithGroup`, then operate on subsets.
+
+```go
+orch.Register(dbSvc, gorch.WithName("db"), gorch.WithGroup("infra"))
+orch.Register(cacheSvc, gorch.WithName("cache"), gorch.WithGroup("infra"))
+orch.Register(apiSvc, gorch.WithName("api"), gorch.WithGroup("app"), gorch.DependsOn("db", "cache"))
+
+// Start or stop only a group.
+err := orch.StartGroup("infra")
+err = orch.StopGroup("app", 5*time.Second)
+
+// Filter statuses by group.
+infra := orch.StatusesByGroup("infra") // map[string]ServiceStatus
+```
+
+### Labels
+
+Attach arbitrary key-value tags for filtering and introspection.
+
+```go
+orch.Register(svc, gorch.WithLabel("tier", "critical"))
+orch.Register(svc, gorch.WithLabel("team", "payments"))
+
+critical := orch.StatusesByLabel("tier", "critical")
+```
+
+### Soft dependencies
+
+`DependsOnSoft` orders a service after its soft dependencies if they are registered, but does not fail if they are missing.
+
+```go
+orch.Register(apiSvc,
+    gorch.WithName("api"),
+    gorch.DependsOn("db"),          // hard: must exist
+    gorch.DependsOnSoft("metrics"), // soft: start after if present, ignore if missing
+)
+```
+
+### Readiness
+
+`ReadinessChecker` separates "running" from "ready to serve." Use `IsReady()` to gate traffic routing without killing the service.
+
+```go
+type ReadinessChecker interface {
+    Ready(ctx context.Context) error
+}
+
+// On the orchestrator:
+if orch.IsReady("api") {
+    // route traffic
+}
+```
+
+### State-change hooks
+
+`OnStateChange` fires on every status transition. `OnCrash` fires specifically on `Running -> Crashed`. Wire these to Prometheus counters, Slack webhooks, or a status page instead of polling.
+
+```go
+orch := gorch.New(gorch.Config{
+    OnStateChange: func(name string, from, to gorch.ServiceStatus) {
+        log.Printf("%s: %s -> %s", name, from, to)
+    },
+    OnCrash: func(name string, err error) {
+        notifications.Send(name + " crashed")
+    },
+})
+```
+
+### WaitFor
+
+Block until a service reaches a target status (or times out). Useful for tests and services that need external coordination.
+
+```go
+err := orch.WaitFor("db", gorch.StatusRunning, 10*time.Second)
+```
+
+### Typed Request-Reply
+
+`TypedRequest` provides type-safe request-reply without falling back to the untyped `Message` API.
+
+```go
+type CreateOrderReq struct {
+    ItemID string
+    Qty    int
+}
+type CreateOrderResp struct {
+    OrderID string
+    Status  string
+}
+
+// Requestor:
+resp, err := gorch.TypedRequest[CreateOrderReq, CreateOrderResp](
+    messenger, ctx, req, "orders.create",
+)
+
+// Responder (inside a service goroutine via TypedSubscribe):
+ch, _ := gorch.TypedSubscribe[CreateOrderReq](messenger, "orders.create")
+for msg := range ch {
+    result := processOrder(msg)
+    gorch.TypedPublish(messenger, result, "orders.results")
+}
+```
+
+### Metrics
+
+`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency.
+
+```go
+stats := orch.Metrics()
+fmt.Printf("starts=%d stops=%d crashes=%d restarts=%d healthFails=%d\n",
+    stats.Starts, stats.Stops, stats.Crashes, stats.Restarts, stats.HealthFails)
+```
+
+### Validator
+
+Implement the `Validator` interface to catch config errors at `Register` time (before `Start`).
+
+```go
+type Validator interface {
+    Validate() error
+}
+
+func (s *MyService) Validate() error {
+    if s.Port == 0 {
+        return fmt.Errorf("port must be set")
+    }
+    return nil
+}
+
+// Register returns the validation error immediately:
+err := orch.Register(svc)
+```
+
+### WithStartCondition
+
+Skip a service at runtime without removing its registration. The condition function is evaluated just before startup.
+
+```go
+orch.Register(svc, gorch.WithStartCondition(func() bool {
+    return os.Getenv("FEATURE_ENABLED") == "true"
+}))
+```
+
+### Per-service StopTimeout
+
+`WithStopTimeout` sets a per-service deadline on `Stop()`. The orchestrator proceeds with shutdown even if this service takes longer.
+
+```go
+orch.Register(svc, gorch.WithStopTimeout(3 * time.Second))
+```
+
+### Messenger buffer size
+
+`SubscribeWithBuffer` lets callers set the buffer capacity to prevent slow consumers from blocking publishers.
+
+```go
+ch, unsub := messenger.SubscribeWithBuffer("high-throughput", 256)
+```
+
+### Health check hooks
+
+`BeforeHealthCheck` and `AfterHealthCheck` provide instrumentation points around every health probe without wrapping every `HealthChecker`.
+
+```go
+orch := gorch.New(gorch.Config{
+    HealthInterval:  30 * time.Second,
+    BeforeHealthCheck: func(name string) error {
+        metrics.Inc("health_checks_total")
+        return nil
+    },
+    AfterHealthCheck: func(name string, err error) {
+        if err != nil {
+            metrics.Inc("health_checks_failed")
+        }
+    },
+})
+```
+
+### Drain and Done
+
+`Drain()` closes all subscriber channels and clears subscriptions. `Done()` returns a channel that closes when all goroutines (services, log-pump, health-check loop) have exited — useful for non-blocking shutdown.
+
+```go
+// Gracefully flush pending messages before shutdown.
+messenger.Drain()
+
+// Non-blocking wait for full shutdown.
+select {
+case <-orch.Done():
+case <-time.After(10 * time.Second):
+}
+```
 
 ## Examples
 

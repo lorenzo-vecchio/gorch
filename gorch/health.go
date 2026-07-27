@@ -9,6 +9,19 @@ type HealthChecker interface {
 	Health(ctx context.Context) error
 }
 
+// ReadinessChecker is implemented by services that distinguish "running" from
+// "ready to serve". Ready returns nil when the service can accept traffic.
+type ReadinessChecker interface {
+	Ready(ctx context.Context) error
+}
+
+// Validator is implemented by services that validate their configuration at
+// Register time. Validate is called immediately during Register; a non-nil
+// error causes Register to return that error.
+type Validator interface {
+	Validate() error
+}
+
 // ServiceStatus represents the lifecycle state of a registered service.
 type ServiceStatus int
 

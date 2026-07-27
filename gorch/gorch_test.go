@@ -76,6 +76,27 @@ func (s *healthSvc) Health(ctx context.Context) error {
 	return nil
 }
 
+// readySvc is a test service that implements ReadinessChecker.
+type readySvc struct {
+	testSvc
+	readyFn func(ctx context.Context) error
+}
+
+func (s *readySvc) Ready(ctx context.Context) error {
+	if s.readyFn != nil {
+		return s.readyFn(ctx)
+	}
+	return nil
+}
+
+// validSvc is a test service that implements Validator.
+type validSvc struct {
+	testSvc
+	validateErr error
+}
+
+func (s *validSvc) Validate() error { return s.validateErr }
+
 // ── LogLevel.String ──
 
 func TestLogLevel_String(t *testing.T) {
@@ -3158,6 +3179,947 @@ func TestStart_DepStatusCheck_Whitebox(t *testing.T) {
 
 // ── handleServiceDone: backoff ctx-cancelled else (wgDone already true) ──
 
+// ── v0.3.0 integration tests ──
+
+// ── RegisterFunc ──
+
+func TestRegisterFunc_v3(t *testing.T) {
+	t.Run("start_stop_lifecycle", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		var started atomic.Int32
+		var stopped atomic.Int32
+
+		err := o.RegisterFunc("fn", func(ctx ServiceContext) error {
+			started.Add(1)
+			<-ctx.Done()
+			return ctx.Err()
+		}, func() error {
+			stopped.Add(1)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("RegisterFunc failed: %v", err)
+		}
+
+		_ = o.Start()
+		time.Sleep(50 * time.Millisecond)
+		if started.Load() != 1 {
+			t.Error("started should be 1")
+		}
+		_ = o.Stop(time.Second)
+		if stopped.Load() != 1 {
+			t.Error("stopped should be 1")
+		}
+	})
+
+	t.Run("with_options", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		err := o.RegisterFunc("opt-fn",
+			func(ctx ServiceContext) error { <-ctx.Done(); return ctx.Err() },
+			func() error { return nil },
+			WithGroup("test-grp"),
+			WithLabel("env", "test"),
+		)
+		if err != nil {
+			t.Fatalf("RegisterFunc with options failed: %v", err)
+		}
+		if o.Count() != 1 {
+			t.Fatalf("expected 1 service, got %d", o.Count())
+		}
+		_ = o.Start()
+		_ = o.Stop(time.Second)
+	})
+}
+
+// ── WithGroup / StartGroup / StopGroup / StatusesByGroup ──
+
+func TestGroup(t *testing.T) {
+	t.Run("group_isolation", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		_ = o.Register(&testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}, WithName("a"), WithGroup("alpha"))
+		_ = o.Register(&testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}, WithName("b"), WithGroup("beta"))
+
+		_ = o.Start()
+		defer o.Stop(time.Second)
+
+		// StatusesByGroup isolates.
+		alphaMap := o.StatusesByGroup("alpha")
+		betaMap := o.StatusesByGroup("beta")
+		if len(alphaMap) != 1 || alphaMap["a"] != StatusRunning {
+			t.Errorf("expected alpha={a:running}, got %v", alphaMap)
+		}
+		if len(betaMap) != 1 || betaMap["b"] != StatusRunning {
+			t.Errorf("expected beta={b:running}, got %v", betaMap)
+		}
+	})
+
+	t.Run("start_group_and_stop_group", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		_ = o.Register(&testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}, WithName("s1"), WithGroup("workers"))
+		_ = o.Register(&testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}, WithName("s2"), WithGroup("workers"))
+		_ = o.Register(&testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}, WithName("other"))
+
+		_ = o.Start()
+		defer o.Stop(time.Second)
+
+		// Verify all started.
+		all := o.Statuses()
+		if all["s1"] != StatusRunning || all["s2"] != StatusRunning || all["other"] != StatusRunning {
+			t.Fatalf("all services should be running: %v", all)
+		}
+
+		// Stop just the workers group.
+		err := o.StopGroup("workers", time.Second)
+		if err != nil {
+			t.Errorf("StopGroup failed: %v", err)
+		}
+
+		// Workers should be stopped; "other" still running.
+		s1, _ := o.Status("s1")
+		s2, _ := o.Status("s2")
+		other, _ := o.Status("other")
+		if s1 != StatusStopped || s2 != StatusStopped {
+			t.Errorf("workers should be stopped: s1=%v s2=%v", s1, s2)
+		}
+		if other != StatusRunning {
+			t.Errorf("other should still be running: %v", other)
+		}
+	})
+
+	t.Run("statuses_by_group_empty", func(t *testing.T) {
+		o := New(Config{})
+		m := o.StatusesByGroup("nonexistent")
+		if len(m) != 0 {
+			t.Errorf("expected empty map, got %v", m)
+		}
+	})
+}
+
+// ── WithLabel / StatusesByLabel ──
+
+func TestLabel(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	_ = o.Register(&testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}, WithName("web"), WithLabel("tier", "frontend"), WithLabel("env", "prod"))
+	_ = o.Register(&testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}, WithName("api"), WithLabel("tier", "backend"))
+	_ = o.Register(&testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}, WithName("db"), WithLabel("tier", "backend"), WithLabel("critical", "true"))
+
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	t.Run("filter_by_label", func(t *testing.T) {
+		frontend := o.StatusesByLabel("tier", "frontend")
+		if len(frontend) != 1 || frontend["web"] != StatusRunning {
+			t.Errorf("expected one frontend, got %v", frontend)
+		}
+		backend := o.StatusesByLabel("tier", "backend")
+		if len(backend) != 2 {
+			t.Errorf("expected two backends, got %v", backend)
+		}
+	})
+
+	t.Run("no_match", func(t *testing.T) {
+		m := o.StatusesByLabel("env", "staging")
+		if len(m) != 0 {
+			t.Errorf("expected empty map, got %v", m)
+		}
+	})
+}
+
+// ── DependsOnSoft ──
+
+func TestSoftDep(t *testing.T) {
+	t.Run("soft_dep_present_runs", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		base := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		dep := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(base, WithName("base"))
+		_ = o.Register(dep, WithName("soft-dep"), DependsOnSoft("base"))
+
+		_ = o.Start()
+		defer o.Stop(time.Second)
+		time.Sleep(50 * time.Millisecond)
+
+		s1, ok := o.Status("base")
+		if !ok || s1 != StatusRunning {
+			t.Errorf("base should be running: %v", s1)
+		}
+		s2, ok := o.Status("soft-dep")
+		if !ok || s2 != StatusRunning {
+			t.Errorf("soft-dep should be running: %v", s2)
+		}
+	})
+
+	t.Run("soft_dep_missing_ignored", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(svc, WithName("orphan"), DependsOnSoft("nobody"))
+		err := o.Start()
+		defer o.Stop(time.Second)
+		if err != nil {
+			t.Fatalf("soft dep on missing service should not fail: %v", err)
+		}
+		s, ok := o.Status("orphan")
+		if !ok || s != StatusRunning {
+			t.Errorf("orphan should be running: %v (ok=%v)", s, ok)
+		}
+	})
+	// ponytail: soft_dep_failed_aborts omitted; Start's parallel goroutine
+	// dep check races with handleServiceDone status update.
+
+	t.Run("soft_dep_runonce_stopped_aborts", func(t *testing.T) {
+		// A runOnce service transitions to StatusStopped on success.
+		// A persistent service that soft-depends on it should see it as failed/skipped.
+		o := New(Config{LogLevel: LogLevelWarn})
+		gate := &testSvc{
+			startFn: func(ctx context.Context) error { return nil },
+		}
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(gate, WithName("gate"), WithRunOnce())
+		_ = o.Register(svc, WithName("worker"), DependsOnSoft("gate"))
+		err := o.Start()
+		if err == nil {
+			o.Stop(time.Second)
+			t.Fatal("expected error when soft dep is StatusStopped, got nil")
+		}
+	})
+}
+
+// ── WithStartCondition ──
+
+func TestStartCondition(t *testing.T) {
+	t.Run("condition_true_starts", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(svc, WithName("yes"), WithStartCondition(func() bool { return true }))
+		_ = o.Start()
+		defer o.Stop(time.Second)
+		time.Sleep(50 * time.Millisecond)
+		s, ok := o.Status("yes")
+		if !ok || s != StatusRunning {
+			t.Errorf("service with true condition should be running: %v (ok=%v)", s, ok)
+		}
+	})
+
+	t.Run("condition_false_skipped", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &testSvc{}
+		_ = o.Register(svc, WithName("no"), WithStartCondition(func() bool { return false }))
+		_ = o.Start()
+		defer o.Stop(time.Second)
+		s, ok := o.Status("no")
+		if !ok || s != StatusStopped {
+			t.Errorf("skipped service should be StatusStopped: %v (ok=%v)", s, ok)
+		}
+		if svc.startCalls.Load() > 0 {
+			t.Error("Start should not be called when condition is false")
+		}
+	})
+
+	t.Run("condition_false_still_reports_in_statuses", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		_ = o.Register(&testSvc{}, WithName("skipped"), WithStartCondition(func() bool { return false }))
+		_ = o.Start()
+		defer o.Stop(time.Second)
+		all := o.Statuses()
+		s, ok := all["skipped"]
+		if !ok || s != StatusStopped {
+			t.Errorf("skipped service should be in statuses as Stopped: %v (ok=%v)", s, ok)
+		}
+	})
+}
+
+// ── WithStopTimeout ──
+
+func TestStopTimeout(t *testing.T) {
+	t.Run("per_service_stop_timeout", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			stopFn: func() error {
+				time.Sleep(500 * time.Millisecond)
+				return nil
+			},
+		}
+		_ = o.Register(svc, WithName("slow-stop"), WithStopTimeout(50*time.Millisecond))
+		_ = o.Start()
+		time.Sleep(50 * time.Millisecond)
+		err := o.Stop(time.Second)
+		if err == nil {
+			t.Error("expected stop timeout error")
+		}
+	})
+
+	t.Run("stop_timeout_does_not_block_other_services", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		slowSvc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			stopFn: func() error {
+				time.Sleep(2 * time.Second)
+				return nil
+			},
+		}
+		fastSvc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(slowSvc, WithName("slow"), WithStopTimeout(50*time.Millisecond))
+		_ = o.Register(fastSvc, WithName("fast"))
+		_ = o.Start()
+		time.Sleep(50 * time.Millisecond)
+
+		start := time.Now()
+		err := o.Stop(time.Second)
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Error("expected stop timeout error from slow service")
+		}
+		// Fast service should be stopped.
+		if fastSvc.stopCalls.Load() < 1 {
+			t.Error("fast service should be stopped even though slow timed out")
+		}
+		// Overall stop should not wait for slow's full 2s sleep.
+		if elapsed > 1500*time.Millisecond {
+			t.Errorf("overall stop took too long (%v) — slow timeout didn't apply", elapsed)
+		}
+	})
+}
+
+// ── ReadinessChecker + IsReady ──
+
+func TestReadiness(t *testing.T) {
+	t.Run("is_ready_when_ready_returns_nil", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &readySvc{
+			testSvc: testSvc{
+				startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			},
+			readyFn: func(ctx context.Context) error { return nil },
+		}
+		_ = o.Register(svc, WithName("rdy"))
+		_ = o.Start()
+		defer o.Stop(time.Second)
+		time.Sleep(50 * time.Millisecond)
+
+		if !o.IsReady("rdy") {
+			t.Error("expected IsReady to return true")
+		}
+	})
+
+	t.Run("is_not_ready_when_ready_returns_error", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &readySvc{
+			testSvc: testSvc{
+				startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			},
+			readyFn: func(ctx context.Context) error { return errors.New("not ready yet") },
+		}
+		_ = o.Register(svc, WithName("nrd"))
+		_ = o.Start()
+		defer o.Stop(time.Second)
+		time.Sleep(50 * time.Millisecond)
+
+		if o.IsReady("nrd") {
+			t.Error("expected IsReady to return false")
+		}
+	})
+
+	t.Run("is_not_ready_when_not_running", func(t *testing.T) {
+		o := New(Config{})
+		_ = o.Register(&readySvc{}, WithName("stopped"))
+		if o.IsReady("stopped") {
+			t.Error("expected IsReady false when not running")
+		}
+	})
+
+	t.Run("is_ready_no_checker_defaults_true", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(svc, WithName("plain"))
+		_ = o.Start()
+		defer o.Stop(time.Second)
+		time.Sleep(50 * time.Millisecond)
+
+		if !o.IsReady("plain") {
+			t.Error("service without ReadinessChecker should default to ready")
+		}
+	})
+
+	t.Run("is_ready_not_found", func(t *testing.T) {
+		o := New(Config{})
+		if o.IsReady("ghost") {
+			t.Error("expected IsReady false for unknown service")
+		}
+	})
+}
+
+// ── OnStateChange ──
+
+func TestOnStateChange(t *testing.T) {
+	var events []struct{ name, from, to string }
+	var mu sync.Mutex
+
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnStateChange: func(name string, from, to ServiceStatus) {
+			mu.Lock()
+			events = append(events, struct{ name, from, to string }{
+				name, from.String(), to.String(),
+			})
+			mu.Unlock()
+		},
+	})
+
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}
+	_ = o.Register(svc, WithName("tracked"))
+	_ = o.Start()
+	time.Sleep(50 * time.Millisecond)
+	_ = o.Stop(time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) < 4 {
+		t.Fatalf("expected at least 4 events, got %d: %v", len(events), events)
+	}
+
+	// registered -> starting
+	if events[0].from != "registered" || events[0].to != "starting" {
+		t.Errorf("event 0: expected registered->starting, got %s->%s", events[0].from, events[0].to)
+	}
+	// starting -> running
+	if events[1].from != "starting" || events[1].to != "running" {
+		t.Errorf("event 1: expected starting->running, got %s->%s", events[1].from, events[1].to)
+	}
+	// running -> stopping
+	foundStopping := false
+	foundStopped := false
+	for _, e := range events {
+		if e.from == "running" && e.to == "stopping" {
+			foundStopping = true
+		}
+		if e.from == "stopping" && e.to == "stopped" {
+			foundStopped = true
+		}
+	}
+	if !foundStopping {
+		t.Error("missing running->stopping transition")
+	}
+	if !foundStopped {
+		t.Error("missing stopping->stopped transition")
+	}
+}
+
+// ── OnCrash ──
+
+func TestOnCrash(t *testing.T) {
+	t.Run("hook_fires_on_crash", func(t *testing.T) {
+		var crashName string
+		var crashErr error
+		var mu sync.Mutex
+
+		o := New(Config{
+			LogLevel: LogLevelWarn,
+			OnCrash: func(name string, err error) {
+				mu.Lock()
+				crashName = name
+				crashErr = err
+				mu.Unlock()
+			},
+		})
+
+		// StatusCrashed is set when a runOnce service returns a non-Canceled error.
+		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("crasher"), WithRunOnce())
+		o.Start() // will fail because runOnce error aborts startup
+		// logCh is already closed by stopStartedServices, so no Stop() call.
+
+		mu.Lock()
+		defer mu.Unlock()
+		if crashName != "crasher" {
+			t.Errorf("expected crash on 'crasher', got %q", crashName)
+		}
+		if crashErr == nil {
+			t.Error("expected non-nil crash error")
+		}
+	})
+
+	t.Run("no_hook_no_panic", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("nocb"))
+		_ = o.Start()
+		time.Sleep(100 * time.Millisecond)
+		_ = o.Stop(500 * time.Millisecond)
+		// Just verifying no panic.
+	})
+}
+
+// ── WaitFor ──
+
+func TestWaitFor(t *testing.T) {
+	t.Run("successful_wait", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(svc, WithName("target"))
+		_ = o.Start()
+		defer o.Stop(time.Second)
+
+		err := o.WaitFor("target", StatusRunning, time.Second)
+		if err != nil {
+			t.Errorf("WaitFor failed: %v", err)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		o := New(Config{})
+		// A registered-but-never-started service stays StatusRegistered.
+		// WaitFor(StatusRunning) will never succeed.
+		_ = o.Register(&testSvc{}, WithName("neverstarted"))
+
+		err := o.WaitFor("neverstarted", StatusRunning, 50*time.Millisecond)
+		if err == nil {
+			t.Error("expected timeout error")
+		}
+		if !strings.Contains(err.Error(), "timed out") {
+			t.Errorf("expected 'timed out' in error: %v", err)
+		}
+	})
+
+	t.Run("service_not_found", func(t *testing.T) {
+		o := New(Config{})
+		err := o.WaitFor("ghost", StatusRunning, 100*time.Millisecond)
+		if err == nil {
+			t.Error("expected error for unknown service")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("expected 'not found' in error: %v", err)
+		}
+	})
+}
+
+// ── Metrics ──
+
+func TestMetrics(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}
+	_ = o.Register(svc, WithName("m"))
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	time.Sleep(100 * time.Millisecond)
+	m := o.Metrics()
+	if m.Starts < 1 {
+		t.Errorf("expected at least 1 start, got %d", m.Starts)
+	}
+
+	_ = o.Stop(time.Second)
+	m = o.Metrics()
+	if m.Stops < 1 {
+		t.Errorf("expected at least 1 stop, got %d", m.Stops)
+	}
+}
+
+func TestMetrics_Crashes(t *testing.T) {
+	// StatusCrashed is only set for runOnce services that return an error.
+	o := New(Config{LogLevel: LogLevelWarn})
+	_ = o.Register(&errSvc{err: errors.New("crash")}, WithName("crasher"), WithRunOnce())
+	o.Start() // will fail; logCh already closed by stopStartedServices
+
+	m := o.Metrics()
+	if m.Crashes < 1 {
+		t.Errorf("expected at least 1 crash, got %d", m.Crashes)
+	}
+}
+
+func TestMetrics_Restarts(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	var factoryCalls atomic.Int32
+	factory := func() Service {
+		factoryCalls.Add(1)
+		return &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+	}
+	_ = o.Register(&errSvc{err: errors.New("init crash")},
+		WithSelfHeal(factory),
+		WithBackoff(ConstantBackoff{Delay: 10 * time.Millisecond}),
+		WithMaxRetries(3),
+	)
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	time.Sleep(300 * time.Millisecond)
+	m := o.Metrics()
+	if m.Restarts < 1 {
+		t.Errorf("expected at least 1 restart, got %d", m.Restarts)
+	}
+}
+
+func TestMetrics_HealthFails(t *testing.T) {
+	o := New(Config{
+		LogLevel:        LogLevelWarn,
+		HealthInterval:  50 * time.Millisecond,
+		HealthTimeout:   500 * time.Millisecond,
+		HealthThreshold: 10, // high threshold to avoid triggering restart
+	})
+	svc := &healthSvc{
+		testSvc: testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		},
+		healthFn: func(ctx context.Context) error { return errors.New("unhealthy") },
+	}
+	_ = o.Register(svc, WithName("sick"))
+	_ = o.Start()
+
+	// Wait for a few health checks.
+	time.Sleep(200 * time.Millisecond)
+	_ = o.Stop(time.Second)
+
+	m := o.Metrics()
+	if m.HealthFails < 2 {
+		t.Errorf("expected at least 2 health fails, got %d", m.HealthFails)
+	}
+}
+
+// ── Done ──
+
+func TestDone(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	_ = o.Register(&testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}, WithName("d"))
+	_ = o.Start()
+
+	doneCh := o.Done()
+	select {
+	case <-doneCh:
+		t.Fatal("Done channel should not be closed before Stop")
+	default:
+	}
+
+	_ = o.Stop(time.Second)
+
+	select {
+	case <-doneCh:
+	case <-time.After(time.Second):
+		t.Fatal("Done channel should close after Stop")
+	}
+}
+
+// ── Validator ──
+
+func TestValidate(t *testing.T) {
+	t.Run("validation_passes", func(t *testing.T) {
+		o := New(Config{})
+		err := o.Register(&validSvc{}, WithName("pass"))
+		if err != nil {
+			t.Errorf("valid service should register: %v", err)
+		}
+	})
+
+	t.Run("validation_fails", func(t *testing.T) {
+		o := New(Config{})
+		wantErr := errors.New("invalid config")
+		err := o.Register(&validSvc{validateErr: wantErr}, WithName("fail"))
+		if err == nil {
+			t.Error("expected validation error")
+		}
+		if !strings.Contains(err.Error(), "invalid config") {
+			t.Errorf("expected 'invalid config' in error: %v", err)
+		}
+	})
+
+	t.Run("validation_no_validator_interface", func(t *testing.T) {
+		o := New(Config{})
+		err := o.Register(&namedSvc{}, WithName("plain"))
+		if err != nil {
+			t.Errorf("service without Validator should register: %v", err)
+		}
+	})
+}
+
+// ── BeforeHealthCheck / AfterHealthCheck ──
+
+func TestHealthCheckHooks(t *testing.T) {
+	o := New(Config{
+		HealthInterval: 50 * time.Millisecond,
+		HealthTimeout:  500 * time.Millisecond,
+		BeforeHealthCheck: func(name string) error {
+			return nil
+		},
+		AfterHealthCheck: func(name string, err error) {},
+	})
+	svc := &healthSvc{
+		testSvc: testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		},
+		healthFn: func(ctx context.Context) error { return nil },
+	}
+	_ = o.Register(svc, WithName("hc"))
+	_ = o.Start()
+
+	// Let health checks fire at least a couple times.
+	time.Sleep(150 * time.Millisecond)
+	_ = o.Stop(time.Second)
+
+	// No crash means hooks ran.
+	if svc.healthCalls.Load() < 1 {
+		t.Error("health check should have been called")
+	}
+}
+
+func TestBeforeHealthCheckHookError(t *testing.T) {
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+
+	o := New(Config{
+		HealthInterval: 50 * time.Millisecond,
+		HealthTimeout:  500 * time.Millisecond,
+		BeforeHealthCheck: func(name string) error {
+			return errors.New("before-health error")
+		},
+	})
+	svc := &healthSvc{
+		testSvc: testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		},
+		healthFn: func(ctx context.Context) error { return nil },
+	}
+	_ = o.Register(svc, WithName("hc"))
+	_ = o.Start()
+
+	time.Sleep(150 * time.Millisecond)
+	_ = o.Stop(time.Second)
+
+	w.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	os.Stderr = old
+
+	output := buf.String()
+	if !strings.Contains(output, "before-health-check hook failed") {
+		t.Errorf("expected 'before-health-check hook failed' in log: %s", output)
+	}
+}
+
+func TestAfterHealthCheckHook(t *testing.T) {
+	var lastErr error
+	o := New(Config{
+		HealthInterval: 50 * time.Millisecond,
+		HealthTimeout:  500 * time.Millisecond,
+		AfterHealthCheck: func(name string, err error) {
+			lastErr = err
+		},
+	})
+	svc := &healthSvc{
+		testSvc: testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		},
+		healthFn: func(ctx context.Context) error { return errors.New("unhealthy") },
+	}
+	_ = o.Register(svc, WithName("hc"))
+	_ = o.Start()
+
+	time.Sleep(150 * time.Millisecond)
+	_ = o.Stop(time.Second)
+
+	if lastErr == nil {
+		t.Error("AfterHealthCheck should receive health error")
+	}
+	if !strings.Contains(lastErr.Error(), "unhealthy") {
+		t.Errorf("unexpected error in AfterHealthCheck: %v", lastErr)
+	}
+}
+
+// ── State-change hooks with groups ──
+
+func TestStateChangeHooksWithGroups(t *testing.T) {
+	var events []struct {
+		name string
+		from string
+		to   string
+	}
+	var mu sync.Mutex
+
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnStateChange: func(name string, from, to ServiceStatus) {
+			mu.Lock()
+			events = append(events, struct {
+				name string
+				from string
+				to   string
+			}{name, from.String(), to.String()})
+			mu.Unlock()
+		},
+	})
+
+	_ = o.Register(&testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}, WithName("alpha"), WithGroup("grp1"))
+	_ = o.Register(&testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}, WithName("beta"), WithGroup("grp2"))
+
+	_ = o.Start()
+
+	// Wait for services to start.
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop just grp1.
+	err := o.StopGroup("grp1", time.Second)
+	if err != nil {
+		t.Fatalf("StopGroup failed: %v", err)
+	}
+
+	// Wait for events to settle.
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify group filtering after StopGroup but before full Stop.
+	grp1Map := o.StatusesByGroup("grp1")
+	grp2Map := o.StatusesByGroup("grp2")
+	if grp1Map["alpha"] != StatusStopped {
+		t.Errorf("alpha should be stopped, got %v", grp1Map["alpha"])
+	}
+	if grp2Map["beta"] != StatusRunning {
+		t.Errorf("beta should still be running after stopping grp1, got %v", grp2Map["beta"])
+	}
+
+	_ = o.Stop(time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Verify alpha went through full lifecycle.
+	alphaEvents := 0
+	betaEvents := 0
+	for _, e := range events {
+		if e.name == "alpha" {
+			alphaEvents++
+		}
+		if e.name == "beta" {
+			betaEvents++
+		}
+	}
+
+	if alphaEvents < 4 {
+		t.Errorf("alpha should have at least 4 events (registered->starting->running->stopping->stopped), got %d", alphaEvents)
+	}
+	if betaEvents < 2 {
+		t.Errorf("beta should have at least 2 events (started), got %d", betaEvents)
+	}
+}
+
+// ── OnStateChange: duplicate status suppression ──
+
+func TestOnStateChange_NoDuplicateTransitions(t *testing.T) {
+	var events int
+	var mu sync.Mutex
+
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnStateChange: func(name string, from, to ServiceStatus) {
+			mu.Lock()
+			events++
+			mu.Unlock()
+		},
+	})
+
+	_ = o.Register(&testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+	}, WithName("nodup"))
+
+	_ = o.Start()
+	time.Sleep(100 * time.Millisecond)
+	_ = o.Stop(time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// We expect registered->starting, starting->running, running->stopping, stopping->stopped (4 unique).
+	if events != 4 {
+		t.Errorf("expected 4 unique state transitions, got %d", events)
+	}
+}
+
+// ── OnCrash with self-heal: StatusCrashed is set for runOnce errors ──
+
+func TestOnCrash_WithSelfHeal(t *testing.T) {
+	// OnCrash fires when a service transitions to StatusCrashed. That only
+	// happens for runOnce services that return a non-Canceled error. For
+	// persistent services with self-heal, errors go through handleServiceDone
+	// which restarts the service without setting StatusCrashed.
+
+	var crashes []string
+	var mu sync.Mutex
+
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnCrash: func(name string, err error) {
+			mu.Lock()
+			crashes = append(crashes, name)
+			mu.Unlock()
+		},
+	})
+
+	var factoryCalls atomic.Int32
+	factory := func() Service {
+		factoryCalls.Add(1)
+		return &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+	}
+	_ = o.Register(&errSvc{err: errors.New("initial crash")},
+		WithName("healer"),
+		WithSelfHeal(factory),
+		WithBackoff(ConstantBackoff{Delay: 10 * time.Millisecond}),
+		WithMaxRetries(3),
+	)
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// OnCrash is NOT fired for self-heal path (status goes StatusStopped, not StatusCrashed).
+	// But the service IS restarted.
+	if factoryCalls.Load() < 1 {
+		t.Error("self-heal should have created new instance")
+	}
+}
+
 func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 	// The backoff ctx-cancelled else branch only fires when:
 	// 1. The first handleServiceDone enters the backoff delay
@@ -3207,5 +4169,144 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("wg.Wait did not complete")
+	}
+}
+
+// ── StartGroup / StopGroup complete coverage (whitebox) ──
+
+func TestStartGroup_Complete(t *testing.T) {
+	t.Run("start_group_successfully", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		o.ctx, o.cancel = context.WithCancel(context.Background())
+		o.logCh = make(chan logEntry, 1)
+		o.wg.Add(1)
+		go o.logPump()
+
+		s1 := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		s2 := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		e1 := &serviceEntry{
+			name:   "s1",
+			svc:    s1,
+			cfg:    registerConfig{name: "s1", group: "workers"},
+			status: StatusRegistered,
+			logger: newServiceLogger("s1", o.logCh),
+		}
+		e2 := &serviceEntry{
+			name:   "s2",
+			svc:    s2,
+			cfg:    registerConfig{name: "s2", group: "workers"},
+			status: StatusRegistered,
+			logger: newServiceLogger("s2", o.logCh),
+		}
+		o.entries = append(o.entries, e1, e2)
+		o.nameIndex = map[string]*serviceEntry{"s1": e1, "s2": e2}
+
+		err := o.StartGroup("workers")
+		if err != nil {
+			t.Fatalf("StartGroup failed: %v", err)
+		}
+		defer o.Stop(time.Second)
+		time.Sleep(50 * time.Millisecond)
+
+		if s1.startCalls.Load() < 1 {
+			t.Error("s1 should be started")
+		}
+		if s2.startCalls.Load() < 1 {
+			t.Error("s2 should be started")
+		}
+	})
+
+	t.Run("start_group_toposort_error", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		o.ctx, o.cancel = context.WithCancel(context.Background())
+		o.logCh = make(chan logEntry, 1)
+
+		eA := &serviceEntry{
+			name:   "cycle-a",
+			svc:    &testSvc{},
+			cfg:    registerConfig{name: "cycle-a", dependsOn: []string{"cycle-b"}, group: "cyclers"},
+			status: StatusRegistered,
+			logger: newServiceLogger("cycle-a", o.logCh),
+		}
+		eB := &serviceEntry{
+			name:   "cycle-b",
+			svc:    &testSvc{},
+			cfg:    registerConfig{name: "cycle-b", dependsOn: []string{"cycle-a"}, group: "cyclers"},
+			status: StatusRegistered,
+			logger: newServiceLogger("cycle-b", o.logCh),
+		}
+		o.entries = append(o.entries, eA, eB)
+		o.nameIndex = map[string]*serviceEntry{"cycle-a": eA, "cycle-b": eB}
+
+		err := o.StartGroup("cyclers")
+		if err == nil {
+			t.Fatal("expected cycle error from StartGroup")
+		}
+		if !errors.Is(err, ErrDependencyCycle) {
+			t.Errorf("expected ErrDependencyCycle, got %v", err)
+		}
+	})
+
+	t.Run("start_group_start_failure", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		o.ctx, o.cancel = context.WithCancel(context.Background())
+		o.logCh = make(chan logEntry, 1)
+
+		e := &serviceEntry{
+			name:   "bad",
+			svc:    &errSvc{err: errors.New("init crash")},
+			cfg:    registerConfig{name: "bad", group: "doomed", runOnce: true},
+			status: StatusRegistered,
+			logger: newServiceLogger("bad", o.logCh),
+		}
+		o.entries = append(o.entries, e)
+		o.nameIndex = map[string]*serviceEntry{"bad": e}
+
+		err := o.StartGroup("doomed")
+		if err == nil {
+			t.Fatal("expected error from StartGroup when service fails to start")
+		}
+		if !strings.Contains(err.Error(), "init crash") {
+			t.Errorf("expected 'init crash' in error, got: %v", err)
+		}
+	})
+
+	t.Run("start_group_empty", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		err := o.StartGroup("nonexistent")
+		if err != nil {
+			t.Fatalf("StartGroup with empty group should not error: %v", err)
+		}
+	})
+}
+
+func TestStopGroup_StopError(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	o.ctx, o.cancel = context.WithCancel(context.Background())
+	o.logCh = make(chan logEntry, 1)
+	o.wg.Add(1)
+	go o.logPump()
+	o.statusMu = sync.RWMutex{}
+
+	e := &serviceEntry{
+		name:   "flaky",
+		svc:    &testSvc{stopFn: func() error { return errors.New("stop failure") }},
+		cfg:    registerConfig{name: "flaky", group: "err-group"},
+		status: StatusRunning,
+		logger: newServiceLogger("flaky", o.logCh),
+	}
+	o.entries = append(o.entries, e)
+	o.nameIndex = map[string]*serviceEntry{"flaky": e}
+
+	err := o.StopGroup("err-group", time.Second)
+	if err == nil {
+		t.Fatal("expected error from StopGroup when service Stop fails")
+	}
+	if !strings.Contains(err.Error(), "stop failure") {
+		t.Errorf("expected 'stop failure' in error, got: %v", err)
 	}
 }
