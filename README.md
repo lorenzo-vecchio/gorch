@@ -38,6 +38,7 @@ Requires Go 1.25+.
 package main
 
 import (
+    "context"
     "time"
 
     "github.com/lorenzo-vecchio/gorch/gorch"
