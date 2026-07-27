@@ -1,3 +1,7 @@
+// Package gorch is a composable Go orchestrator for managing goroutine lifecycles.
+// It handles start, stop, cron scheduling, and inter-service pub-sub messaging
+// with self-healing restart. Orchestrators can be nested — a service may create
+// and manage its own gorch instance for sub-services.
 package gorch
 
 import (
