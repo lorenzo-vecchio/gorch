@@ -31,16 +31,34 @@ type ServiceContext struct {
 	Messenger *Messenger
 }
 
-// ServiceLogger — a logger that doesn't log; it sends entries to gorch's log channel.
-// gorch consumes the channel and does the actual output (formatting, writing to stderr).
-type ServiceLogger struct {
-	svcName string
-	ch      chan<- logEntry // send-only, shared across all services
+// Logger is the logging interface used by gorch. Services receive a *ServiceLogger
+// which satisfies this interface. Inject a custom implementation via Config.Logger.
+// The standard library's *slog.Logger satisfies this interface directly.
+type Logger interface {
+	Info(msg string, args ...any)
+	Error(msg string, args ...any)
+	Debug(msg string, args ...any)
+	Warn(msg string, args ...any)
 }
 
-// newServiceLogger creates a ServiceLogger (internal, called by orchestrator).
+// ServiceLogger — a logger that doesn't log; it sends entries to gorch's log channel.
+// gorch consumes the channel and does the actual output (formatting, writing to stderr).
+// When a custom Logger is set via Config.Logger, ServiceLogger delegates to it
+// instead of the channel, prepending "service"=<name> to the key-value pairs.
+type ServiceLogger struct {
+	svcName string
+	ch      chan<- logEntry // used by default channel-based logging
+	logger  Logger          // custom logger (bypasses channel)
+}
+
+// newServiceLogger creates a channel-based ServiceLogger (internal).
 func newServiceLogger(svcName string, ch chan<- logEntry) *ServiceLogger {
 	return &ServiceLogger{svcName: svcName, ch: ch}
+}
+
+// newServiceLoggerWith creates a ServiceLogger that delegates to a custom Logger.
+func newServiceLoggerWith(svcName string, logger Logger) *ServiceLogger {
+	return &ServiceLogger{svcName: svcName, logger: logger}
 }
 
 func (l *ServiceLogger) Info(msg string, args ...any)  { l.emit(LogLevelInfo, msg, args) }
@@ -49,6 +67,22 @@ func (l *ServiceLogger) Debug(msg string, args ...any) { l.emit(LogLevelDebug, m
 func (l *ServiceLogger) Warn(msg string, args ...any)  { l.emit(LogLevelWarn, msg, args) }
 
 func (l *ServiceLogger) emit(level LogLevel, msg string, args []any) {
+	if l.logger != nil {
+		fullArgs := make([]any, 0, len(args)+2)
+		fullArgs = append(fullArgs, "service", l.svcName)
+		fullArgs = append(fullArgs, args...)
+		switch level {
+		case LogLevelInfo:
+			l.logger.Info(msg, fullArgs...)
+		case LogLevelError:
+			l.logger.Error(msg, fullArgs...)
+		case LogLevelDebug:
+			l.logger.Debug(msg, fullArgs...)
+		case LogLevelWarn:
+			l.logger.Warn(msg, fullArgs...)
+		}
+		return
+	}
 	select {
 	case l.ch <- logEntry{time: time.Now(), level: level, service: l.svcName, msg: msg, args: args}:
 	default: // drop if channel full

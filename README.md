@@ -30,7 +30,8 @@ Requires Go 1.25+.
 - **Status introspection** — `Status`, `Statuses`, `Names`, `Count` for runtime observability.
 - **Error aggregation** — `errors.Join` in `Start`/`Stop` so all failures are reported, not just the first.
 - **Nestable orchestrators** — a service can create its own gorch for sub-services.
-- **Structured logging** — channel-based log-pump; services call `Info/Error/Debug/Warn` on a `ServiceLogger`, no slog dependency.
+- **Structured logging** — channel-based log-pump writes to stderr; services call `Info/Error/Debug/Warn` on a `ServiceLogger`.
+- **Custom logger** — inject any logger satisfying the `Logger` interface (e.g. `*slog.Logger`); service name is prepended as a key-value pair to every call.
 - **RegisterFunc** — closure-based services for simple cases; no boilerplate struct needed.
 - **Service groups** — `WithGroup`, `StartGroup`, `StopGroup`, `StatusesByGroup` for operating on subsets.
 - **Labels** — `WithLabel` + `StatusesByLabel` for metadata filtering.
@@ -289,7 +290,26 @@ sc.Logger.Info("request completed", "status", 200, "latency", 12*time.Millisecon
 // 2026-07-27 14:30:05.123 INFO  *main.MyService --- request completed status=200 latency=12ms
 ```
 
-The log-pump writes to `os.Stderr`. Log level filters entries: `Debug < Info < Warn < Error`.
+The built-in log-pump writes to `os.Stderr`. Log level filters entries: `Debug < Info < Warn < Error`.
+
+#### Custom logger
+
+Inject any logger that satisfies the `Logger` interface via `Config.Logger`. `*slog.Logger` from the standard library satisfies this interface directly.
+
+```go
+import "log/slog"
+
+orch := gorch.New(gorch.Config{
+    Logger: slog.Default(),
+})
+```
+
+When a custom logger is set, the built-in log-pump is disabled entirely. The service name is prepended as `"service"=<name>` to every log call so the custom logger can include or exclude it as needed. `Config.LogLevel` is ignored — the custom logger manages its own level filtering.
+
+```go
+// With slog, the service name appears as a structured key-value pair:
+// level=INFO msg="request completed" service=api status=200 latency=12ms
+```
 
 ### RegisterFunc
 

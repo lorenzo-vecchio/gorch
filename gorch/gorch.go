@@ -42,7 +42,14 @@ func (l LogLevel) String() string {
 
 // Config holds orchestrator configuration.
 type Config struct {
-	LogLevel LogLevel // defaults to LogLevelInfo if zero
+	// Logger is an optional custom logger. When set, gorch sends all log output
+	// through it instead of the built-in stderr logger. The service name is
+	// prepended as a "service"=<name> key-value pair to every call.
+	// When nil (default), gorch uses its built-in channel-based logger which
+	// writes to stderr with a fixed timestamp+level+service format.
+	Logger Logger
+
+	LogLevel LogLevel // defaults to LogLevelInfo if zero; ignored when Logger is set
 
 	// DefaultStartTimeout is the default per-service start deadline.
 	// 0 means no timeout (use WithStartTimeout per-service).
@@ -297,7 +304,10 @@ func (o *Orchestrator) Start() error {
 		o.mu.Unlock()
 
 		o.ctx, o.cancel = context.WithCancel(context.Background())
-		o.logCh = make(chan logEntry, 256)
+		// Only create log channel when using the default (channel-based) logger.
+		if o.cfg.Logger == nil {
+			o.logCh = make(chan logEntry, 256)
+		}
 
 		// Assign loggers: use cfg.name if WithName was set, else reflect type.
 		for _, entry := range o.entries {
@@ -307,12 +317,18 @@ func (o *Orchestrator) Start() error {
 			if svcName == "" || svcName[0] == '$' {
 				svcName = reflect.TypeOf(entry.svc).String()
 			}
-			entry.logger = newServiceLogger(svcName, o.logCh)
+			if o.cfg.Logger != nil {
+				entry.logger = newServiceLoggerWith(svcName, o.cfg.Logger)
+			} else {
+				entry.logger = newServiceLogger(svcName, o.logCh)
+			}
 		}
 
-		// Spawn log-pump goroutine.
-		o.wg.Add(1)
-		go o.logPump()
+		// Spawn log-pump goroutine (default logger only).
+		if o.cfg.Logger == nil {
+			o.wg.Add(1)
+			go o.logPump()
+		}
 
 		// Set up cron scheduler (with seconds field).
 		o.cronSched = cron.New(cron.WithSeconds())
@@ -326,7 +342,9 @@ func (o *Orchestrator) Start() error {
 			})
 			if err != nil {
 				o.cancel()
-				close(o.logCh)
+				if o.logCh != nil {
+					close(o.logCh)
+				}
 				o.cronSched.Stop()
 				startErr = fmt.Errorf("%w: %w", ErrInvalidCron, err)
 				return
@@ -699,7 +717,9 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		}
 
 		// 4. Close log channel to signal log-pump to drain and exit.
-		close(o.logCh)
+		if o.logCh != nil {
+			close(o.logCh)
+		}
 
 		// 5. Clean up messenger subscriptions.
 		cleanup := o.messengerDone()
@@ -1345,7 +1365,11 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 	if svcName == "" || svcName[0] == '$' {
 		svcName = reflect.TypeOf(newSvc).String()
 	}
-	entry.logger = newServiceLogger(svcName, o.logCh)
+	if o.cfg.Logger != nil {
+		entry.logger = newServiceLoggerWith(svcName, o.cfg.Logger)
+	} else {
+		entry.logger = newServiceLogger(svcName, o.logCh)
+	}
 	entry.stableSince = time.Now()
 
 	// New per-service context.
