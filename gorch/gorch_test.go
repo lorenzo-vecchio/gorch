@@ -1022,6 +1022,56 @@ func TestSelfHeal_CustomBackoff(t *testing.T) {
 	}
 }
 
+// TestSelfHeal_ConcurrentHealthProbe exercises the per-entry state mutex: a
+// self-healing service crashes repeatedly while Health() and the health-check
+// loop read its state concurrently. Run with -race.
+func TestSelfHeal_ConcurrentHealthProbe(t *testing.T) {
+	o := New(Config{
+		LogLevel:        LogLevelWarn,
+		HealthInterval:  5 * time.Millisecond,
+		HealthTimeout:   100 * time.Millisecond,
+		HealthThreshold: 3,
+	})
+
+	mk := func() Service {
+		return &healthSvc{
+			testSvc: testSvc{
+				startFn: func(ctx context.Context) error {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(time.Millisecond):
+						return errors.New("crash quickly")
+					}
+				},
+			},
+			healthFn: func(ctx context.Context) error { return errors.New("unhealthy") },
+		}
+	}
+	_ = o.Register(mk(), WithName("flaky"),
+		WithSelfHeal(mk),
+		WithBackoff(ConstantBackoff{Delay: time.Millisecond}),
+	)
+
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				o.Health()
+			}
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+}
+
 // ── Service panic recovery ──
 
 func TestServicePanicRecovery(t *testing.T) {

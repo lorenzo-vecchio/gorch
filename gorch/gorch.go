@@ -99,6 +99,11 @@ type logEntry struct {
 
 // serviceEntry tracks a registered service with its options and runtime state.
 type serviceEntry struct {
+	// stateMu guards svc, logger, cancel, retryCount, stableSince, and
+	// healthFailures — the fields the self-heal restart path mutates while the
+	// health-check loop and introspection methods (Health, IsReady) read them.
+	stateMu sync.Mutex
+
 	svc    Service
 	cfg    registerConfig
 	logger *ServiceLogger
@@ -122,6 +127,90 @@ type serviceEntry struct {
 	wgDone bool // true once wg.Done() has been called for this entry
 	// CronSkip / CronQueue gate
 	running atomic.Bool
+}
+
+// getSvc returns the current service instance (thread-safe).
+func (e *serviceEntry) getSvc() Service {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.svc
+}
+
+// setSvc replaces the service instance (thread-safe).
+func (e *serviceEntry) setSvc(svc Service) {
+	e.stateMu.Lock()
+	e.svc = svc
+	e.stateMu.Unlock()
+}
+
+// getLogger returns the current logger (thread-safe).
+func (e *serviceEntry) getLogger() *ServiceLogger {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.logger
+}
+
+// setLogger replaces the logger (thread-safe).
+func (e *serviceEntry) setLogger(l *ServiceLogger) {
+	e.stateMu.Lock()
+	e.logger = l
+	e.stateMu.Unlock()
+}
+
+// getCancel returns the per-service cancel func (thread-safe).
+func (e *serviceEntry) getCancel() context.CancelFunc {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.cancel
+}
+
+// setCancel replaces the per-service cancel func (thread-safe).
+func (e *serviceEntry) setCancel(c context.CancelFunc) {
+	e.stateMu.Lock()
+	e.cancel = c
+	e.stateMu.Unlock()
+}
+
+// getRetryCount returns the retry counter (thread-safe).
+func (e *serviceEntry) getRetryCount() int {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.retryCount
+}
+
+// setRetryCount sets the retry counter (thread-safe).
+func (e *serviceEntry) setRetryCount(n int) {
+	e.stateMu.Lock()
+	e.retryCount = n
+	e.stateMu.Unlock()
+}
+
+// getStableSince returns the stability-window start (thread-safe).
+func (e *serviceEntry) getStableSince() time.Time {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.stableSince
+}
+
+// setStableSince sets the stability-window start (thread-safe).
+func (e *serviceEntry) setStableSince(t time.Time) {
+	e.stateMu.Lock()
+	e.stableSince = t
+	e.stateMu.Unlock()
+}
+
+// getHealthFailures returns the health-failure counter (thread-safe).
+func (e *serviceEntry) getHealthFailures() int {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.healthFailures
+}
+
+// setHealthFailures sets the health-failure counter (thread-safe).
+func (e *serviceEntry) setHealthFailures(n int) {
+	e.stateMu.Lock()
+	e.healthFailures = n
+	e.stateMu.Unlock()
 }
 
 // Orchestrator manages service lifecycles.
@@ -338,12 +427,12 @@ func (o *Orchestrator) Start() error {
 			// ponytail: if user didn't set WithName, the name is auto "$N".
 			// Use reflect type for logging to keep backward compat.
 			if svcName == "" || svcName[0] == '$' {
-				svcName = reflect.TypeOf(entry.svc).String()
+				svcName = reflect.TypeOf(entry.getSvc()).String()
 			}
 			if o.cfg.Logger != nil {
-				entry.logger = newServiceLoggerWith(svcName, o.cfg.Logger)
+				entry.setLogger(newServiceLoggerWith(svcName, o.cfg.Logger))
 			} else {
-				entry.logger = newServiceLogger(svcName, o.logCh, o.logQuit)
+				entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit))
 			}
 		}
 
@@ -524,11 +613,11 @@ func (o *Orchestrator) resetAfterStartFailure() {
 	for _, entry := range o.entries {
 		entry.status = StatusRegistered
 		entry.wgDone = false
-		entry.cancel = nil
-		entry.retryCount = 0
-		entry.healthFailures = 0
-		entry.stableSince = time.Time{}
-		entry.logger = nil
+		entry.setCancel(nil)
+		entry.setRetryCount(0)
+		entry.setHealthFailures(0)
+		entry.setStableSince(time.Time{})
+		entry.setLogger(nil)
 	}
 }
 
@@ -557,13 +646,13 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 
 	// Per-service context with optional timeout.
 	svcCtx, svcCancel := context.WithCancel(o.ctx)
-	entry.cancel = svcCancel
+	entry.setCancel(svcCancel)
 	entry.startedAt = time.Now()
-	entry.stableSince = time.Now()
+	entry.setStableSince(time.Now())
 
 	sc := ServiceContext{
 		Context:   svcCtx,
-		Logger:    entry.logger,
+		Logger:    entry.getLogger(),
 		Messenger: o.messenger,
 	}
 
@@ -587,11 +676,11 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
-						entry.logger.Error("service panicked", "panic", fmt.Sprint(r))
+						entry.getLogger().Error("service panicked", "panic", fmt.Sprint(r))
 						done <- fmt.Errorf("panic: %v", r)
 					}
 				}()
-				done <- entry.svc.Start(sc)
+				done <- entry.getSvc().Start(sc)
 			}()
 			select {
 			case err = <-done:
@@ -603,9 +692,9 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 				svcCancel()
 			}
 		} else {
-			err = entry.svc.Start(sc)
+			err = entry.getSvc().Start(sc)
 		}
-		entry.cancel = nil
+		entry.setCancel(nil)
 		svcCancel()
 
 		if err != nil && err != context.Canceled {
@@ -643,7 +732,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 			}
 			o.handleServiceDone(entry, sc, exitErr)
 		}()
-		exitErr = entry.svc.Start(sc)
+		exitErr = entry.getSvc().Start(sc)
 		if exitErr != nil && exitErr != context.Canceled {
 			sc.Logger.Error("service returned error", "error", exitErr.Error())
 		}
@@ -834,14 +923,14 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 	timeout := entry.cfg.stopTimeout
 	if timeout > 0 {
 		done := make(chan error, 1)
-		go func() { done <- o.safeStopWithResult(entry.svc) }()
+		go func() { done <- o.safeStopWithResult(entry.getSvc()) }()
 		select {
 		case stopErr = <-done:
 		case <-time.After(timeout):
 			stopErr = fmt.Errorf("stop timeout after %v", timeout)
 		}
 	} else {
-		stopErr = o.safeStopWithResult(entry.svc)
+		stopErr = o.safeStopWithResult(entry.getSvc())
 	}
 
 	// --- after-stop hook ---
@@ -973,7 +1062,7 @@ func (o *Orchestrator) Health() map[string]error {
 
 	result := make(map[string]error, len(entries))
 	for _, e := range entries {
-		hc, ok := e.svc.(HealthChecker)
+		hc, ok := e.getSvc().(HealthChecker)
 		if !ok {
 			result[e.name] = nil
 			continue
@@ -1009,7 +1098,7 @@ func (o *Orchestrator) IsReady(name string) bool {
 	if s != StatusRunning {
 		return false
 	}
-	rc, ok := entry.svc.(ReadinessChecker)
+	rc, ok := entry.getSvc().(ReadinessChecker)
 	if !ok {
 		return true
 	}
@@ -1247,7 +1336,7 @@ func (o *Orchestrator) runHealthChecks() {
 	o.mu.Unlock()
 
 	for _, e := range entries {
-		hc, ok := e.svc.(HealthChecker)
+		hc, ok := e.getSvc().(HealthChecker)
 		if !ok {
 			continue
 		}
@@ -1261,7 +1350,7 @@ func (o *Orchestrator) runHealthChecks() {
 
 		if o.cfg.BeforeHealthCheck != nil {
 			if err := o.cfg.BeforeHealthCheck(e.name); err != nil {
-				e.logger.Warn("before-health-check hook failed", "error", err.Error())
+				e.getLogger().Warn("before-health-check hook failed", "error", err.Error())
 			}
 		}
 
@@ -1273,20 +1362,23 @@ func (o *Orchestrator) runHealthChecks() {
 		if o.cfg.AfterHealthCheck != nil {
 			o.cfg.AfterHealthCheck(e.name, healthErr)
 		}
+		failures := e.getHealthFailures()
 		if healthErr != nil {
-			e.healthFailures++
+			failures++
 			o.metricsHealthFails.Add(1)
-			e.logger.Warn("health check failed", "failures", e.healthFailures, "error", healthErr.Error())
-			if e.healthFailures >= o.cfg.HealthThreshold && e.cfg.factory != nil {
-				e.logger.Error("health threshold reached, restarting service", "failures", e.healthFailures)
-				e.healthFailures = 0
+			e.getLogger().Warn("health check failed", "failures", failures, "error", healthErr.Error())
+			if failures >= o.cfg.HealthThreshold && e.cfg.factory != nil {
+				e.getLogger().Error("health threshold reached, restarting service", "failures", failures)
+				e.setHealthFailures(0)
 				// Cancel the service's context → Start returns → handleServiceDone → self-heal.
-				if e.cancel != nil {
-					e.cancel()
+				if cancelFn := e.getCancel(); cancelFn != nil {
+					cancelFn()
 				}
+			} else {
+				e.setHealthFailures(failures)
 			}
 		} else {
-			e.healthFailures = 0
+			e.setHealthFailures(0)
 		}
 	}
 }
@@ -1350,7 +1442,7 @@ func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext) {
 		o.handleServiceDone(entry, sc, exitErr)
 	}()
 
-	exitErr = entry.svc.Start(sc)
+	exitErr = entry.getSvc().Start(sc)
 	if exitErr != nil && exitErr != context.Canceled {
 		sc.Logger.Error("service returned error", "error", exitErr.Error())
 	}
@@ -1413,14 +1505,14 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 
 	// Check resetAfter: if the service was stable long enough, reset retry count.
 	if entry.cfg.resetAfter > 0 {
-		if time.Since(entry.stableSince) >= entry.cfg.resetAfter {
-			entry.retryCount = 0
+		if time.Since(entry.getStableSince()) >= entry.cfg.resetAfter {
+			entry.setRetryCount(0)
 		}
 	}
 
 	// Check maxRetries.
-	if entry.cfg.maxRetries > 0 && entry.retryCount >= entry.cfg.maxRetries {
-		entry.logger.Error("max retries reached, giving up", "retries", entry.retryCount)
+	if entry.cfg.maxRetries > 0 && entry.getRetryCount() >= entry.cfg.maxRetries {
+		entry.getLogger().Error("max retries reached, giving up", "retries", entry.getRetryCount())
 		o.setStatusErr(entry, StatusCrashed, exitErr)
 		o.mu.Lock()
 		if !entry.wgDone {
@@ -1433,17 +1525,17 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 		return
 	}
 
-	entry.retryCount++
+	entry.setRetryCount(entry.getRetryCount() + 1)
 
 	// Compute backoff delay.
 	backoff := entry.cfg.backoff
 	if backoff == nil {
 		backoff = ConstantBackoff{Delay: 1 * time.Second}
 	}
-	delay := backoff.Next(entry.retryCount)
+	delay := backoff.Next(entry.getRetryCount())
 
-	entry.logger.Warn("self-heal: restarting service",
-		"retry", entry.retryCount, "delay", delay.String())
+	entry.getLogger().Warn("self-heal: restarting service",
+		"retry", entry.getRetryCount(), "delay", delay.String())
 
 	select {
 	case <-o.ctx.Done():
@@ -1463,9 +1555,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	o.safeStop(entry) // best-effort cleanup of old instance
 
 	newSvc := entry.cfg.factory()
-	o.mu.Lock()
-	entry.svc = newSvc
-	o.mu.Unlock()
+	entry.setSvc(newSvc)
 
 	// Update logger for the new instance.
 	svcName := entry.name
@@ -1473,16 +1563,16 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 		svcName = reflect.TypeOf(newSvc).String()
 	}
 	if o.cfg.Logger != nil {
-		entry.logger = newServiceLoggerWith(svcName, o.cfg.Logger)
+		entry.setLogger(newServiceLoggerWith(svcName, o.cfg.Logger))
 	} else {
-		entry.logger = newServiceLogger(svcName, o.logCh, o.logQuit)
+		entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit))
 	}
-	entry.stableSince = time.Now()
+	entry.setStableSince(time.Now())
 
 	// New per-service context.
 	svcCtx, svcCancel := context.WithCancel(o.ctx)
-	entry.cancel = svcCancel
-	newSc := ServiceContext{Context: svcCtx, Logger: entry.logger, Messenger: o.messenger}
+	entry.setCancel(svcCancel)
+	newSc := ServiceContext{Context: svcCtx, Logger: entry.getLogger(), Messenger: o.messenger}
 
 	go o.runService(entry, newSc)
 	o.metricsRestarts.Add(1)
@@ -1494,7 +1584,7 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 	switch entry.cfg.cronMode {
 	case CronSkip:
 		if !entry.running.CompareAndSwap(false, true) {
-			entry.logger.Warn("cron tick skipped: previous invocation still running")
+			entry.getLogger().Warn("cron tick skipped: previous invocation still running")
 			return
 		}
 		defer entry.running.Store(false)
@@ -1508,18 +1598,18 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 
 	sc := ServiceContext{
 		Context:   o.ctx,
-		Logger:    entry.logger,
+		Logger:    entry.getLogger(),
 		Messenger: o.messenger,
 	}
 
 	defer func() {
 		if r := recover(); r != nil {
-			entry.logger.Error("cron service panicked", "panic", fmt.Sprint(r))
+			entry.getLogger().Error("cron service panicked", "panic", fmt.Sprint(r))
 		}
 	}()
 
-	err := entry.svc.Start(sc)
+	err := entry.getSvc().Start(sc)
 	if err != nil && err != context.Canceled {
-		entry.logger.Error("cron service returned error", "error", err.Error())
+		entry.getLogger().Error("cron service returned error", "error", err.Error())
 	}
 }
