@@ -428,6 +428,8 @@ func (m *Messenger) requestMessage(wrapper Message, topic string) (<-chan any, f
 
 // RequestAsync is like Request but returns immediately with a response
 // channel. The caller must select on the channel and ctx.Done().
+// The returned channel is delivered to exactly once on reply, and the
+// forwarding goroutine exits on either a reply or context cancellation.
 // Thread-safe.
 func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-chan any, error) {
 	// encode payload with gob
@@ -447,13 +449,17 @@ func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-
 
 	replyCh, unsub := m.requestMessage(wrapper, topic)
 
-	// spawn cleanup goroutine that waits for context done, then unsubs
+	out := make(chan any, 1)
 	go func() {
-		<-ctx.Done()
-		unsub()
+		defer unsub()
+		select {
+		case resp := <-replyCh:
+			out <- resp
+		case <-ctx.Done():
+		}
 	}()
 
-	return replyCh, nil
+	return out, nil
 }
 
 // Drain closes all subscriber channels and clears all subscriptions.

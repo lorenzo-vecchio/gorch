@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/gob"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1008,6 +1009,41 @@ func TestMessenger_RequestAsync_NilMessage(t *testing.T) {
 	}
 	if resp != "ok" {
 		t.Errorf("expected 'ok', got %v", resp)
+	}
+}
+
+// TestMessenger_RequestAsync_NoGoroutineLeak verifies the forwarding goroutine
+// exits once a reply is delivered, even when the caller's context never cancels.
+func TestMessenger_RequestAsync_NoGoroutineLeak(t *testing.T) {
+	m := newMessenger()
+
+	before := runtime.NumGoroutine()
+
+	rawCh, _ := m.Subscribe("req")
+	responderDone := make(chan struct{})
+	go func() {
+		defer close(responderDone)
+		msg := (<-rawCh).(Message)
+		m.Publish("done", msg.ReplyTopic)
+	}()
+
+	// Never-cancelled context.
+	ch, err := m.RequestAsync(context.Background(), "ping", "req")
+	if err != nil {
+		t.Fatalf("RequestAsync failed: %v", err)
+	}
+	<-ch
+	<-responderDone
+
+	// The forwarding goroutine must have exited after delivering the reply.
+	deadline := time.After(2 * time.Second)
+	for runtime.NumGoroutine() > before {
+		select {
+		case <-deadline:
+			t.Fatalf("goroutine leak: baseline=%d, now=%d", before, runtime.NumGoroutine())
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 }
 
