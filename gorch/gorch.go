@@ -218,7 +218,7 @@ func (e *serviceEntry) setHealthFailures(n int) {
 type Orchestrator struct {
 	cfg     Config
 	started bool
-	mu      sync.Mutex // protects started, entries slice, nameIndex
+	mu      sync.RWMutex // protects started, entries slice, nameIndex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -243,6 +243,9 @@ type Orchestrator struct {
 	wg        sync.WaitGroup
 	stopOnce  sync.Once
 	startOnce sync.Once
+
+	// doneCh lazily caches the Done() channel via sync.OnceValue.
+	doneCh func() <-chan struct{}
 
 	metricsStarts      atomic.Int64
 	metricsStops       atomic.Int64
@@ -272,6 +275,17 @@ func New(cfg Config) *Orchestrator {
 		messenger: newMessenger(),
 		nameIndex: make(map[string]*serviceEntry),
 	}
+	o.doneCh = sync.OnceValue(func() <-chan struct{} {
+		ch := make(chan struct{})
+		go func() {
+			o.wg.Wait()
+			if o.logPumpDone != nil {
+				<-o.logPumpDone
+			}
+			close(ch)
+		}()
+		return ch
+	})
 	return o
 }
 
@@ -438,7 +452,6 @@ func (o *Orchestrator) Start() error {
 			if entry.cfg.cronSpec == "" {
 				continue
 			}
-			entry := entry
 			id, err := o.cronSched.AddFunc(entry.cfg.cronSpec, func() {
 				o.invokeCron(entry)
 			})
@@ -830,12 +843,12 @@ func (o *Orchestrator) setStatusErr(entry *serviceEntry, s ServiceStatus, err er
 func (o *Orchestrator) Stop(timeout time.Duration) error {
 	var stopErr error
 	o.stopOnce.Do(func() {
-		o.mu.Lock()
+		o.mu.RLock()
 		if !o.started {
-			o.mu.Unlock()
+			o.mu.RUnlock()
 			return
 		}
-		o.mu.Unlock()
+		o.mu.RUnlock()
 
 		// Stop health-check loop.
 		if o.healthCancel != nil {
@@ -965,6 +978,8 @@ func (o *Orchestrator) safeStop(entry *serviceEntry) {
 
 // persistentEntries returns non-cron, non-runOnce entries.
 func (o *Orchestrator) persistentEntries() []*serviceEntry {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	var out []*serviceEntry
 	for _, e := range o.entries {
 		if e.cfg.cronSpec == "" && !e.cfg.runOnce {
@@ -999,9 +1014,9 @@ func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) erro
 // ok is false if no service with that name is registered.
 // Thread-safe.
 func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
-	o.mu.Lock()
+	o.mu.RLock()
 	entry, ok := o.nameIndex[name]
-	o.mu.Unlock()
+	o.mu.RUnlock()
 	if !ok {
 		return 0, false
 	}
@@ -1014,10 +1029,10 @@ func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
 // Statuses returns a map of service name to status for all registered services.
 // Thread-safe.
 func (o *Orchestrator) Statuses() map[string]ServiceStatus {
-	o.mu.Lock()
+	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
 	copy(entries, o.entries)
-	o.mu.Unlock()
+	o.mu.RUnlock()
 
 	result := make(map[string]ServiceStatus, len(entries))
 	o.statusMu.RLock()
@@ -1031,8 +1046,8 @@ func (o *Orchestrator) Statuses() map[string]ServiceStatus {
 // Names returns the names of all registered services in registration order.
 // Thread-safe.
 func (o *Orchestrator) Names() []string {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	names := make([]string, len(o.entries))
 	for i, e := range o.entries {
 		names[i] = e.name
@@ -1043,8 +1058,8 @@ func (o *Orchestrator) Names() []string {
 // Count returns the total number of registered services.
 // Thread-safe.
 func (o *Orchestrator) Count() int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	return len(o.entries)
 }
 
@@ -1053,10 +1068,10 @@ func (o *Orchestrator) Count() int {
 // Services that don't implement HealthChecker are reported as nil.
 // Thread-safe.
 func (o *Orchestrator) Health() map[string]error {
-	o.mu.Lock()
+	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
 	copy(entries, o.entries)
-	o.mu.Unlock()
+	o.mu.RUnlock()
 
 	result := make(map[string]error, len(entries))
 	for _, e := range entries {
@@ -1084,9 +1099,9 @@ func (o *Orchestrator) RegisterFunc(name string, startFn func(ctx ServiceContext
 
 // IsReady reports whether a named service is running and ready to serve.
 func (o *Orchestrator) IsReady(name string) bool {
-	o.mu.Lock()
+	o.mu.RLock()
 	entry, ok := o.nameIndex[name]
-	o.mu.Unlock()
+	o.mu.RUnlock()
 	if !ok {
 		return false
 	}
@@ -1105,14 +1120,14 @@ func (o *Orchestrator) IsReady(name string) bool {
 
 // StartGroup starts all services in the named group in topological order.
 func (o *Orchestrator) StartGroup(group string) error {
-	o.mu.Lock()
+	o.mu.RLock()
 	entries := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
 		if e.cfg.group == group {
 			entries = append(entries, e)
 		}
 	}
-	o.mu.Unlock()
+	o.mu.RUnlock()
 	levels, err := o.topoSort(entries)
 	if err != nil {
 		return err
@@ -1130,14 +1145,14 @@ func (o *Orchestrator) StartGroup(group string) error {
 // StopGroup stops all non-cron, non-runOnce services in the named group in
 // reverse topological order. Errors are aggregated via errors.Join.
 func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
-	o.mu.Lock()
+	o.mu.RLock()
 	persistent := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
 		if e.cfg.group == group && e.cfg.cronSpec == "" && !e.cfg.runOnce {
 			persistent = append(persistent, e)
 		}
 	}
-	o.mu.Unlock()
+	o.mu.RUnlock()
 	levels, _ := o.topoSort(persistent)
 	var stopErr error
 	for i := len(levels) - 1; i >= 0; i-- {
@@ -1153,14 +1168,14 @@ func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
 // StatusesByGroup returns a map of service name to status for all services
 // in the named group. Thread-safe.
 func (o *Orchestrator) StatusesByGroup(group string) map[string]ServiceStatus {
-	o.mu.Lock()
+	o.mu.RLock()
 	entries := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
 		if e.cfg.group == group {
 			entries = append(entries, e)
 		}
 	}
-	o.mu.Unlock()
+	o.mu.RUnlock()
 	result := make(map[string]ServiceStatus, len(entries))
 	o.statusMu.RLock()
 	defer o.statusMu.RUnlock()
@@ -1173,14 +1188,14 @@ func (o *Orchestrator) StatusesByGroup(group string) map[string]ServiceStatus {
 // StatusesByLabel returns a map of service name to status for all services
 // matching the given label key-value pair. Thread-safe.
 func (o *Orchestrator) StatusesByLabel(key, value string) map[string]ServiceStatus {
-	o.mu.Lock()
+	o.mu.RLock()
 	entries := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
 		if e.cfg.labels != nil && e.cfg.labels[key] == value {
 			entries = append(entries, e)
 		}
 	}
-	o.mu.Unlock()
+	o.mu.RUnlock()
 	result := make(map[string]ServiceStatus, len(entries))
 	o.statusMu.RLock()
 	defer o.statusMu.RUnlock()
@@ -1225,14 +1240,10 @@ func (o *Orchestrator) Metrics() Metrics {
 
 // Done returns a channel that closes when all managed goroutines (services,
 // log-pump, health-check loop) have exited. The orchestrator must be stopped
-// (via Stop or Run returning) before the channel closes.
+// (via Stop or Run returning) before the channel closes. The channel is
+// created lazily and cached: repeated calls return the same channel.
 func (o *Orchestrator) Done() <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		o.wg.Wait()
-		close(ch)
-	}()
-	return ch
+	return o.doneCh()
 }
 
 // ── Topological sort ──
@@ -1328,10 +1339,10 @@ func (o *Orchestrator) healthCheckLoop(ctx context.Context) {
 }
 
 func (o *Orchestrator) runHealthChecks() {
-	o.mu.Lock()
+	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
 	copy(entries, o.entries)
-	o.mu.Unlock()
+	o.mu.RUnlock()
 
 	for _, e := range entries {
 		hc, ok := e.getSvc().(HealthChecker)

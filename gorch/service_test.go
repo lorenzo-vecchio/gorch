@@ -1047,29 +1047,7 @@ func TestMessenger_RequestAsync_NoGoroutineLeak(t *testing.T) {
 	}
 }
 
-// ── gobBuf / newUUID ──
-
-func TestGobBuf_Write(t *testing.T) {
-	var buf gobBuf
-	n, err := buf.Write([]byte("hello"))
-	if n != 5 || err != nil {
-		t.Errorf("expected (5, nil), got (%d, %v)", n, err)
-	}
-	if string(buf.Bytes()) != "hello" {
-		t.Errorf("expected 'hello', got %q", buf.Bytes())
-	}
-	buf.Write([]byte(" world"))
-	if string(buf.Bytes()) != "hello world" {
-		t.Errorf("expected 'hello world', got %q", buf.Bytes())
-	}
-}
-
-func TestGobBuf_Bytes_Empty(t *testing.T) {
-	var buf gobBuf
-	if len(buf.Bytes()) != 0 {
-		t.Errorf("expected empty, got %v", buf.Bytes())
-	}
-}
+// ── newUUID ──
 
 func TestNewUUID(t *testing.T) {
 	id := newUUID(rand.Reader)

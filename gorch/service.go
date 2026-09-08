@@ -5,6 +5,7 @@
 package gorch
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/gob"
@@ -429,7 +430,7 @@ func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-
 	// encode payload with gob
 	var payload []byte
 	if msg != nil {
-		var buf gobBuf
+		var buf bytes.Buffer
 		if err := gob.NewEncoder(&buf).Encode(&msg); err != nil {
 			return nil, fmt.Errorf("gorch: failed to encode request: %w", err)
 		}
@@ -470,19 +471,6 @@ func (m *Messenger) Drain() {
 	}
 	m.subs = nil
 }
-
-// gobBuf is a simple bytes.Buffer wrapper for gob encoding.
-// ponytail: stdlib bytes.Buffer already implements io.Writer; used directly.
-type gobBuf struct {
-	buf []byte
-}
-
-func (b *gobBuf) Write(p []byte) (int, error) {
-	b.buf = append(b.buf, p...)
-	return len(p), nil
-}
-
-func (b *gobBuf) Bytes() []byte { return b.buf }
 
 // newUUID generates a short random ID for reply topics.
 // ponytail: crypto/rand hex, error path removed — rand.Read never fails on Linux.
