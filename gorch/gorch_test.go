@@ -2348,11 +2348,11 @@ func TestRun_StartError(t *testing.T) {
 }
 
 func TestRun_DefaultSignal(t *testing.T) {
-	// Cover the default signal path (len(sigSet) == 0 → os.Interrupt).
+	// Cover the default signal path (len(sigSet) == 0 → SIGINT + SIGTERM).
 	o := New(Config{LogLevel: LogLevelWarn})
 	done := make(chan error, 1)
 	go func() {
-		done <- o.Run(time.Second) // no signals → defaults to os.Interrupt
+		done <- o.Run(time.Second) // no signals → defaults to SIGINT + SIGTERM
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -2366,6 +2366,26 @@ func TestRun_DefaultSignal(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after signal")
+	}
+}
+
+func TestRun_DefaultSignal_SIGTERM(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	done := make(chan error, 1)
+	go func() {
+		done <- o.Run(time.Second) // defaults to SIGINT + SIGTERM
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after SIGTERM")
 	}
 }
 

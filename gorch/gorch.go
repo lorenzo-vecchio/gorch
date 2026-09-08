@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -975,7 +976,7 @@ func (o *Orchestrator) persistentEntries() []*serviceEntry {
 
 // Run starts the orchestrator, blocks on SIGINT/SIGTERM, then stops.
 // Returns any error from Start or aggregated errors from Stop.
-// Optional signals override the default signal set.
+// Optional signals override the default signal set (SIGINT, SIGTERM).
 func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) error {
 	if err := o.Start(); err != nil {
 		return err
@@ -983,7 +984,7 @@ func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) erro
 
 	sigSet := signals
 	if len(sigSet) == 0 {
-		sigSet = []os.Signal{os.Interrupt}
+		sigSet = []os.Signal{os.Interrupt, syscall.SIGTERM}
 	}
 
 	ch := make(chan os.Signal, 1)
