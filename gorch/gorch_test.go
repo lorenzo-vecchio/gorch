@@ -2781,6 +2781,41 @@ func TestStop_StopsCronAndRunOnce(t *testing.T) {
 	}
 }
 
+// TestCronStatusLifecycle verifies cron services transition to running at Start
+// and to stopped at Stop (they are no longer stuck in StatusRegistered).
+func TestCronStatusLifecycle(t *testing.T) {
+	var stopHooks atomic.Int32
+	o := New(Config{LogLevel: LogLevelWarn})
+	cronSvc := &testSvc{
+		startFn: func(ctx context.Context) error { return nil },
+	}
+	_ = o.Register(cronSvc,
+		WithName("cron"),
+		WithCron("* * * * * *", CronParallel),
+		WithOnBeforeStop(func(name string) error {
+			stopHooks.Add(1)
+			return nil
+		}),
+	)
+	_ = o.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	s, ok := o.Status("cron")
+	if !ok || s != StatusRunning {
+		t.Errorf("cron service should be running after Start, got %v (ok=%v)", s, ok)
+	}
+
+	_ = o.Stop(time.Second)
+
+	s, ok = o.Status("cron")
+	if !ok || s != StatusStopped {
+		t.Errorf("cron service should be stopped after Stop, got %v (ok=%v)", s, ok)
+	}
+	if stopHooks.Load() != 1 {
+		t.Errorf("expected stop hook to fire exactly once, got %d", stopHooks.Load())
+	}
+}
+
 // ── Persistence: health loop disabled when HealthInterval=0 ──
 
 func TestHealthLoop_DefaultInterval(t *testing.T) {

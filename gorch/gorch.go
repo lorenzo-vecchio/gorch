@@ -457,6 +457,14 @@ func (o *Orchestrator) Start() error {
 		// Start cron scheduler.
 		o.cronSched.Start()
 
+		// Mark cron services as running now that the scheduler is live.
+		for _, entry := range o.entries {
+			if entry.cfg.cronSpec != "" {
+				o.setStatus(entry, StatusRunning)
+				o.metricsStarts.Add(1)
+			}
+		}
+
 		// Partition: runOnce vs persistent services.
 		var runOnce, persistent []*serviceEntry
 		for _, entry := range o.entries {
