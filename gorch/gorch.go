@@ -422,7 +422,7 @@ func (o *Orchestrator) Start() error {
 			if o.cfg.Logger != nil {
 				entry.setLogger(newServiceLoggerWith(svcName, o.cfg.Logger))
 			} else {
-				entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit))
+				entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit, o.cfg.LogLevel))
 			}
 		}
 
@@ -1562,7 +1562,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	if o.cfg.Logger != nil {
 		entry.setLogger(newServiceLoggerWith(svcName, o.cfg.Logger))
 	} else {
-		entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit))
+		entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit, o.cfg.LogLevel))
 	}
 	entry.setStableSince(time.Now())
 

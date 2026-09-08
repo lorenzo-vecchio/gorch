@@ -1442,19 +1442,58 @@ func TestLogPump_DrainsBufferedOnQuit(t *testing.T) {
 	}
 }
 
+// TestLogLevelFiltering_AtEmit verifies that below-minimum entries are dropped
+// at emit (not the pump), so a Debug flood cannot starve the buffer and drop
+// an Error entry.
+func TestLogLevelFiltering_AtEmit(t *testing.T) {
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+
+	o := New(Config{LogLevel: LogLevelInfo})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error {
+			sc := ctx.(ServiceContext)
+			for i := 0; i < 1000; i++ {
+				sc.Logger.Debug("debug spam", "i", i)
+			}
+			sc.Logger.Error("important error", "code", 500)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	_ = o.Register(svc)
+	_ = o.Start()
+	time.Sleep(100 * time.Millisecond)
+	_ = o.Stop(time.Second)
+
+	w.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	os.Stderr = old
+
+	output := buf.String()
+	if !strings.Contains(output, "important error") {
+		t.Errorf("Error entry should reach stderr despite Debug flood, got:\n%s", output)
+	}
+	if strings.Contains(output, "debug spam") {
+		t.Error("Debug entries should be filtered at emit (level=Info)")
+	}
+}
+
 // ── ServiceLogger emit ──
 
 func TestServiceLogger_Emit(t *testing.T) {
 	t.Run("non_blocking_send_when_channel_full", func(t *testing.T) {
 		ch := make(chan logEntry, 1)
 		ch <- logEntry{}
-		logger := newServiceLogger("test", ch, nil)
+		logger := newServiceLogger("test", ch, nil, LogLevelDebug)
 		logger.Info("dropped")
 	})
 
 	t.Run("methods_use_correct_levels", func(t *testing.T) {
 		ch := make(chan logEntry, 16)
-		logger := newServiceLogger("svc", ch, nil)
+		logger := newServiceLogger("svc", ch, nil, LogLevelDebug)
 
 		logger.Debug("d")
 		logger.Info("i")
@@ -2495,7 +2534,7 @@ func TestRunHealthChecks_FailuresTracked(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return errors.New("bad") }},
 		cfg:    registerConfig{name: "sick"},
 		status: StatusRunning,
-		logger: newServiceLogger("sick", logCh, nil),
+		logger: newServiceLogger("sick", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2516,7 +2555,7 @@ func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return nil }},
 		cfg:    registerConfig{name: "healthy"},
 		status: StatusRunning,
-		logger: newServiceLogger("healthy", logCh, nil),
+		logger: newServiceLogger("healthy", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2545,7 +2584,7 @@ func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
 		}},
 		cfg:    registerConfig{name: "slow"},
 		status: StatusRunning,
-		logger: newServiceLogger("slow", logCh, nil),
+		logger: newServiceLogger("slow", logCh, nil, LogLevelDebug),
 	}
 	fast := &serviceEntry{
 		name: "fast",
@@ -2557,7 +2596,7 @@ func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
 		}},
 		cfg:    registerConfig{name: "fast"},
 		status: StatusRunning,
-		logger: newServiceLogger("fast", logCh, nil),
+		logger: newServiceLogger("fast", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, slow, fast)
 
@@ -2608,7 +2647,7 @@ func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return errors.New("bad") }},
 		cfg:    registerConfig{name: "registered"},
 		status: StatusRegistered, // not running — should be skipped
-		logger: newServiceLogger("registered", logCh, nil),
+		logger: newServiceLogger("registered", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2668,7 +2707,7 @@ func TestRunHealthChecks_ThresholdWithoutSelfHeal(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return errors.New("bad") }},
 		cfg:    registerConfig{name: "sick"},
 		status: StatusRunning,
-		logger: newServiceLogger("sick", logCh, nil),
+		logger: newServiceLogger("sick", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2728,7 +2767,7 @@ func TestHandleServiceDone_CancelledDuringBackoff(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: factory, backoff: ConstantBackoff{Delay: 500 * time.Millisecond}},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh, nil),
+		logger: newServiceLogger("x", logCh, nil, LogLevelDebug),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -3103,14 +3142,14 @@ func TestRunHealthChecks_NonHealthCheckerSkipped(t *testing.T) {
 		svc:    &namedSvc{}, // does NOT implement HealthChecker
 		cfg:    registerConfig{name: "plain"},
 		status: StatusRunning,
-		logger: newServiceLogger("plain", logCh, nil),
+		logger: newServiceLogger("plain", logCh, nil, LogLevelDebug),
 	}
 	e2 := &serviceEntry{
 		name:   "hc",
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return nil }},
 		cfg:    registerConfig{name: "hc"},
 		status: StatusRunning,
-		logger: newServiceLogger("hc", logCh, nil),
+		logger: newServiceLogger("hc", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, e1, e2)
 
@@ -3135,7 +3174,7 @@ func TestHandleServiceDone_FactoryContextCancelled(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: factory},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh, nil),
+		logger: newServiceLogger("x", logCh, nil, LogLevelDebug),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -3176,7 +3215,7 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 		cfg:        registerConfig{name: "x", factory: factory, maxRetries: 1},
 		name:       "x",
 		status:     StatusRunning,
-		logger:     newServiceLogger("x", logCh, nil),
+		logger:     newServiceLogger("x", logCh, nil, LogLevelDebug),
 		retryCount: 1, // already at max
 	}
 	o.wg.Add(1)
@@ -3284,7 +3323,7 @@ func TestRunOnce_CtxDone(t *testing.T) {
 		svc:    svc,
 		cfg:    registerConfig{name: "runonce", runOnce: true, startTimeout: time.Second},
 		status: StatusRegistered,
-		logger: newServiceLogger("runonce", o.logCh, nil),
+		logger: newServiceLogger("runonce", o.logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
 	o.nameIndex["runonce"] = entry
@@ -3362,7 +3401,7 @@ func TestHandleServiceDone_WgDoneTrue_CtxCancelled(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: func() Service { return &testSvc{} }},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh, nil),
+		logger: newServiceLogger("x", logCh, nil, LogLevelDebug),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -3389,7 +3428,7 @@ func TestHandleServiceDone_WgDoneTrue_MaxRetries(t *testing.T) {
 		cfg:        registerConfig{name: "x", factory: func() Service { return &testSvc{} }, maxRetries: 1},
 		name:       "x",
 		status:     StatusRunning,
-		logger:     newServiceLogger("x", logCh, nil),
+		logger:     newServiceLogger("x", logCh, nil, LogLevelDebug),
 		retryCount: 1,
 	}
 	o.wg.Add(1)
@@ -3417,7 +3456,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelled(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: func() Service { return &testSvc{} }, backoff: ConstantBackoff{Delay: 500 * time.Millisecond}},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh, nil),
+		logger: newServiceLogger("x", logCh, nil, LogLevelDebug),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -4608,7 +4647,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 		cfg:        registerConfig{name: "x", factory: func() Service { return &testSvc{} }, backoff: ConstantBackoff{Delay: 200 * time.Millisecond}},
 		name:       "x",
 		status:     StatusRunning,
-		logger:     newServiceLogger("x", logCh, nil),
+		logger:     newServiceLogger("x", logCh, nil, LogLevelDebug),
 		wgDone:     true, // already done
 		retryCount: 1,
 	}
@@ -4665,14 +4704,14 @@ func TestStartGroup_Complete(t *testing.T) {
 			svc:    s1,
 			cfg:    registerConfig{name: "s1", group: "workers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("s1", o.logCh, nil),
+			logger: newServiceLogger("s1", o.logCh, nil, LogLevelDebug),
 		}
 		e2 := &serviceEntry{
 			name:   "s2",
 			svc:    s2,
 			cfg:    registerConfig{name: "s2", group: "workers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("s2", o.logCh, nil),
+			logger: newServiceLogger("s2", o.logCh, nil, LogLevelDebug),
 		}
 		o.entries = append(o.entries, e1, e2)
 		o.nameIndex = map[string]*serviceEntry{"s1": e1, "s2": e2}
@@ -4704,14 +4743,14 @@ func TestStartGroup_Complete(t *testing.T) {
 			svc:    &testSvc{},
 			cfg:    registerConfig{name: "cycle-a", dependsOn: []string{"cycle-b"}, group: "cyclers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("cycle-a", o.logCh, nil),
+			logger: newServiceLogger("cycle-a", o.logCh, nil, LogLevelDebug),
 		}
 		eB := &serviceEntry{
 			name:   "cycle-b",
 			svc:    &testSvc{},
 			cfg:    registerConfig{name: "cycle-b", dependsOn: []string{"cycle-a"}, group: "cyclers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("cycle-b", o.logCh, nil),
+			logger: newServiceLogger("cycle-b", o.logCh, nil, LogLevelDebug),
 		}
 		o.entries = append(o.entries, eA, eB)
 		o.nameIndex = map[string]*serviceEntry{"cycle-a": eA, "cycle-b": eB}
@@ -4737,7 +4776,7 @@ func TestStartGroup_Complete(t *testing.T) {
 			svc:    &errSvc{err: errors.New("init crash")},
 			cfg:    registerConfig{name: "bad", group: "doomed", runOnce: true},
 			status: StatusRegistered,
-			logger: newServiceLogger("bad", o.logCh, nil),
+			logger: newServiceLogger("bad", o.logCh, nil, LogLevelDebug),
 		}
 		o.entries = append(o.entries, e)
 		o.nameIndex = map[string]*serviceEntry{"bad": e}
@@ -4976,7 +5015,7 @@ func TestStopGroup_StopError(t *testing.T) {
 		svc:    &testSvc{stopFn: func() error { return errors.New("stop failure") }},
 		cfg:    registerConfig{name: "flaky", group: "err-group"},
 		status: StatusRunning,
-		logger: newServiceLogger("flaky", o.logCh, nil),
+		logger: newServiceLogger("flaky", o.logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, e)
 	o.nameIndex = map[string]*serviceEntry{"flaky": e}

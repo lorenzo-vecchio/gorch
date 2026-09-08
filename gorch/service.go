@@ -46,15 +46,16 @@ type Logger interface {
 // When a custom Logger is set via Config.Logger, ServiceLogger delegates to it
 // instead of the channel, prepending "service"=<name> to the key-value pairs.
 type ServiceLogger struct {
-	svcName string
-	ch      chan<- logEntry // used by default channel-based logging
-	quit    <-chan struct{} // closed at shutdown; emit drops entries once closed
-	logger  Logger          // custom logger (bypasses channel)
+	svcName  string
+	ch       chan<- logEntry // used by default channel-based logging
+	quit     <-chan struct{} // closed at shutdown; emit drops entries once closed
+	minLevel LogLevel        // entries below this level are dropped at emit
+	logger   Logger          // custom logger (bypasses channel)
 }
 
 // newServiceLogger creates a channel-based ServiceLogger (internal).
-func newServiceLogger(svcName string, ch chan<- logEntry, quit <-chan struct{}) *ServiceLogger {
-	return &ServiceLogger{svcName: svcName, ch: ch, quit: quit}
+func newServiceLogger(svcName string, ch chan<- logEntry, quit <-chan struct{}, minLevel LogLevel) *ServiceLogger {
+	return &ServiceLogger{svcName: svcName, ch: ch, quit: quit, minLevel: minLevel}
 }
 
 // newServiceLoggerWith creates a ServiceLogger that delegates to a custom Logger.
@@ -82,6 +83,11 @@ func (l *ServiceLogger) emit(level LogLevel, msg string, args []any) {
 		case LogLevelWarn:
 			l.logger.Warn(msg, fullArgs...)
 		}
+		return
+	}
+	// Drop below-minimum entries at emit so a Debug flood cannot starve the
+	// log-pump buffer and cause INFO/ERROR entries to be dropped.
+	if level < l.minLevel {
 		return
 	}
 	select {

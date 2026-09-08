@@ -26,7 +26,7 @@ func TestServiceLogger_Info(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ch := make(chan logEntry, 1)
-			l := newServiceLogger("testsvc", ch, nil)
+			l := newServiceLogger("testsvc", ch, nil, LogLevelDebug)
 			l.Info(tt.msg, tt.args...)
 			select {
 			case e := <-ch:
@@ -48,7 +48,7 @@ func TestServiceLogger_Info(t *testing.T) {
 
 func TestServiceLogger_Error(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("errsvc", ch, nil)
+	l := newServiceLogger("errsvc", ch, nil, LogLevelDebug)
 	l.Error("err msg", "code", 500)
 	select {
 	case e := <-ch:
@@ -62,7 +62,7 @@ func TestServiceLogger_Error(t *testing.T) {
 
 func TestServiceLogger_Debug(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("dbgsvc", ch, nil)
+	l := newServiceLogger("dbgsvc", ch, nil, LogLevelDebug)
 	l.Debug("debug msg")
 	select {
 	case e := <-ch:
@@ -76,7 +76,7 @@ func TestServiceLogger_Debug(t *testing.T) {
 
 func TestServiceLogger_Warn(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("warnsvc", ch, nil)
+	l := newServiceLogger("warnsvc", ch, nil, LogLevelDebug)
 	l.Warn("warn msg")
 	select {
 	case e := <-ch:
@@ -99,7 +99,7 @@ func TestServiceLogger_ChannelFull_NoBlock(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ch := make(chan logEntry, tt.capSize)
-			l := newServiceLogger("fullsvc", ch, nil)
+			l := newServiceLogger("fullsvc", ch, nil, LogLevelDebug)
 			if tt.capSize > 0 {
 				ch <- logEntry{}
 			}
@@ -119,7 +119,7 @@ func TestServiceLogger_ChannelFull_NoBlock(t *testing.T) {
 
 func TestServiceLogger_Emit_OddArgs_NoPanic(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("oddsvc", ch, nil)
+	l := newServiceLogger("oddsvc", ch, nil, LogLevelDebug)
 	l.Info("msg", "key1")
 	select {
 	case e := <-ch:
@@ -599,7 +599,7 @@ func TestMessenger_Unsubscribe_OneLeavesOther(t *testing.T) {
 
 func TestLogEntry_ArgsPreserved(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("svc", ch, nil)
+	l := newServiceLogger("svc", ch, nil, LogLevelDebug)
 	l.Info("test", "key", "value", "count", 5)
 	select {
 	case e := <-ch:
