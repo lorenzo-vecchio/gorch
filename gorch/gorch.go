@@ -551,7 +551,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 		svcCancel()
 
 		if err != nil && err != context.Canceled {
-			o.setStatus(entry, StatusCrashed)
+			o.setStatusErr(entry, StatusCrashed, err)
 			o.callAfterStartHook(entry, err)
 			return err
 		}
@@ -572,20 +572,22 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	startErrCh := make(chan error, 1)
 
 	go func() {
+		var exitErr error
 		defer func() {
 			if r := recover(); r != nil {
 				sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
+				exitErr = fmt.Errorf("panic: %v", r)
 			}
 			// Signal whether Start returned cleanly within the timeout window.
 			select {
 			case startErrCh <- nil:
 			default:
 			}
-			o.handleServiceDone(entry, sc)
+			o.handleServiceDone(entry, sc, exitErr)
 		}()
-		err := entry.svc.Start(sc)
-		if err != nil && err != context.Canceled {
-			sc.Logger.Error("service returned error", "error", err.Error())
+		exitErr = entry.svc.Start(sc)
+		if exitErr != nil && exitErr != context.Canceled {
+			sc.Logger.Error("service returned error", "error", exitErr.Error())
 		}
 	}()
 
@@ -650,6 +652,12 @@ func (o *Orchestrator) stopStartedServices() {
 
 // setStatus updates the service status (thread-safe).
 func (o *Orchestrator) setStatus(entry *serviceEntry, s ServiceStatus) {
+	o.setStatusErr(entry, s, nil)
+}
+
+// setStatusErr updates the service status and, on a crash, forwards the real
+// exit cause to the OnCrash callback (thread-safe).
+func (o *Orchestrator) setStatusErr(entry *serviceEntry, s ServiceStatus, err error) {
 	o.statusMu.Lock()
 	old := entry.status
 	entry.status = s
@@ -662,7 +670,10 @@ func (o *Orchestrator) setStatus(entry *serviceEntry, s ServiceStatus) {
 		o.metricsCrashes.Add(1)
 	}
 	if o.cfg.OnCrash != nil && s == StatusCrashed {
-		o.cfg.OnCrash(entry.name, fmt.Errorf("service %s crashed", entry.name))
+		if err == nil {
+			err = fmt.Errorf("service %s crashed", entry.name)
+		}
+		o.cfg.OnCrash(entry.name, err)
 	}
 }
 
@@ -1260,23 +1271,25 @@ func (o *Orchestrator) emitLog(entry logEntry) {
 // runService starts a non-cron service. handleServiceDone is called exactly once
 // via defer — covering both normal return and panic recovery paths.
 func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext) {
+	var exitErr error
 	defer func() {
 		if r := recover(); r != nil {
 			sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
+			exitErr = fmt.Errorf("panic: %v", r)
 		}
-		o.handleServiceDone(entry, sc)
+		o.handleServiceDone(entry, sc, exitErr)
 	}()
 
-	err := entry.svc.Start(sc)
-	if err != nil && err != context.Canceled {
-		sc.Logger.Error("service returned error", "error", err.Error())
+	exitErr = entry.svc.Start(sc)
+	if exitErr != nil && exitErr != context.Canceled {
+		sc.Logger.Error("service returned error", "error", exitErr.Error())
 	}
 }
 
 // handleServiceDone is called when a non-cron service exits (normally or via panic).
 // For services without self-heal it decrements the waitgroup once.
 // For self-heal services it uses the configured backoff and retry policy.
-func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext) {
+func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext, exitErr error) {
 	if entry.cfg.factory == nil {
 		// No self-heal: service stays dead.
 		// If orchestrator is shutting down, Stop() handles status transitions
@@ -1295,8 +1308,12 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 			default:
 			}
 		}
-		o.setStatus(entry, StatusStopped)
-		o.metricsStops.Add(1)
+		if exitErr != nil && !errors.Is(exitErr, context.Canceled) {
+			o.setStatusErr(entry, StatusCrashed, exitErr)
+		} else {
+			o.setStatus(entry, StatusStopped)
+			o.metricsStops.Add(1)
+		}
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true
@@ -1334,8 +1351,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 	// Check maxRetries.
 	if entry.cfg.maxRetries > 0 && entry.retryCount >= entry.cfg.maxRetries {
 		entry.logger.Error("max retries reached, giving up", "retries", entry.retryCount)
-		o.setStatus(entry, StatusStopped)
-		o.metricsStops.Add(1)
+		o.setStatusErr(entry, StatusCrashed, exitErr)
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true

@@ -493,7 +493,7 @@ func TestStopMultipleErrors(t *testing.T) {
 
 	// handleServiceDone for non-self-heal decrements wg.
 	sc := ServiceContext{Context: o.ctx}
-	o.handleServiceDone(entry, sc)
+	o.handleServiceDone(entry, sc, nil)
 
 	// wg should be done after handleServiceDone.
 	o.wg.Wait()
@@ -819,7 +819,7 @@ func TestSelfHeal(t *testing.T) {
 		entry := &serviceEntry{svc: &namedSvc{name: "x"}, cfg: registerConfig{}}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: context.Background()}
-		o.handleServiceDone(entry, sc)
+		o.handleServiceDone(entry, sc, nil)
 
 		done := make(chan struct{})
 		go func() { o.wg.Wait(); close(done) }()
@@ -835,8 +835,8 @@ func TestSelfHeal(t *testing.T) {
 		entry := &serviceEntry{svc: &namedSvc{name: "x"}, cfg: registerConfig{}}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: context.Background()}
-		o.handleServiceDone(entry, sc)
-		o.handleServiceDone(entry, sc)
+		o.handleServiceDone(entry, sc, nil)
+		o.handleServiceDone(entry, sc, nil)
 
 		done := make(chan struct{})
 		go func() { o.wg.Wait(); close(done) }()
@@ -866,7 +866,7 @@ func TestSelfHeal(t *testing.T) {
 		}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: ctx}
-		o.handleServiceDone(entry, sc)
+		o.handleServiceDone(entry, sc, nil)
 
 		if factoryCalls.Load() != 0 {
 			t.Error("factory should not be called when context is cancelled")
@@ -2549,7 +2549,7 @@ func TestHandleServiceDone_CancelledDuringBackoff(t *testing.T) {
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
 
-	go o.handleServiceDone(entry, sc)
+	go o.handleServiceDone(entry, sc, nil)
 
 	time.Sleep(100 * time.Millisecond)
 	cancel()
@@ -2920,7 +2920,7 @@ func TestHandleServiceDone_FactoryContextCancelled(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc)
+	o.handleServiceDone(entry, sc, nil)
 
 	if factoryCalls.Load() != 0 {
 		t.Error("factory should not be called when context is cancelled")
@@ -2935,8 +2935,13 @@ func TestHandleServiceDone_FactoryContextCancelled(t *testing.T) {
 }
 
 func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
-	// Ensure the maxRetries block sets StatusStopped.
-	o := New(Config{LogLevel: LogLevelWarn})
+	// Ensure the maxRetries block sets StatusCrashed and forwards the real error.
+	var crashName string
+	var crashErr error
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnCrash:  func(name string, err error) { crashName = name; crashErr = err },
+	})
 	ctx := context.Background()
 	o.ctx = ctx
 
@@ -2946,8 +2951,9 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 		return &errSvc{err: errors.New("always")}
 	}
 	logCh := make(chan logEntry, 1)
+	exitErr := errors.New("boom")
 	entry := &serviceEntry{
-		svc:        &errSvc{err: errors.New("boom")},
+		svc:        &errSvc{err: exitErr},
 		cfg:        registerConfig{name: "x", factory: factory, maxRetries: 1},
 		name:       "x",
 		status:     StatusRunning,
@@ -2956,14 +2962,20 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc)
+	o.handleServiceDone(entry, sc, exitErr)
 
 	if factoryCalls.Load() != 0 {
 		t.Error("factory should not be called when maxRetries reached")
 	}
-	// Status should be Stopped.
-	if entry.status != StatusStopped {
-		t.Errorf("expected StatusStopped, got %v", entry.status)
+	// Status should be Crashed, not Stopped.
+	if entry.status != StatusCrashed {
+		t.Errorf("expected StatusCrashed, got %v", entry.status)
+	}
+	if crashName != "x" {
+		t.Errorf("expected OnCrash for 'x', got %q", crashName)
+	}
+	if !errors.Is(crashErr, exitErr) {
+		t.Errorf("expected OnCrash to receive real error %v, got %v", exitErr, crashErr)
 	}
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -3135,8 +3147,8 @@ func TestHandleServiceDone_WgDoneTrue_CtxCancelled(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc)
-	o.handleServiceDone(entry, sc)
+	o.handleServiceDone(entry, sc, nil)
+	o.handleServiceDone(entry, sc, nil)
 
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -3163,8 +3175,8 @@ func TestHandleServiceDone_WgDoneTrue_MaxRetries(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc)
-	o.handleServiceDone(entry, sc)
+	o.handleServiceDone(entry, sc, nil)
+	o.handleServiceDone(entry, sc, nil)
 
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -3191,14 +3203,14 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelled(t *testing.T) {
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
 
-	go o.handleServiceDone(entry, sc)
+	go o.handleServiceDone(entry, sc, nil)
 
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 	time.Sleep(50 * time.Millisecond)
 
 	// Second call: wgDone is already true from the goroutine → else branch.
-	o.handleServiceDone(entry, sc)
+	o.handleServiceDone(entry, sc, nil)
 
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -3752,6 +3764,9 @@ func TestOnCrash(t *testing.T) {
 		if crashErr == nil {
 			t.Error("expected non-nil crash error")
 		}
+		if !strings.Contains(crashErr.Error(), "boom") {
+			t.Errorf("expected real error to reach OnCrash, got %v", crashErr)
+		}
 	})
 
 	t.Run("no_hook_no_panic", func(t *testing.T) {
@@ -4160,10 +4175,8 @@ func TestOnStateChange_NoDuplicateTransitions(t *testing.T) {
 // ── OnCrash with self-heal: StatusCrashed is set for runOnce errors ──
 
 func TestOnCrash_WithSelfHeal(t *testing.T) {
-	// OnCrash fires when a service transitions to StatusCrashed. That only
-	// happens for runOnce services that return a non-Canceled error. For
-	// persistent services with self-heal, errors go through handleServiceDone
-	// which restarts the service without setting StatusCrashed.
+	// OnCrash fires with the real error once a self-heal service exhausts its
+	// maxRetries and transitions to StatusCrashed.
 
 	var crashes []string
 	var mu sync.Mutex
@@ -4180,9 +4193,7 @@ func TestOnCrash_WithSelfHeal(t *testing.T) {
 	var factoryCalls atomic.Int32
 	factory := func() Service {
 		factoryCalls.Add(1)
-		return &testSvc{
-			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
-		}
+		return &errSvc{err: errors.New("recurring crash")}
 	}
 	_ = o.Register(&errSvc{err: errors.New("initial crash")},
 		WithName("healer"),
@@ -4197,10 +4208,106 @@ func TestOnCrash_WithSelfHeal(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	// OnCrash is NOT fired for self-heal path (status goes StatusStopped, not StatusCrashed).
-	// But the service IS restarted.
 	if factoryCalls.Load() < 1 {
 		t.Error("self-heal should have created new instance")
+	}
+	if len(crashes) == 0 {
+		t.Error("OnCrash should fire when self-heal exhausts maxRetries")
+	}
+}
+
+// waitForStatus polls until a service reaches the target status or times out.
+func waitForStatus(t *testing.T, o *Orchestrator, name string, target ServiceStatus) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		s, _ := o.Status(name)
+		if s == target {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("service %s never reached %s", name, target)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+func TestCrashSemantics_PersistentError(t *testing.T) {
+	var crashName string
+	var crashErr error
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnCrash:  func(name string, err error) { crashName = name; crashErr = err },
+	})
+	_ = o.Register(&errSvc{err: errors.New("persistent boom")}, WithName("p"))
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	waitForStatus(t, o, "p", StatusCrashed)
+
+	if crashName != "p" {
+		t.Errorf("expected OnCrash for 'p', got %q", crashName)
+	}
+	if !strings.Contains(crashErr.Error(), "persistent boom") {
+		t.Errorf("expected real error in OnCrash, got %v", crashErr)
+	}
+	if o.Metrics().Crashes < 1 {
+		t.Error("expected Crashes metric to increment")
+	}
+}
+
+func TestCrashSemantics_Panic(t *testing.T) {
+	var crashErr error
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnCrash:  func(name string, err error) { crashErr = err },
+	})
+	_ = o.Register(&panicSvc{msg: "kaboom"}, WithName("p"))
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	waitForStatus(t, o, "p", StatusCrashed)
+
+	if crashErr == nil {
+		t.Fatal("expected OnCrash error from panic")
+	}
+	if !strings.Contains(crashErr.Error(), "kaboom") {
+		t.Errorf("expected panic value in OnCrash error, got %v", crashErr)
+	}
+}
+
+func TestCrashSemantics_CleanExit(t *testing.T) {
+	var crashCalls atomic.Int32
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnCrash:  func(name string, err error) { crashCalls.Add(1) },
+	})
+	_ = o.Register(&testSvc{startFn: func(ctx context.Context) error { return nil }}, WithName("clean"))
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	waitForStatus(t, o, "clean", StatusStopped)
+
+	if crashCalls.Load() != 0 {
+		t.Errorf("clean exit should not fire OnCrash, got %d calls", crashCalls.Load())
+	}
+	if o.Metrics().Crashes != 0 {
+		t.Errorf("clean exit should not increment Crashes, got %d", o.Metrics().Crashes)
+	}
+}
+
+func TestSetStatusErr_NilError_FabricatesMessage(t *testing.T) {
+	var got error
+	o := New(Config{LogLevel: LogLevelWarn, OnCrash: func(name string, err error) { got = err }})
+	entry := &serviceEntry{name: "x", status: StatusRunning}
+	o.setStatusErr(entry, StatusCrashed, nil)
+	if got == nil {
+		t.Fatal("expected fabricated crash error")
+	}
+	if !strings.Contains(got.Error(), "crashed") {
+		t.Errorf("expected fabricated message, got %v", got)
 	}
 }
 
@@ -4229,7 +4336,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 	sc := ServiceContext{Context: ctx}
 
 	// Start handleServiceDone asynchronously — it will enter the backoff delay.
-	go o.handleServiceDone(entry, sc)
+	go o.handleServiceDone(entry, sc, nil)
 
 	// Cancel during backoff, triggering the ctx.Done case in the backoff select.
 	time.Sleep(50 * time.Millisecond)
