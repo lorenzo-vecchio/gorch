@@ -25,7 +25,7 @@ func TestServiceLogger_Info(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ch := make(chan logEntry, 1)
-			l := newServiceLogger("testsvc", ch)
+			l := newServiceLogger("testsvc", ch, nil)
 			l.Info(tt.msg, tt.args...)
 			select {
 			case e := <-ch:
@@ -47,7 +47,7 @@ func TestServiceLogger_Info(t *testing.T) {
 
 func TestServiceLogger_Error(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("errsvc", ch)
+	l := newServiceLogger("errsvc", ch, nil)
 	l.Error("err msg", "code", 500)
 	select {
 	case e := <-ch:
@@ -61,7 +61,7 @@ func TestServiceLogger_Error(t *testing.T) {
 
 func TestServiceLogger_Debug(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("dbgsvc", ch)
+	l := newServiceLogger("dbgsvc", ch, nil)
 	l.Debug("debug msg")
 	select {
 	case e := <-ch:
@@ -75,7 +75,7 @@ func TestServiceLogger_Debug(t *testing.T) {
 
 func TestServiceLogger_Warn(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("warnsvc", ch)
+	l := newServiceLogger("warnsvc", ch, nil)
 	l.Warn("warn msg")
 	select {
 	case e := <-ch:
@@ -98,7 +98,7 @@ func TestServiceLogger_ChannelFull_NoBlock(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ch := make(chan logEntry, tt.capSize)
-			l := newServiceLogger("fullsvc", ch)
+			l := newServiceLogger("fullsvc", ch, nil)
 			if tt.capSize > 0 {
 				ch <- logEntry{}
 			}
@@ -118,7 +118,7 @@ func TestServiceLogger_ChannelFull_NoBlock(t *testing.T) {
 
 func TestServiceLogger_Emit_OddArgs_NoPanic(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("oddsvc", ch)
+	l := newServiceLogger("oddsvc", ch, nil)
 	l.Info("msg", "key1")
 	select {
 	case e := <-ch:
@@ -598,7 +598,7 @@ func TestMessenger_Unsubscribe_OneLeavesOther(t *testing.T) {
 
 func TestLogEntry_ArgsPreserved(t *testing.T) {
 	ch := make(chan logEntry, 1)
-	l := newServiceLogger("svc", ch)
+	l := newServiceLogger("svc", ch, nil)
 	l.Info("test", "key", "value", "count", 5)
 	select {
 	case e := <-ch:

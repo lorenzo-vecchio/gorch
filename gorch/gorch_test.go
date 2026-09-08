@@ -388,6 +388,54 @@ func TestStop(t *testing.T) {
 	})
 }
 
+// TestStop_ServiceLogsAfterCancel_NoPanic is a regression test for the
+// "send on closed channel" crash: a service that keeps logging after ctx
+// cancellation while Stop() runs must not panic.
+func TestStop_ServiceLogsAfterCancel_NoPanic(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelError})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error {
+			sc := ctx.(ServiceContext)
+			<-ctx.Done()
+			for i := 0; i < 1000; i++ {
+				sc.Logger.Error("post-cancel log", "i", i)
+			}
+			return ctx.Err()
+		},
+	}
+	_ = o.Register(svc)
+	_ = o.Start()
+	time.Sleep(20 * time.Millisecond)
+	if err := o.Stop(time.Second); err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+}
+
+// TestStop_Timeout_LogPumpExits verifies that when a service ignores ctx and
+// Stop() times out, the log-pump still exits and nothing panics.
+func TestStop_Timeout_LogPumpExits(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelError})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error {
+			sc := ctx.(ServiceContext)
+			for i := 0; i < 5; i++ {
+				sc.Logger.Error("still running", "i", i)
+				time.Sleep(time.Millisecond)
+			}
+			never := make(chan struct{})
+			<-never
+			return nil
+		},
+	}
+	_ = o.Register(svc)
+	_ = o.Start()
+	time.Sleep(20 * time.Millisecond)
+	err := o.Stop(50 * time.Millisecond)
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("expected ErrStopTimeout, got %v", err)
+	}
+}
+
 // ── Stop: error aggregation and per-service hooks ──
 
 func TestStop_ErrorAggregation(t *testing.T) {
@@ -424,7 +472,6 @@ func TestStop_ErrorAggregation(t *testing.T) {
 func TestStopMultipleErrors(t *testing.T) {
 	o := New(Config{LogLevel: LogLevelWarn})
 	o.ctx, o.cancel = context.WithCancel(context.Background())
-	o.logCh = make(chan logEntry, 1)
 	o.started = true
 	o.cronSched = nil
 	o.nameIndex = make(map[string]*serviceEntry)
@@ -448,7 +495,6 @@ func TestStopMultipleErrors(t *testing.T) {
 	sc := ServiceContext{Context: o.ctx}
 	o.handleServiceDone(entry, sc)
 
-	close(o.logCh)
 	// wg should be done after handleServiceDone.
 	o.wg.Wait()
 }
@@ -1046,7 +1092,8 @@ func TestLogPump(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelDebug})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
-		o.wg.Add(1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 		go o.logPump()
 
 		o.logCh <- logEntry{
@@ -1056,8 +1103,8 @@ func TestLogPump(t *testing.T) {
 			msg:     "hello world",
 			args:    []any{"k1", "v1", "k2", 42},
 		}
-		close(o.logCh)
-		o.wg.Wait()
+		close(o.logQuit)
+		<-o.logPumpDone
 
 		w.Close()
 		var buf bytes.Buffer
@@ -1088,7 +1135,8 @@ func TestLogPump(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelDebug})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
-		o.wg.Add(1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 		go o.logPump()
 
 		o.logCh <- logEntry{
@@ -1098,8 +1146,8 @@ func TestLogPump(t *testing.T) {
 			msg:     "odd",
 			args:    []any{"lonely"},
 		}
-		close(o.logCh)
-		o.wg.Wait()
+		close(o.logQuit)
+		<-o.logPumpDone
 
 		w.Close()
 		var buf bytes.Buffer
@@ -1120,7 +1168,8 @@ func TestLogPump(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelDebug})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
-		o.wg.Add(1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 		go o.logPump()
 
 		o.logCh <- logEntry{
@@ -1130,8 +1179,8 @@ func TestLogPump(t *testing.T) {
 			msg:     "odd3",
 			args:    []any{"a", 1, "b"},
 		}
-		close(o.logCh)
-		o.wg.Wait()
+		close(o.logQuit)
+		<-o.logPumpDone
 
 		w.Close()
 		var buf bytes.Buffer
@@ -1155,7 +1204,8 @@ func TestLogPump(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelDebug})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
-		o.wg.Add(1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 		go o.logPump()
 
 		o.logCh <- logEntry{
@@ -1165,8 +1215,8 @@ func TestLogPump(t *testing.T) {
 			msg:     "no args",
 			args:    nil,
 		}
-		close(o.logCh)
-		o.wg.Wait()
+		close(o.logQuit)
+		<-o.logPumpDone
 
 		w.Close()
 		var buf bytes.Buffer
@@ -1187,7 +1237,8 @@ func TestLogPump(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelWarn})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 256)
-		o.wg.Add(1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 		go o.logPump()
 
 		o.logCh <- logEntry{
@@ -1206,8 +1257,8 @@ func TestLogPump(t *testing.T) {
 			time:  time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC),
 			level: LogLevelError, service: "svc", msg: "error msg",
 		}
-		close(o.logCh)
-		o.wg.Wait()
+		close(o.logQuit)
+		<-o.logPumpDone
 
 		w.Close()
 		var buf bytes.Buffer
@@ -1229,17 +1280,18 @@ func TestLogPump(t *testing.T) {
 		}
 	})
 
-	t.Run("logPump_exits_when_channel_closed", func(t *testing.T) {
+	t.Run("logPump_exits_on_quit_signal", func(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelDebug})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
-		o.wg.Add(1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 		done := make(chan struct{})
 		go func() {
 			o.logPump()
 			close(done)
 		}()
-		close(o.logCh)
+		close(o.logQuit)
 		select {
 		case <-done:
 		case <-time.After(500 * time.Millisecond):
@@ -1248,19 +1300,49 @@ func TestLogPump(t *testing.T) {
 	})
 }
 
+// TestLogPump_DrainsBufferedOnQuit verifies the pump flushes buffered entries
+// to stderr before exiting on the quit signal.
+func TestLogPump_DrainsBufferedOnQuit(t *testing.T) {
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+
+	o := New(Config{LogLevel: LogLevelDebug})
+	o.logCh = make(chan logEntry, 256)
+	o.logQuit = make(chan struct{})
+	o.logPumpDone = make(chan struct{})
+
+	// Pre-fill the buffer before starting the pump; on quit it must drain all.
+	for i := 0; i < 3; i++ {
+		o.logCh <- logEntry{time: time.Now(), level: LogLevelInfo, service: "svc", msg: "buffered"}
+	}
+	close(o.logQuit)
+	go o.logPump()
+	<-o.logPumpDone
+
+	w.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	os.Stderr = old
+
+	if count := strings.Count(buf.String(), "buffered"); count != 3 {
+		t.Errorf("expected 3 buffered entries flushed, got %d", count)
+	}
+}
+
 // ── ServiceLogger emit ──
 
 func TestServiceLogger_Emit(t *testing.T) {
 	t.Run("non_blocking_send_when_channel_full", func(t *testing.T) {
 		ch := make(chan logEntry, 1)
 		ch <- logEntry{}
-		logger := newServiceLogger("test", ch)
+		logger := newServiceLogger("test", ch, nil)
 		logger.Info("dropped")
 	})
 
 	t.Run("methods_use_correct_levels", func(t *testing.T) {
 		ch := make(chan logEntry, 16)
-		logger := newServiceLogger("svc", ch)
+		logger := newServiceLogger("svc", ch, nil)
 
 		logger.Debug("d")
 		logger.Info("i")
@@ -2301,7 +2383,7 @@ func TestRunHealthChecks_FailuresTracked(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return errors.New("bad") }},
 		cfg:    registerConfig{name: "sick"},
 		status: StatusRunning,
-		logger: newServiceLogger("sick", logCh),
+		logger: newServiceLogger("sick", logCh, nil),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2322,7 +2404,7 @@ func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return nil }},
 		cfg:    registerConfig{name: "healthy"},
 		status: StatusRunning,
-		logger: newServiceLogger("healthy", logCh),
+		logger: newServiceLogger("healthy", logCh, nil),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2342,7 +2424,7 @@ func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return errors.New("bad") }},
 		cfg:    registerConfig{name: "registered"},
 		status: StatusRegistered, // not running — should be skipped
-		logger: newServiceLogger("registered", logCh),
+		logger: newServiceLogger("registered", logCh, nil),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2402,7 +2484,7 @@ func TestRunHealthChecks_ThresholdWithoutSelfHeal(t *testing.T) {
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return errors.New("bad") }},
 		cfg:    registerConfig{name: "sick"},
 		status: StatusRunning,
-		logger: newServiceLogger("sick", logCh),
+		logger: newServiceLogger("sick", logCh, nil),
 	}
 	o.entries = append(o.entries, entry)
 
@@ -2462,7 +2544,7 @@ func TestHandleServiceDone_CancelledDuringBackoff(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: factory, backoff: ConstantBackoff{Delay: 500 * time.Millisecond}},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh),
+		logger: newServiceLogger("x", logCh, nil),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -2723,19 +2805,19 @@ func TestRunOnce_WithTimeout(t *testing.T) {
 	})
 }
 
-func TestStopStartedServices_LogChClosed(t *testing.T) {
-	// Cover the case where logCh is already closed when stopStartedServices runs.
-	// This happens when a cron error closes logCh in Start().
+func TestStopStartedServices_LogQuitSignal(t *testing.T) {
+	// stopStartedServices signals the log-pump via logQuit instead of closing
+	// logCh, so a late log send can never panic on a closed channel.
 	o := New(Config{LogLevel: LogLevelWarn})
 	_ = o.Register(&namedSvc{}, WithCron("invalid", CronParallel))
-	// Start fails → cancel called → logCh closed → stopStartedServices NOT called.
-	// But we call stopStartedServices directly after to cover the already-closed path.
+	// Start fails → logQuit closed → logPumpDone closed → logCh left open.
 	_ = o.Start() // will fail with ErrInvalidCron
-	// logCh is now closed. Create a new entry and call stopStartedServices.
-	o.entries = append(o.entries, &serviceEntry{
-		name: "x", svc: &namedSvc{}, cfg: registerConfig{name: "x"}, status: StatusStopped,
-	})
-	o.stopStartedServices() // should not panic on already-closed logCh
+
+	// logCh must remain open so sends never panic.
+	select {
+	case o.logCh <- logEntry{}:
+	default:
+	}
 }
 
 func TestRunService_ErrorViaSelfHeal(t *testing.T) {
@@ -2802,14 +2884,14 @@ func TestRunHealthChecks_NonHealthCheckerSkipped(t *testing.T) {
 		svc:    &namedSvc{}, // does NOT implement HealthChecker
 		cfg:    registerConfig{name: "plain"},
 		status: StatusRunning,
-		logger: newServiceLogger("plain", logCh),
+		logger: newServiceLogger("plain", logCh, nil),
 	}
 	e2 := &serviceEntry{
 		name:   "hc",
 		svc:    &healthSvc{healthFn: func(ctx context.Context) error { return nil }},
 		cfg:    registerConfig{name: "hc"},
 		status: StatusRunning,
-		logger: newServiceLogger("hc", logCh),
+		logger: newServiceLogger("hc", logCh, nil),
 	}
 	o.entries = append(o.entries, e1, e2)
 
@@ -2834,7 +2916,7 @@ func TestHandleServiceDone_FactoryContextCancelled(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: factory},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh),
+		logger: newServiceLogger("x", logCh, nil),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -2869,7 +2951,7 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 		cfg:        registerConfig{name: "x", factory: factory, maxRetries: 1},
 		name:       "x",
 		status:     StatusRunning,
-		logger:     newServiceLogger("x", logCh),
+		logger:     newServiceLogger("x", logCh, nil),
 		retryCount: 1, // already at max
 	}
 	o.wg.Add(1)
@@ -2951,6 +3033,8 @@ func TestRunOnce_CtxDone(t *testing.T) {
 	o := New(Config{LogLevel: LogLevelWarn})
 	o.ctx, o.cancel = context.WithCancel(context.Background())
 	o.logCh = make(chan logEntry, 1)
+	o.logQuit = make(chan struct{})
+	o.logPumpDone = make(chan struct{})
 	o.started = true
 	o.nameIndex = make(map[string]*serviceEntry)
 
@@ -2969,7 +3053,7 @@ func TestRunOnce_CtxDone(t *testing.T) {
 		svc:    svc,
 		cfg:    registerConfig{name: "runonce", runOnce: true, startTimeout: time.Second},
 		status: StatusRegistered,
-		logger: newServiceLogger("runonce", o.logCh),
+		logger: newServiceLogger("runonce", o.logCh, nil),
 	}
 	o.entries = append(o.entries, entry)
 	o.nameIndex["runonce"] = entry
@@ -3047,7 +3131,7 @@ func TestHandleServiceDone_WgDoneTrue_CtxCancelled(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: func() Service { return &testSvc{} }},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh),
+		logger: newServiceLogger("x", logCh, nil),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -3074,7 +3158,7 @@ func TestHandleServiceDone_WgDoneTrue_MaxRetries(t *testing.T) {
 		cfg:        registerConfig{name: "x", factory: func() Service { return &testSvc{} }, maxRetries: 1},
 		name:       "x",
 		status:     StatusRunning,
-		logger:     newServiceLogger("x", logCh),
+		logger:     newServiceLogger("x", logCh, nil),
 		retryCount: 1,
 	}
 	o.wg.Add(1)
@@ -3102,7 +3186,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelled(t *testing.T) {
 		cfg:    registerConfig{name: "x", factory: func() Service { return &testSvc{} }, backoff: ConstantBackoff{Delay: 500 * time.Millisecond}},
 		name:   "x",
 		status: StatusRunning,
-		logger: newServiceLogger("x", logCh),
+		logger: newServiceLogger("x", logCh, nil),
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
@@ -4137,7 +4221,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 		cfg:        registerConfig{name: "x", factory: func() Service { return &testSvc{} }, backoff: ConstantBackoff{Delay: 200 * time.Millisecond}},
 		name:       "x",
 		status:     StatusRunning,
-		logger:     newServiceLogger("x", logCh),
+		logger:     newServiceLogger("x", logCh, nil),
 		wgDone:     true, // already done
 		retryCount: 1,
 	}
@@ -4179,7 +4263,8 @@ func TestStartGroup_Complete(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelWarn})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
-		o.wg.Add(1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 		go o.logPump()
 
 		s1 := &testSvc{
@@ -4193,14 +4278,14 @@ func TestStartGroup_Complete(t *testing.T) {
 			svc:    s1,
 			cfg:    registerConfig{name: "s1", group: "workers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("s1", o.logCh),
+			logger: newServiceLogger("s1", o.logCh, nil),
 		}
 		e2 := &serviceEntry{
 			name:   "s2",
 			svc:    s2,
 			cfg:    registerConfig{name: "s2", group: "workers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("s2", o.logCh),
+			logger: newServiceLogger("s2", o.logCh, nil),
 		}
 		o.entries = append(o.entries, e1, e2)
 		o.nameIndex = map[string]*serviceEntry{"s1": e1, "s2": e2}
@@ -4224,20 +4309,22 @@ func TestStartGroup_Complete(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelWarn})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 
 		eA := &serviceEntry{
 			name:   "cycle-a",
 			svc:    &testSvc{},
 			cfg:    registerConfig{name: "cycle-a", dependsOn: []string{"cycle-b"}, group: "cyclers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("cycle-a", o.logCh),
+			logger: newServiceLogger("cycle-a", o.logCh, nil),
 		}
 		eB := &serviceEntry{
 			name:   "cycle-b",
 			svc:    &testSvc{},
 			cfg:    registerConfig{name: "cycle-b", dependsOn: []string{"cycle-a"}, group: "cyclers"},
 			status: StatusRegistered,
-			logger: newServiceLogger("cycle-b", o.logCh),
+			logger: newServiceLogger("cycle-b", o.logCh, nil),
 		}
 		o.entries = append(o.entries, eA, eB)
 		o.nameIndex = map[string]*serviceEntry{"cycle-a": eA, "cycle-b": eB}
@@ -4255,13 +4342,15 @@ func TestStartGroup_Complete(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelWarn})
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
+		o.logQuit = make(chan struct{})
+		o.logPumpDone = make(chan struct{})
 
 		e := &serviceEntry{
 			name:   "bad",
 			svc:    &errSvc{err: errors.New("init crash")},
 			cfg:    registerConfig{name: "bad", group: "doomed", runOnce: true},
 			status: StatusRegistered,
-			logger: newServiceLogger("bad", o.logCh),
+			logger: newServiceLogger("bad", o.logCh, nil),
 		}
 		o.entries = append(o.entries, e)
 		o.nameIndex = map[string]*serviceEntry{"bad": e}
@@ -4490,7 +4579,8 @@ func TestStopGroup_StopError(t *testing.T) {
 	o := New(Config{LogLevel: LogLevelWarn})
 	o.ctx, o.cancel = context.WithCancel(context.Background())
 	o.logCh = make(chan logEntry, 1)
-	o.wg.Add(1)
+	o.logQuit = make(chan struct{})
+	o.logPumpDone = make(chan struct{})
 	go o.logPump()
 	o.statusMu = sync.RWMutex{}
 
@@ -4499,7 +4589,7 @@ func TestStopGroup_StopError(t *testing.T) {
 		svc:    &testSvc{stopFn: func() error { return errors.New("stop failure") }},
 		cfg:    registerConfig{name: "flaky", group: "err-group"},
 		status: StatusRunning,
-		logger: newServiceLogger("flaky", o.logCh),
+		logger: newServiceLogger("flaky", o.logCh, nil),
 	}
 	o.entries = append(o.entries, e)
 	o.nameIndex = map[string]*serviceEntry{"flaky": e}

@@ -133,8 +133,10 @@ type Orchestrator struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	logCh     chan logEntry
-	messenger *Messenger
+	logCh       chan logEntry
+	logQuit     chan struct{} // closed to signal the log-pump to drain and exit
+	logPumpDone chan struct{} // closed when the log-pump goroutine exits
+	messenger   *Messenger
 
 	cronSched *cron.Cron
 	entries   []*serviceEntry
@@ -307,6 +309,8 @@ func (o *Orchestrator) Start() error {
 		// Only create log channel when using the default (channel-based) logger.
 		if o.cfg.Logger == nil {
 			o.logCh = make(chan logEntry, 256)
+			o.logQuit = make(chan struct{})
+			o.logPumpDone = make(chan struct{})
 		}
 
 		// Assign loggers: use cfg.name if WithName was set, else reflect type.
@@ -320,13 +324,12 @@ func (o *Orchestrator) Start() error {
 			if o.cfg.Logger != nil {
 				entry.logger = newServiceLoggerWith(svcName, o.cfg.Logger)
 			} else {
-				entry.logger = newServiceLogger(svcName, o.logCh)
+				entry.logger = newServiceLogger(svcName, o.logCh, o.logQuit)
 			}
 		}
 
 		// Spawn log-pump goroutine (default logger only).
 		if o.cfg.Logger == nil {
-			o.wg.Add(1)
 			go o.logPump()
 		}
 
@@ -342,8 +345,9 @@ func (o *Orchestrator) Start() error {
 			})
 			if err != nil {
 				o.cancel()
-				if o.logCh != nil {
-					close(o.logCh)
+				if o.logQuit != nil {
+					close(o.logQuit)
+					<-o.logPumpDone
 				}
 				o.cronSched.Stop()
 				startErr = fmt.Errorf("%w: %w", ErrInvalidCron, err)
@@ -638,14 +642,9 @@ func (o *Orchestrator) stopStartedServices() {
 			o.safeStop(entry)
 		}
 	}
-	// Close log channel.
-	if o.logCh != nil {
-		select {
-		case <-o.logCh:
-		// already closed
-		default:
-			close(o.logCh)
-		}
+	// Stop log-pump: signal it to drain buffered entries and exit.
+	if o.logQuit != nil {
+		close(o.logQuit)
 	}
 }
 
@@ -716,9 +715,9 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 			}
 		}
 
-		// 4. Close log channel to signal log-pump to drain and exit.
-		if o.logCh != nil {
-			close(o.logCh)
+		// 4. Signal log-pump to drain and exit.
+		if o.logQuit != nil {
+			close(o.logQuit)
 		}
 
 		// 5. Clean up messenger subscriptions.
@@ -729,6 +728,9 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		done := make(chan struct{})
 		go func() {
 			o.wg.Wait()
+			if o.logPumpDone != nil {
+				<-o.logPumpDone
+			}
 			close(done)
 		}()
 		select {
@@ -1211,29 +1213,48 @@ func (o *Orchestrator) runHealthChecks() {
 // ── Internal helpers ──
 
 func (o *Orchestrator) logPump() {
-	defer o.wg.Done()
-	for entry := range o.logCh {
-		if entry.level < o.cfg.LogLevel {
-			continue
-		}
-		levelStr := entry.level.String()
-		ts := entry.time.Format("2006-01-02 15:04:05.000")
-		var argsStr string
-		for i := 0; i < len(entry.args)-1; i += 2 {
-			if i > 0 {
-				argsStr += " "
+	defer close(o.logPumpDone)
+	for {
+		select {
+		case entry := <-o.logCh:
+			o.emitLog(entry)
+		case <-o.logQuit:
+			// Drain remaining buffered entries, then exit.
+			for {
+				select {
+				case entry := <-o.logCh:
+					o.emitLog(entry)
+				default:
+					return
+				}
 			}
-			argsStr += fmt.Sprintf("%v=%v", entry.args[i], entry.args[i+1])
 		}
-		if len(entry.args)%2 != 0 && len(entry.args) > 0 {
-			if argsStr != "" {
-				argsStr += " "
-			}
-			argsStr += fmt.Sprintf("%v=(missing)", entry.args[len(entry.args)-1])
-		}
-		_, _ = fmt.Fprintf(os.Stderr, "%s %-5s %s --- %s %s\n",
-			ts, levelStr, entry.service, entry.msg, argsStr)
 	}
+}
+
+// emitLog formats and writes a single log entry to stderr, respecting the
+// configured minimum log level.
+func (o *Orchestrator) emitLog(entry logEntry) {
+	if entry.level < o.cfg.LogLevel {
+		return
+	}
+	levelStr := entry.level.String()
+	ts := entry.time.Format("2006-01-02 15:04:05.000")
+	var argsStr string
+	for i := 0; i < len(entry.args)-1; i += 2 {
+		if i > 0 {
+			argsStr += " "
+		}
+		argsStr += fmt.Sprintf("%v=%v", entry.args[i], entry.args[i+1])
+	}
+	if len(entry.args)%2 != 0 && len(entry.args) > 0 {
+		if argsStr != "" {
+			argsStr += " "
+		}
+		argsStr += fmt.Sprintf("%v=(missing)", entry.args[len(entry.args)-1])
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "%s %-5s %s --- %s %s\n",
+		ts, levelStr, entry.service, entry.msg, argsStr)
 }
 
 // runService starts a non-cron service. handleServiceDone is called exactly once
@@ -1368,7 +1389,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext)
 	if o.cfg.Logger != nil {
 		entry.logger = newServiceLoggerWith(svcName, o.cfg.Logger)
 	} else {
-		entry.logger = newServiceLogger(svcName, o.logCh)
+		entry.logger = newServiceLogger(svcName, o.logCh, o.logQuit)
 	}
 	entry.stableSince = time.Now()
 

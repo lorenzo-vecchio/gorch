@@ -48,12 +48,13 @@ type Logger interface {
 type ServiceLogger struct {
 	svcName string
 	ch      chan<- logEntry // used by default channel-based logging
+	quit    <-chan struct{} // closed at shutdown; emit drops entries once closed
 	logger  Logger          // custom logger (bypasses channel)
 }
 
 // newServiceLogger creates a channel-based ServiceLogger (internal).
-func newServiceLogger(svcName string, ch chan<- logEntry) *ServiceLogger {
-	return &ServiceLogger{svcName: svcName, ch: ch}
+func newServiceLogger(svcName string, ch chan<- logEntry, quit <-chan struct{}) *ServiceLogger {
+	return &ServiceLogger{svcName: svcName, ch: ch, quit: quit}
 }
 
 // newServiceLoggerWith creates a ServiceLogger that delegates to a custom Logger.
@@ -85,6 +86,7 @@ func (l *ServiceLogger) emit(level LogLevel, msg string, args []any) {
 	}
 	select {
 	case l.ch <- logEntry{time: time.Now(), level: level, service: l.svcName, msg: msg, args: args}:
+	case <-l.quit: // shutdown in progress: drop rather than risk blocking a Stop
 	default: // drop if channel full
 	}
 }
