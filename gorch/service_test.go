@@ -1448,7 +1448,7 @@ func TestDrain_Complete(t *testing.T) {
 // ── FuncService.Stop: nil stopFn path ──
 
 func TestFuncService_StopNil(t *testing.T) {
-	f := &funcService{startFn: func(ctx context.Context) error { return nil }}
+	f := &funcService{startFn: func(ctx ServiceContext) error { return nil }}
 	if err := f.Stop(); err != nil {
 		t.Errorf("Stop with nil stopFn should return nil, got %v", err)
 	}

@@ -19,8 +19,8 @@ import (
 
 // Service — every managed goroutine implements this.
 type Service interface {
-	Start(ctx context.Context) error // blocks; for cron: runs per-tick; for non-cron: runs until ctx cancelled
-	Stop() error                     // cleanup signal beyond context cancellation
+	Start(ctx ServiceContext) error // blocks; for cron: runs per-tick; for non-cron: runs until ctx cancelled
+	Stop() error                    // cleanup signal beyond context cancellation
 }
 
 // ServiceContext — what the orchestrator hands each service.
@@ -304,17 +304,19 @@ var (
 
 // funcService wraps closures as a Service. Used by RegisterFunc.
 type funcService struct {
-	startFn func(ctx context.Context) error
+	startFn func(ctx ServiceContext) error
 	stopFn  func() error
 }
 
-func (f *funcService) Start(ctx context.Context) error { return f.startFn(ctx) }
+func (f *funcService) Start(ctx ServiceContext) error { return f.startFn(ctx) }
 func (f *funcService) Stop() error {
 	if f.stopFn != nil {
 		return f.stopFn()
 	}
 	return nil
 }
+
+var _ Service = (*funcService)(nil)
 
 // Messenger — pub-sub with topics (Socket.IO rooms style).
 // A nil or empty topics slice in Publish broadcasts to ALL subscribers.

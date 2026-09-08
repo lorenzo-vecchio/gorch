@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,7 +14,7 @@ type Worker struct {
 	name string
 }
 
-func (w *Worker) Start(ctx context.Context) error {
+func (w *Worker) Start(ctx gorch.ServiceContext) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -34,7 +33,7 @@ func (w *Worker) Stop() error {
 }
 
 func main() {
-	orch := gorch.New(gorch.Config{})
+	orch := gorch.New()
 
 	// Register a long-running service.
 	orch.Register(&Worker{name: "worker-1"})

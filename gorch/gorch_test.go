@@ -24,7 +24,7 @@ type testSvc struct {
 	startCalls atomic.Int32
 }
 
-func (s *testSvc) Start(ctx context.Context) error {
+func (s *testSvc) Start(ctx ServiceContext) error {
 	s.startCalls.Add(1)
 	if s.startFn != nil {
 		return s.startFn(ctx)
@@ -43,23 +43,23 @@ func (s *testSvc) Stop() error {
 
 type namedSvc struct{ name string }
 
-func (s *namedSvc) Start(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
-func (s *namedSvc) Stop() error                     { return nil }
+func (s *namedSvc) Start(ctx ServiceContext) error { <-ctx.Done(); return ctx.Err() }
+func (s *namedSvc) Stop() error                    { return nil }
 
 type errSvc struct{ err error }
 
-func (s *errSvc) Start(ctx context.Context) error { return s.err }
-func (s *errSvc) Stop() error                     { return nil }
+func (s *errSvc) Start(ctx ServiceContext) error { return s.err }
+func (s *errSvc) Stop() error                    { return nil }
 
 type panicSvc struct{ msg string }
 
-func (s *panicSvc) Start(ctx context.Context) error { panic(s.msg) }
-func (s *panicSvc) Stop() error                     { return nil }
+func (s *panicSvc) Start(ctx ServiceContext) error { panic(s.msg) }
+func (s *panicSvc) Stop() error                    { return nil }
 
 type stopPanicSvc struct{}
 
-func (s *stopPanicSvc) Start(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
-func (s *stopPanicSvc) Stop() error                     { panic("stop boom") }
+func (s *stopPanicSvc) Start(ctx ServiceContext) error { <-ctx.Done(); return ctx.Err() }
+func (s *stopPanicSvc) Stop() error                    { panic("stop boom") }
 
 // healthSvc is a test service that implements HealthChecker.
 type healthSvc struct {
@@ -124,36 +124,42 @@ func TestLogLevel_String(t *testing.T) {
 
 func TestNew_Defaults(t *testing.T) {
 	t.Run("zero_loglevel_defaults_to_info", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		if o.cfg.LogLevel != LogLevelInfo {
 			t.Errorf("expected LogLevelInfo (1), got %d", o.cfg.LogLevel)
 		}
 	})
 
-	t.Run("logLevelDebug_zero_defaults_to_info", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelDebug})
-		if o.cfg.LogLevel != LogLevelInfo {
-			t.Errorf("LogLevelDebug (0) is indistinguishable from zero-value; "+
-				"New() defaults it to Info. got %d", o.cfg.LogLevel)
+	t.Run("logLevelDebug_is_selectable", func(t *testing.T) {
+		o := New(WithLogLevel(LogLevelDebug))
+		if o.cfg.LogLevel != LogLevelDebug {
+			t.Errorf("WithLogLevel(LogLevelDebug) should select Debug, got %d", o.cfg.LogLevel)
 		}
 	})
 
 	t.Run("explicit_warn_stays_warn", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		if o.cfg.LogLevel != LogLevelWarn {
 			t.Errorf("expected LogLevelWarn (2), got %d", o.cfg.LogLevel)
 		}
 	})
 
+	t.Run("health_checks_can_be_disabled", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if o.cfg.HealthInterval != 0 {
+			t.Errorf("expected HealthInterval=0 when disabled, got %v", o.cfg.HealthInterval)
+		}
+	})
+
 	t.Run("messenger_initialized", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		if o.messenger == nil {
 			t.Fatal("expected messenger to be initialized")
 		}
 	})
 
 	t.Run("health_defaults", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		if o.cfg.HealthInterval != 30*time.Second {
 			t.Errorf("expected HealthInterval=30s, got %v", o.cfg.HealthInterval)
 		}
@@ -166,7 +172,7 @@ func TestNew_Defaults(t *testing.T) {
 	})
 
 	t.Run("nameIndex_initialized", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		if o.nameIndex == nil {
 			t.Fatal("expected nameIndex to be initialized")
 		}
@@ -177,7 +183,7 @@ func TestNew_Defaults(t *testing.T) {
 
 func TestRegister(t *testing.T) {
 	t.Run("register_before_start", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		err := o.Register(&namedSvc{name: "a"})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
@@ -188,7 +194,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("register_after_start_returns_ErrAlreadyStarted", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		_ = o.Register(&namedSvc{name: "a"})
 		_ = o.Start()
 		defer o.Stop(1 * time.Second)
@@ -199,7 +205,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("register_with_cron_option", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		err := o.Register(&namedSvc{name: "c"}, WithCron("* * * * * *", CronParallel))
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
@@ -213,7 +219,7 @@ func TestRegister(t *testing.T) {
 	})
 
 	t.Run("register_with_selfheal_option", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		factory := func() Service { return &namedSvc{name: "healed"} }
 		err := o.Register(&namedSvc{name: "a"}, WithSelfHeal(factory))
 		if err != nil {
@@ -228,7 +234,7 @@ func TestRegister(t *testing.T) {
 // ── Register edge cases ──
 
 func TestRegister_DuplicateName(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("dup"))
 	err := o.Register(&namedSvc{}, WithName("dup"))
 	if !errors.Is(err, ErrDuplicateName) {
@@ -237,7 +243,7 @@ func TestRegister_DuplicateName(t *testing.T) {
 }
 
 func TestRegister_SelfDependency(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	err := o.Register(&namedSvc{}, WithName("self"), DependsOn("self"))
 	if !errors.Is(err, ErrDependencyCycle) {
 		t.Errorf("expected ErrDependencyCycle, got %v", err)
@@ -245,7 +251,7 @@ func TestRegister_SelfDependency(t *testing.T) {
 }
 
 func TestRegister_DependencyNotFound(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	err := o.Register(&namedSvc{}, WithName("orphan"), DependsOn("nobody"))
 	if err == nil {
 		t.Fatal("expected dependency-not-found error")
@@ -256,7 +262,7 @@ func TestRegister_DependencyNotFound(t *testing.T) {
 
 func TestStart(t *testing.T) {
 	t.Run("start_with_no_services", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		err := o.Start()
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
@@ -265,7 +271,7 @@ func TestStart(t *testing.T) {
 	})
 
 	t.Run("double_start_returns_ErrAlreadyStarted", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		err1 := o.Start()
 		err2 := o.Start()
 		if err1 != nil {
@@ -278,7 +284,7 @@ func TestStart(t *testing.T) {
 	})
 
 	t.Run("start_with_invalid_cron_returns_ErrInvalidCron", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		_ = o.Register(&namedSvc{name: "bad-cron"}, WithCron("invalid", CronParallel))
 		err := o.Start()
 		if !errors.Is(err, ErrInvalidCron) {
@@ -288,7 +294,7 @@ func TestStart(t *testing.T) {
 
 	t.Run("start_ErrAlreadyStarted_via_whitebox", func(t *testing.T) {
 		o := &Orchestrator{
-			cfg:       Config{LogLevel: LogLevelInfo},
+			cfg:       config{LogLevel: LogLevelInfo, logLevelSet: true},
 			started:   true,
 			messenger: newMessenger(),
 		}
@@ -303,7 +309,7 @@ func TestStart(t *testing.T) {
 // orchestrator: it can be registered against, restarted, and stopped.
 func TestStart_RetryAfterFailure(t *testing.T) {
 	t.Run("register_after_failed_start_succeeds", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("gate"), WithRunOnce())
 		if err := o.Start(); err == nil {
 			t.Fatal("expected Start to fail")
@@ -314,7 +320,7 @@ func TestStart_RetryAfterFailure(t *testing.T) {
 	})
 
 	t.Run("start_after_failed_start_actually_starts", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var gateCalls atomic.Int32
 		gate := &testSvc{startFn: func(ctx context.Context) error {
 			if gateCalls.Add(1) == 1 {
@@ -338,7 +344,7 @@ func TestStart_RetryAfterFailure(t *testing.T) {
 	})
 
 	t.Run("stop_after_failed_start_is_noop", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("gate"), WithRunOnce())
 		_ = o.Start()
 		if err := o.Stop(time.Second); err != nil {
@@ -351,7 +357,7 @@ func TestStart_RetryAfterFailure(t *testing.T) {
 
 func TestStop(t *testing.T) {
 	t.Run("stop_on_never_started_is_noop", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		err := o.Stop(100 * time.Millisecond)
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)
@@ -359,7 +365,7 @@ func TestStop(t *testing.T) {
 	})
 
 	t.Run("stop_after_start_with_no_services", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		_ = o.Start()
 		err := o.Stop(1 * time.Second)
 		if err != nil {
@@ -368,7 +374,7 @@ func TestStop(t *testing.T) {
 	})
 
 	t.Run("double_stop_is_idempotent", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		_ = o.Start()
 		err1 := o.Stop(1 * time.Second)
 		err2 := o.Stop(1 * time.Second)
@@ -381,7 +387,7 @@ func TestStop(t *testing.T) {
 	})
 
 	t.Run("stop_calls_svc_stop", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		svc := &testSvc{}
 		_ = o.Register(svc)
 		_ = o.Start()
@@ -392,7 +398,7 @@ func TestStop(t *testing.T) {
 	})
 
 	t.Run("stop_timeout_returns_ErrStopTimeout", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error {
 				never := make(chan struct{})
@@ -409,7 +415,7 @@ func TestStop(t *testing.T) {
 	})
 
 	t.Run("stop_cleans_up_messenger_subs", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		_ = o.Start()
 		ch, _ := o.messenger.Subscribe("test")
 		_ = o.Stop(1 * time.Second)
@@ -425,7 +431,7 @@ func TestStop(t *testing.T) {
 // "send on closed channel" crash: a service that keeps logging after ctx
 // cancellation while Stop() runs must not panic.
 func TestStop_ServiceLogsAfterCancel_NoPanic(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelError})
+	o := New(WithLogLevel(LogLevelError))
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error {
 			sc := ctx.(ServiceContext)
@@ -447,7 +453,7 @@ func TestStop_ServiceLogsAfterCancel_NoPanic(t *testing.T) {
 // TestStop_Timeout_LogPumpExits verifies that when a service ignores ctx and
 // Stop() times out, the log-pump still exits and nothing panics.
 func TestStop_Timeout_LogPumpExits(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelError})
+	o := New(WithLogLevel(LogLevelError))
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error {
 			sc := ctx.(ServiceContext)
@@ -472,7 +478,7 @@ func TestStop_Timeout_LogPumpExits(t *testing.T) {
 // TestStop_ClosesMessengerSubscriberChannels verifies that a subscriber blocked
 // on receive observes a channel close when the orchestrator stops.
 func TestStop_ClosesMessengerSubscriberChannels(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Start()
 	ch, _ := o.messenger.Subscribe("topic")
 	_ = o.Stop(time.Second)
@@ -486,7 +492,7 @@ func TestStop_ClosesMessengerSubscriberChannels(t *testing.T) {
 // TestStop_SubscribeAfterStopDoesNotPanic verifies the messenger re-initializes
 // its subscription map lazily so a late Subscribe does not panic.
 func TestStop_SubscribeAfterStopDoesNotPanic(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Start()
 	_ = o.Stop(time.Second)
 
@@ -501,7 +507,7 @@ func TestStop_SubscribeAfterStopDoesNotPanic(t *testing.T) {
 // ── Stop: error aggregation and per-service hooks ──
 
 func TestStop_ErrorAggregation(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	stopErr1 := errors.New("stop failed alpha")
 	stopErr2 := errors.New("stop failed beta")
 
@@ -532,7 +538,7 @@ func TestStop_ErrorAggregation(t *testing.T) {
 }
 
 func TestStopMultipleErrors(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	o.ctx, o.cancel = context.WithCancel(context.Background())
 	o.started = true
 	o.cronSched = nil
@@ -564,7 +570,7 @@ func TestStopMultipleErrors(t *testing.T) {
 // ── stopOneService hooks ──
 
 func TestStopOneService_HookErrors(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 
 	hookErr := errors.New("before-stop hook error")
 	stopErr := errors.New("stop error")
@@ -599,16 +605,16 @@ func TestStopOneService_HookErrors(t *testing.T) {
 
 func TestStopOneService_GlobalHooks(t *testing.T) {
 	var events []string
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnBeforeStop: func(name string) error {
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithGlobalOnBeforeStop(func(name string) error {
 			events = append(events, "gb:"+name)
 			return nil
-		},
-		OnAfterStop: func(name string, err error) {
+		}),
+		WithGlobalOnAfterStop(func(name string, err error) {
 			events = append(events, "ga:"+name)
-		},
-	})
+		}),
+	)
 
 	svc := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
 	entry := &serviceEntry{
@@ -629,7 +635,7 @@ func TestStopOneService_GlobalHooks(t *testing.T) {
 }
 
 func TestStopOneService_StopPanic(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	entry := &serviceEntry{
 		name:   "panicky",
 		svc:    &stopPanicSvc{},
@@ -649,7 +655,7 @@ func TestStopOneService_StopPanic(t *testing.T) {
 
 func TestContextCancellation(t *testing.T) {
 	t.Run("services_receive_context_cancellation_on_stop", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error {
 				<-ctx.Done()
@@ -666,7 +672,7 @@ func TestContextCancellation(t *testing.T) {
 	})
 
 	t.Run("service_returns_context_canceled_on_stop", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		var returnedErr error
 		var mu sync.Mutex
 
@@ -698,7 +704,7 @@ func TestContextCancellation(t *testing.T) {
 
 func TestCronModes(t *testing.T) {
 	t.Run("cron_parallel_concurrent_ticks", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var running atomic.Int32
 		var maxRunning atomic.Int32
 
@@ -730,7 +736,7 @@ func TestCronModes(t *testing.T) {
 	})
 
 	t.Run("cron_skip_drops_overlapping_tick", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var calls atomic.Int32
 
 		svc := &testSvc{
@@ -755,7 +761,7 @@ func TestCronModes(t *testing.T) {
 	})
 
 	t.Run("cron_queue_serializes_ticks", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var running atomic.Int32
 		var maxRunning atomic.Int32
 		var total atomic.Int32
@@ -796,7 +802,7 @@ func TestCronModes(t *testing.T) {
 
 func TestSelfHeal(t *testing.T) {
 	t.Run("restarts_after_error", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var factoryCalls atomic.Int32
 
 		factory := func() Service {
@@ -821,7 +827,7 @@ func TestSelfHeal(t *testing.T) {
 	})
 
 	t.Run("restarts_after_panic", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var factoryCalls atomic.Int32
 
 		factory := func() Service {
@@ -846,7 +852,7 @@ func TestSelfHeal(t *testing.T) {
 	})
 
 	t.Run("self_heal_1s_backoff", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var factoryCalls atomic.Int32
 
 		factory := func() Service {
@@ -877,7 +883,7 @@ func TestSelfHeal(t *testing.T) {
 	})
 
 	t.Run("handleServiceDone_no_factory_calls_wgDone", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		entry := &serviceEntry{svc: &namedSvc{name: "x"}, cfg: registerConfig{}}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: context.Background()}
@@ -893,7 +899,7 @@ func TestSelfHeal(t *testing.T) {
 	})
 
 	t.Run("handleServiceDone_double_call_no_double_wgDone", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		entry := &serviceEntry{svc: &namedSvc{name: "x"}, cfg: registerConfig{}}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: context.Background()}
@@ -910,7 +916,7 @@ func TestSelfHeal(t *testing.T) {
 	})
 
 	t.Run("handleServiceDone_ctx_cancelled_no_restart", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		ctx, cancel := context.WithCancel(context.Background())
 		o.ctx = ctx
 		cancel() // cancel immediately
@@ -939,7 +945,7 @@ func TestSelfHeal(t *testing.T) {
 // ── Self-heal with options ──
 
 func TestSelfHeal_MaxRetries(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	var factoryCalls atomic.Int32
 
 	factory := func() Service {
@@ -967,7 +973,7 @@ func TestSelfHeal_MaxRetries(t *testing.T) {
 }
 
 func TestSelfHeal_ResetAfter(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	var factoryCalls atomic.Int32
 
 	factory := func() Service {
@@ -1001,7 +1007,7 @@ func TestSelfHeal_ResetAfter(t *testing.T) {
 }
 
 func TestSelfHeal_CustomBackoff(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	var factoryCalls atomic.Int32
 
 	factory := func() Service {
@@ -1040,12 +1046,10 @@ func TestSelfHeal_CustomBackoff(t *testing.T) {
 // self-healing service crashes repeatedly while Health() and the health-check
 // loop read its state concurrently. Run with -race.
 func TestSelfHeal_ConcurrentHealthProbe(t *testing.T) {
-	o := New(Config{
-		LogLevel:        LogLevelWarn,
-		HealthInterval:  5 * time.Millisecond,
-		HealthTimeout:   100 * time.Millisecond,
-		HealthThreshold: 3,
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithHealthChecks(5*time.Millisecond, 100*time.Millisecond, 3),
+	)
 
 	mk := func() Service {
 		return &healthSvc{
@@ -1090,7 +1094,7 @@ func TestSelfHeal_ConcurrentHealthProbe(t *testing.T) {
 
 func TestServicePanicRecovery(t *testing.T) {
 	t.Run("panic_in_start_recovered", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		_ = o.Register(&panicSvc{msg: "start panic"})
 		_ = o.Start()
 		time.Sleep(100 * time.Millisecond)
@@ -1105,7 +1109,7 @@ func TestServicePanicRecovery(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelError})
+		o := New(WithLogLevel(LogLevelError))
 		_ = o.Register(&panicSvc{msg: "logged panic"})
 		_ = o.Start()
 		time.Sleep(100 * time.Millisecond)
@@ -1123,14 +1127,14 @@ func TestServicePanicRecovery(t *testing.T) {
 	})
 
 	t.Run("safeStop_recovers_stop_panic", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		svc := &stopPanicSvc{}
 		entry := &serviceEntry{name: "test", svc: svc, cfg: registerConfig{name: "test"}}
 		o.safeStop(entry)
 	})
 
 	t.Run("safeStop_calls_stop", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		svc := &testSvc{}
 		entry := &serviceEntry{name: "test", svc: svc, cfg: registerConfig{name: "test"}}
 		o.safeStop(entry)
@@ -1144,7 +1148,7 @@ func TestServicePanicRecovery(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&panicSvc{msg: "cron panic"}, WithCron("* * * * * *", CronParallel))
 		_ = o.Start()
 		time.Sleep(1500 * time.Millisecond)
@@ -1166,7 +1170,7 @@ func TestServicePanicRecovery(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error {
 				select {
@@ -1201,7 +1205,7 @@ func TestLogPump(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelDebug})
+		o := New(WithLogLevel(LogLevelDebug))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -1244,7 +1248,7 @@ func TestLogPump(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelDebug})
+		o := New(WithLogLevel(LogLevelDebug))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -1277,7 +1281,7 @@ func TestLogPump(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelDebug})
+		o := New(WithLogLevel(LogLevelDebug))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -1313,7 +1317,7 @@ func TestLogPump(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelDebug})
+		o := New(WithLogLevel(LogLevelDebug))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -1346,7 +1350,7 @@ func TestLogPump(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 256)
 		o.logQuit = make(chan struct{})
@@ -1393,7 +1397,7 @@ func TestLogPump(t *testing.T) {
 	})
 
 	t.Run("logPump_exits_on_quit_signal", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelDebug})
+		o := New(WithLogLevel(LogLevelDebug))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -1419,7 +1423,7 @@ func TestLogPump_DrainsBufferedOnQuit(t *testing.T) {
 	old := os.Stderr
 	os.Stderr = w
 
-	o := New(Config{LogLevel: LogLevelDebug})
+	o := New(WithLogLevel(LogLevelDebug))
 	o.logCh = make(chan logEntry, 256)
 	o.logQuit = make(chan struct{})
 	o.logPumpDone = make(chan struct{})
@@ -1450,7 +1454,7 @@ func TestLogLevelFiltering_AtEmit(t *testing.T) {
 	old := os.Stderr
 	os.Stderr = w
 
-	o := New(Config{LogLevel: LogLevelInfo})
+	o := New(WithLogLevel(LogLevelInfo))
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error {
 			sc := ctx.(ServiceContext)
@@ -1659,7 +1663,7 @@ func TestRunService_ErrorLogging(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelError})
+		o := New(WithLogLevel(LogLevelError))
 		_ = o.Register(&errSvc{err: errors.New("test failure")})
 		_ = o.Start()
 		time.Sleep(100 * time.Millisecond)
@@ -1684,7 +1688,7 @@ func TestRunService_ErrorLogging(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelError})
+		o := New(WithLogLevel(LogLevelError))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error {
 				<-ctx.Done()
@@ -1712,7 +1716,7 @@ func TestRunService_ErrorLogging(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelError})
+		o := New(WithLogLevel(LogLevelError))
 		_ = o.Register(&errSvc{err: errors.New("cron fail")}, WithCron("* * * * * *", CronParallel))
 		_ = o.Start()
 		time.Sleep(1500 * time.Millisecond)
@@ -1762,7 +1766,7 @@ func TestRunService_Normal(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelError})
+		o := New(WithLogLevel(LogLevelError))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error {
 				return nil
@@ -1793,7 +1797,7 @@ func TestServiceNameInLogger(t *testing.T) {
 		old := os.Stderr
 		os.Stderr = w
 
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&panicSvc{msg: "namecheck"})
 		_ = o.Start()
 		time.Sleep(100 * time.Millisecond)
@@ -1840,7 +1844,7 @@ func TestDependencyOrdering_StartOrder(t *testing.T) {
 		}
 	}
 
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(makeSvc("a"), WithName("a"))
 	_ = o.Register(makeSvc("b"), WithName("b"), DependsOn("a"))
 	_ = o.Register(makeSvc("c"), WithName("c"), DependsOn("a", "b"))
@@ -1890,7 +1894,7 @@ func TestDependencyOrdering_ReverseStopOrder(t *testing.T) {
 		}
 	}
 
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(makeSvc("a"), WithName("a"))
 	_ = o.Register(makeSvc("b"), WithName("b"), DependsOn("a"))
 	_ = o.Register(makeSvc("c"), WithName("c"), DependsOn("a", "b"))
@@ -1917,7 +1921,7 @@ func TestDependencyOrdering_ReverseStopOrder(t *testing.T) {
 }
 
 func TestDependency_SkippedDependents(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 
 	// WithStartTimeout makes the failure synchronous so the dependent
 	// sees StatusCrashed and is skipped before it ever starts.
@@ -1953,7 +1957,7 @@ func TestDependency_SkippedDependents(t *testing.T) {
 // ── Start timeout ──
 
 func TestStartTimeout_Persistent(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error {
 			// Context-aware: when svcCancel fires, exit cleanly (no log).
@@ -1977,10 +1981,10 @@ func TestStartTimeout_Persistent(t *testing.T) {
 }
 
 func TestStartTimeout_DefaultStartTimeout(t *testing.T) {
-	o := New(Config{
-		LogLevel:            LogLevelWarn,
-		DefaultStartTimeout: 50 * time.Millisecond,
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithDefaultStartTimeout(50*time.Millisecond),
+	)
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error {
 			select {
@@ -2029,7 +2033,7 @@ func TestOneShot(t *testing.T) {
 			},
 		}
 
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(oneShot, WithName("init"), WithRunOnce())
 		_ = o.Register(persistent, WithName("main"))
 		_ = o.Start()
@@ -2059,7 +2063,7 @@ func TestOneShot(t *testing.T) {
 		}
 		persistent := &testSvc{}
 
-		o := New(Config{})
+		o := New()
 		_ = o.Register(oneShot, WithName("init"), WithRunOnce())
 		_ = o.Register(persistent, WithName("main"))
 
@@ -2076,7 +2080,7 @@ func TestOneShot(t *testing.T) {
 	})
 
 	t.Run("transitions_to_stopped", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		oneShot := &testSvc{
 			startFn: func(ctx context.Context) error { return nil },
 		}
@@ -2097,7 +2101,7 @@ func TestOneShot(t *testing.T) {
 	})
 
 	t.Run("context_canceled_is_not_an_error", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		oneShot := &testSvc{
 			startFn: func(ctx context.Context) error {
 				return context.Canceled
@@ -2120,16 +2124,16 @@ func TestOneShot(t *testing.T) {
 func TestLifecycleHooks(t *testing.T) {
 	t.Run("global_before_start_hook", func(t *testing.T) {
 		var called []string
-		o := New(Config{
-			LogLevel: LogLevelWarn,
-			OnBeforeStart: func(name string) error {
+		o := New(
+			WithLogLevel(LogLevelWarn),
+			WithGlobalOnBeforeStart(func(name string) error {
 				called = append(called, "before:"+name)
 				return nil
-			},
-			OnAfterStart: func(name string, err error) {
+			}),
+			WithGlobalOnAfterStart(func(name string, err error) {
 				called = append(called, "after:"+name)
-			},
-		})
+			}),
+		)
 		_ = o.Register(&testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}, WithName("a"))
@@ -2144,10 +2148,10 @@ func TestLifecycleHooks(t *testing.T) {
 
 	t.Run("before_start_hook_error_aborts", func(t *testing.T) {
 		hookErr := errors.New("hook denied")
-		o := New(Config{
-			LogLevel:      LogLevelWarn,
-			OnBeforeStart: func(name string) error { return hookErr },
-		})
+		o := New(
+			WithLogLevel(LogLevelWarn),
+			WithGlobalOnBeforeStart(func(name string) error { return hookErr }),
+		)
 		_ = o.Register(&testSvc{}, WithName("a"))
 		err := o.Start()
 		if err == nil {
@@ -2159,12 +2163,12 @@ func TestLifecycleHooks(t *testing.T) {
 	t.Run("per_service_after_start_overrides_global", func(t *testing.T) {
 		var globalCalls, perSvcCalls []string
 
-		o := New(Config{
-			LogLevel: LogLevelWarn,
-			OnAfterStart: func(name string, err error) {
+		o := New(
+			WithLogLevel(LogLevelWarn),
+			WithGlobalOnAfterStart(func(name string, err error) {
 				globalCalls = append(globalCalls, name)
-			},
-		})
+			}),
+		)
 
 		_ = o.Register(&testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -2186,9 +2190,7 @@ func TestLifecycleHooks(t *testing.T) {
 
 	t.Run("all_four_hooks_for_stop", func(t *testing.T) {
 		var events []string
-		o := New(Config{
-			LogLevel: LogLevelWarn,
-		})
+		o := New(WithLogLevel(LogLevelWarn))
 
 		_ = o.Register(&testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -2222,12 +2224,12 @@ func TestLifecycleHooks(t *testing.T) {
 	})
 
 	t.Run("before_stop_hook_error_not_fatal", func(t *testing.T) {
-		o := New(Config{
-			LogLevel: LogLevelWarn,
-			OnBeforeStop: func(name string) error {
+		o := New(
+			WithLogLevel(LogLevelWarn),
+			WithGlobalOnBeforeStop(func(name string) error {
 				return errors.New("before-stop issue")
-			},
-		})
+			}),
+		)
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}
@@ -2248,7 +2250,7 @@ func TestLifecycleHooks(t *testing.T) {
 // ── Status / Statuses / Names / Count ──
 
 func TestStatus_Found(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("alpha"))
 	_ = o.Register(&namedSvc{}, WithName("beta"))
 
@@ -2262,7 +2264,7 @@ func TestStatus_Found(t *testing.T) {
 }
 
 func TestStatus_NotFound(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_, ok := o.Status("nope")
 	if ok {
 		t.Error("expected nope to not be found")
@@ -2270,7 +2272,7 @@ func TestStatus_NotFound(t *testing.T) {
 }
 
 func TestStatuses(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("a"))
 	_ = o.Register(&namedSvc{}, WithName("b"))
 
@@ -2284,7 +2286,7 @@ func TestStatuses(t *testing.T) {
 }
 
 func TestNames(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("first"))
 	_ = o.Register(&namedSvc{}, WithName("second"))
 
@@ -2298,7 +2300,7 @@ func TestNames(t *testing.T) {
 }
 
 func TestCount(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	if c := o.Count(); c != 0 {
 		t.Errorf("expected 0, got %d", c)
 	}
@@ -2313,7 +2315,7 @@ func TestCount(t *testing.T) {
 }
 
 func TestStatusTransitions(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 	}
@@ -2339,7 +2341,7 @@ func TestStatusTransitions(t *testing.T) {
 // ── Run ──
 
 func TestRun_StartError(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{name: "bad"}, WithCron("invalid", CronParallel))
 	err := o.Run(time.Second)
 	if !errors.Is(err, ErrInvalidCron) {
@@ -2349,7 +2351,7 @@ func TestRun_StartError(t *testing.T) {
 
 func TestRun_DefaultSignal(t *testing.T) {
 	// Cover the default signal path (len(sigSet) == 0 → SIGINT + SIGTERM).
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	done := make(chan error, 1)
 	go func() {
 		done <- o.Run(time.Second) // no signals → defaults to SIGINT + SIGTERM
@@ -2370,7 +2372,7 @@ func TestRun_DefaultSignal(t *testing.T) {
 }
 
 func TestRun_DefaultSignal_SIGTERM(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	done := make(chan error, 1)
 	go func() {
 		done <- o.Run(time.Second) // defaults to SIGINT + SIGTERM
@@ -2391,7 +2393,7 @@ func TestRun_DefaultSignal_SIGTERM(t *testing.T) {
 
 func TestRun_CustomSignal(t *testing.T) {
 	// Cover the custom signal path.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 
 	done := make(chan error, 1)
 	go func() {
@@ -2414,7 +2416,7 @@ func TestRun_CustomSignal(t *testing.T) {
 // ── topoSort ──
 
 func TestTopoSort_Cycle(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	entries := []*serviceEntry{
 		{name: "a", cfg: registerConfig{name: "a", dependsOn: []string{"b"}}},
 		{name: "b", cfg: registerConfig{name: "b", dependsOn: []string{"c"}}},
@@ -2427,7 +2429,7 @@ func TestTopoSort_Cycle(t *testing.T) {
 }
 
 func TestTopoSort_Empty(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	levels, err := o.topoSort(nil)
 	if err != nil || levels != nil {
 		t.Errorf("expected nil, nil; got %v, %v", levels, err)
@@ -2435,7 +2437,7 @@ func TestTopoSort_Empty(t *testing.T) {
 }
 
 func TestTopoSort_Single(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	entries := []*serviceEntry{
 		{name: "lonely", cfg: registerConfig{name: "lonely"}},
 	}
@@ -2451,7 +2453,7 @@ func TestTopoSort_Single(t *testing.T) {
 // ── dependsOnRecursive ──
 
 func TestDependsOnRecursive(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("a"))
 	_ = o.Register(&namedSvc{}, WithName("b"), DependsOn("a"))
 	_ = o.Register(&namedSvc{}, WithName("c"), DependsOn("b"))
@@ -2480,7 +2482,7 @@ func TestDependsOnRecursive(t *testing.T) {
 
 func TestStopStartedServices_UsedDuringStartupFailure(t *testing.T) {
 	// One-shot error triggers stopStartedServices.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	oneShot := &testSvc{
 		startFn: func(ctx context.Context) error {
 			return errors.New("init fail")
@@ -2506,7 +2508,7 @@ func TestStopStartedServices_UsedDuringStartupFailure(t *testing.T) {
 // ── Health ──
 
 func TestHealth_NonHealthChecker_ReportsNil(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("plain"))
 	results := o.Health()
 	if results["plain"] != nil {
@@ -2515,7 +2517,7 @@ func TestHealth_NonHealthChecker_ReportsNil(t *testing.T) {
 }
 
 func TestHealth_HealthChecker_ReportsError(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	healthErr := errors.New("unhealthy")
 	svc := &healthSvc{healthFn: func(ctx context.Context) error { return healthErr }}
 	_ = o.Register(svc, WithName("sick"))
@@ -2526,7 +2528,7 @@ func TestHealth_HealthChecker_ReportsError(t *testing.T) {
 }
 
 func TestHealth_HealthyService_ReportsNil(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	svc := &healthSvc{healthFn: func(ctx context.Context) error { return nil }}
 	_ = o.Register(svc, WithName("fine"))
 	results := o.Health()
@@ -2536,7 +2538,7 @@ func TestHealth_HealthyService_ReportsNil(t *testing.T) {
 }
 
 func TestHealth_NoEntries(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	results := o.Health()
 	if len(results) != 0 {
 		t.Errorf("expected empty map, got %v", results)
@@ -2547,7 +2549,7 @@ func TestHealth_NoEntries(t *testing.T) {
 
 func TestRunHealthChecks_FailuresTracked(t *testing.T) {
 	// ponytail: set up entry manually to avoid the health-check loop.
-	o := New(Config{HealthThreshold: 3})
+	o := New(WithHealthChecks(0, 0, 3))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "sick",
@@ -2568,7 +2570,7 @@ func TestRunHealthChecks_FailuresTracked(t *testing.T) {
 }
 
 func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
-	o := New(Config{HealthThreshold: 3})
+	o := New(WithHealthChecks(0, 0, 3))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "healthy",
@@ -2590,7 +2592,7 @@ func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
 func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
 	// A slow checker that consumes its whole deadline must not fail a later
 	// instant checker: each probe gets a fresh per-service timeout.
-	o := New(Config{HealthTimeout: 50 * time.Millisecond})
+	o := New(WithHealthChecks(0, 50*time.Millisecond, 0))
 	logCh := make(chan logEntry, 1)
 	slow := &serviceEntry{
 		name: "slow",
@@ -2631,7 +2633,7 @@ func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
 }
 
 func TestHealth_PerProbeTimeout(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn, HealthTimeout: 50 * time.Millisecond})
+	o := New(WithLogLevel(LogLevelWarn), WithHealthChecks(0, 50*time.Millisecond, 0))
 	slow := &healthSvc{healthFn: func(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
@@ -2660,7 +2662,7 @@ func TestHealth_PerProbeTimeout(t *testing.T) {
 }
 
 func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
-	o := New(Config{HealthThreshold: 3})
+	o := New(WithHealthChecks(0, 0, 3))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "registered",
@@ -2679,12 +2681,10 @@ func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
 }
 
 func TestRunHealthChecks_ThresholdTriggersRestart(t *testing.T) {
-	o := New(Config{
-		LogLevel:        LogLevelWarn,
-		HealthInterval:  50 * time.Millisecond,
-		HealthTimeout:   500 * time.Millisecond,
-		HealthThreshold: 2,
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 2),
+	)
 	var factoryCalls atomic.Int32
 
 	factory := func() Service {
@@ -2720,7 +2720,7 @@ func TestRunHealthChecks_ThresholdTriggersRestart(t *testing.T) {
 }
 
 func TestRunHealthChecks_ThresholdWithoutSelfHeal(t *testing.T) {
-	o := New(Config{HealthThreshold: 2})
+	o := New(WithHealthChecks(0, 0, 2))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "sick",
@@ -2746,12 +2746,12 @@ func TestRunHealthChecks_ThresholdWithoutSelfHeal(t *testing.T) {
 
 func TestCallAfterStartHook_Global(t *testing.T) {
 	var called []string
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnAfterStart: func(name string, err error) {
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithGlobalOnAfterStart(func(name string, err error) {
 			called = append(called, name)
-		},
-	})
+		}),
+	)
 
 	entry := &serviceEntry{name: "test", cfg: registerConfig{name: "test"}}
 	o.callAfterStartHook(entry, nil)
@@ -2762,7 +2762,7 @@ func TestCallAfterStartHook_Global(t *testing.T) {
 }
 
 func TestCallAfterStartHook_None(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	entry := &serviceEntry{name: "test", cfg: registerConfig{name: "test"}}
 	// No global, no per-service hook. Must not panic.
 	o.callAfterStartHook(entry, nil)
@@ -2771,7 +2771,7 @@ func TestCallAfterStartHook_None(t *testing.T) {
 // ── handleServiceDone with self-heal: cancelled during backoff ──
 
 func TestHandleServiceDone_CancelledDuringBackoff(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	ctx, cancel := context.WithCancel(context.Background())
 	o.ctx = ctx
 
@@ -2817,7 +2817,7 @@ func TestHandleServiceDone_CancelledDuringBackoff(t *testing.T) {
 // ── Persistence: cron + runOnce both stopped during shutdown ──
 
 func TestStop_StopsCronAndRunOnce(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	cronSvc := &testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 	}
@@ -2844,7 +2844,7 @@ func TestStop_StopsCronAndRunOnce(t *testing.T) {
 // and to stopped at Stop (they are no longer stuck in StatusRegistered).
 func TestCronStatusLifecycle(t *testing.T) {
 	var stopHooks atomic.Int32
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	cronSvc := &testSvc{
 		startFn: func(ctx context.Context) error { return nil },
 	}
@@ -2878,10 +2878,9 @@ func TestCronStatusLifecycle(t *testing.T) {
 // ── Persistence: health loop disabled when HealthInterval=0 ──
 
 func TestHealthLoop_DefaultInterval(t *testing.T) {
-	// ponytail: HealthInterval=0 defaults to 30s in New(). The health loop
-	// is always started by default. There is no off switch for health checks
-	// in the current API — set a very large interval to effectively disable.
-	o := New(Config{})
+	// Health checks are enabled by default (30s interval). Use
+	// WithHealthChecksDisabled to turn them off.
+	o := New()
 	_ = o.Register(&healthSvc{
 		testSvc: testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -2895,6 +2894,21 @@ func TestHealthLoop_DefaultInterval(t *testing.T) {
 	}
 }
 
+func TestHealthLoop_Disabled(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	_ = o.Register(&healthSvc{
+		testSvc: testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		},
+	}, WithName("hc"))
+	_ = o.Start()
+	defer o.Stop(time.Second)
+
+	if o.healthCancel != nil {
+		t.Error("health loop should not be started when disabled")
+	}
+}
+
 // ── Register: dependency found in entries but not nameIndex ──
 
 func TestRegister_DepFoundInEntries(t *testing.T) {
@@ -2902,7 +2916,7 @@ func TestRegister_DepFoundInEntries(t *testing.T) {
 	// Since Register is called sequentially, nameIndex always has previous entries.
 	// We verify the path exists by testing indirectly: register two services
 	// where the second depends on the first.
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("base"))
 	err := o.Register(&namedSvc{}, WithName("child"), DependsOn("base"))
 	if err != nil {
@@ -2913,7 +2927,7 @@ func TestRegister_DepFoundInEntries(t *testing.T) {
 // ── ErrDuplicateName and ErrDependencyCycle message format ──
 
 func TestErrDuplicateName_MessageHasName(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}, WithName("a"))
 	err := o.Register(&namedSvc{}, WithName("a"))
 	if err == nil || !errors.Is(err, ErrDuplicateName) {
@@ -2925,7 +2939,7 @@ func TestErrDuplicateName_MessageHasName(t *testing.T) {
 }
 
 func TestErrDependencyCycle_MessageHasNames(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	err := o.Register(&namedSvc{}, WithName("self"), DependsOn("self"))
 	if err == nil || !errors.Is(err, ErrDependencyCycle) {
 		t.Fatalf("expected ErrDependencyCycle, got %v", err)
@@ -2938,7 +2952,7 @@ func TestErrDependencyCycle_MessageHasNames(t *testing.T) {
 // ── Auto-name generation in Register ──
 
 func TestRegister_AutoName(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	_ = o.Register(&namedSvc{}) // no WithName
 	if o.entries[0].name != "$1" {
 		t.Errorf("expected auto-name '$1', got %q", o.entries[0].name)
@@ -2975,7 +2989,7 @@ func TestRegister_TransitiveCycle(t *testing.T) {
 	// White-box: manually add an entry to o.entries (not nameIndex) that
 	// depends on the service we're about to register. Then register that
 	// service with a dep on the entry → cycle detected.
-	o := New(Config{})
+	o := New()
 	existing := &serviceEntry{
 		name: "intermediate",
 		cfg:  registerConfig{name: "intermediate", dependsOn: []string{"target"}},
@@ -2992,7 +3006,7 @@ func TestRegister_TransitiveCycle(t *testing.T) {
 func TestRegister_DepInEntriesNotNameIndex(t *testing.T) {
 	// White-box: cover the path where a dependency is found in o.entries
 	// but not in o.nameIndex (batch-register scenario).
-	o := New(Config{})
+	o := New()
 	entry := &serviceEntry{name: "base", cfg: registerConfig{name: "base"}, status: StatusRegistered}
 	o.entries = append(o.entries, entry)
 	// nameIndex does NOT have "base".
@@ -3008,7 +3022,7 @@ func TestRegister_DepInEntriesNotNameIndex(t *testing.T) {
 }
 
 func TestDependsOnRecursive_EntriesPath(t *testing.T) {
-	o := New(Config{})
+	o := New()
 	// Add entries to entries but NOT to nameIndex (batch-register scenario).
 	base := &serviceEntry{name: "a", cfg: registerConfig{name: "a"}}
 	mid := &serviceEntry{name: "b", cfg: registerConfig{name: "b", dependsOn: []string{"a"}}}
@@ -3025,7 +3039,7 @@ func TestTopoSort_ErrorInStart(t *testing.T) {
 	// Verify that a topoSort cycle during Start is handled.
 	// ponytail: create entries with a cycle manually and register them
 	// as persistent services. The cycle will be caught by topoSort.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	// Create two entries with a circular dependency.
 	// We bypass Register to avoid cycle detection.
 	e1 := &serviceEntry{name: "a", cfg: registerConfig{name: "a", dependsOn: []string{"b"}}, status: StatusRegistered}
@@ -3044,7 +3058,7 @@ func TestTopoSort_ErrorInStart(t *testing.T) {
 func TestRunOnce_WithTimeout(t *testing.T) {
 	// Cover runOnce with timeout goroutine paths.
 	t.Run("success_within_timeout", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error { return nil },
 		}
@@ -3060,7 +3074,7 @@ func TestRunOnce_WithTimeout(t *testing.T) {
 	})
 
 	t.Run("timeout_exceeded", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error {
 				select {
@@ -3086,7 +3100,7 @@ func TestRunOnce_WithTimeout(t *testing.T) {
 func TestStopStartedServices_LogQuitSignal(t *testing.T) {
 	// stopStartedServices signals the log-pump via logQuit instead of closing
 	// logCh, so a late log send can never panic on a closed channel.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(&namedSvc{}, WithCron("invalid", CronParallel))
 	// Start fails → logQuit closed → logPumpDone closed → logCh left open.
 	_ = o.Start() // will fail with ErrInvalidCron
@@ -3105,7 +3119,7 @@ func TestRunService_ErrorViaSelfHeal(t *testing.T) {
 	old := os.Stderr
 	os.Stderr = w
 
-	o := New(Config{LogLevel: LogLevelError})
+	o := New(WithLogLevel(LogLevelError))
 	var factoryCalls atomic.Int32
 	factory := func() Service {
 		factoryCalls.Add(1)
@@ -3135,7 +3149,7 @@ func TestRunService_ErrorViaSelfHeal(t *testing.T) {
 
 func TestStop_CronAndRunOnceStopErrors(t *testing.T) {
 	// Cover the error aggregation path in Stop for cron/runOnce entries.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	stopErr := errors.New("stop oops")
 	cronSvc := &testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -3154,7 +3168,7 @@ func TestStop_CronAndRunOnceStopErrors(t *testing.T) {
 }
 
 func TestRunHealthChecks_NonHealthCheckerSkipped(t *testing.T) {
-	o := New(Config{HealthThreshold: 3})
+	o := New(WithHealthChecks(0, 0, 3))
 	logCh := make(chan logEntry, 1)
 	// Add a non-HealthChecker entry alongside a HealthChecker entry.
 	e1 := &serviceEntry{
@@ -3178,7 +3192,7 @@ func TestRunHealthChecks_NonHealthCheckerSkipped(t *testing.T) {
 
 func TestHandleServiceDone_FactoryContextCancelled(t *testing.T) {
 	// Cover the factory != nil + ctx cancelled path (gorch.go:996).
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	ctx, cancel := context.WithCancel(context.Background())
 	o.ctx = ctx
 	cancel() // cancelled immediately
@@ -3216,10 +3230,10 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 	// Ensure the maxRetries block sets StatusCrashed and forwards the real error.
 	var crashName string
 	var crashErr error
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnCrash:  func(name string, err error) { crashName = name; crashErr = err },
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnCrash(func(name string, err error) { crashName = name; crashErr = err }),
+	)
 	ctx := context.Background()
 	o.ctx = ctx
 
@@ -3267,7 +3281,7 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 // ── Dependency status check in Start (parallel level) ──
 
 func TestStart_DepStatusCheck(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	// A uses WithStartTimeout so startOneService waits for the goroutine's defer
 	// to send to startErrCh. With a fast Start return, there's a narrow window
 	// where the dependent's status check may or may not see StatusStopped.
@@ -3295,7 +3309,7 @@ func TestRunOnce_PanicRecovery(t *testing.T) {
 	old := os.Stderr
 	os.Stderr = w
 
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(&panicSvc{msg: "runonce panic"}, WithRunOnce(), WithStartTimeout(time.Second))
 	_ = o.Register(&testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -3320,7 +3334,7 @@ func TestRunOnce_PanicRecovery(t *testing.T) {
 // ── runOnce: ctx.Done during timeout select ──
 
 func TestRunOnce_CtxDone(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	o.ctx, o.cancel = context.WithCancel(context.Background())
 	o.logCh = make(chan logEntry, 1)
 	o.logQuit = make(chan struct{})
@@ -3359,7 +3373,7 @@ func TestRunOnce_CtxDone(t *testing.T) {
 // ── Persistent: startErrCh received (Start returns before timeout) ──
 
 func TestStartOneService_PersistentStartErrCh(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error { return nil },
 	}
@@ -3378,7 +3392,7 @@ func TestRunService_PanicRecovery(t *testing.T) {
 	old := os.Stderr
 	os.Stderr = w
 
-	o := New(Config{LogLevel: LogLevelError})
+	o := New(WithLogLevel(LogLevelError))
 	var factoryCalls atomic.Int32
 	factory := func() Service {
 		factoryCalls.Add(1)
@@ -3410,7 +3424,7 @@ func TestRunService_PanicRecovery(t *testing.T) {
 // ── handleServiceDone: wgDone already true (else branches) ──
 
 func TestHandleServiceDone_WgDoneTrue_CtxCancelled(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	ctx, cancel := context.WithCancel(context.Background())
 	o.ctx = ctx
 	cancel()
@@ -3438,7 +3452,7 @@ func TestHandleServiceDone_WgDoneTrue_CtxCancelled(t *testing.T) {
 }
 
 func TestHandleServiceDone_WgDoneTrue_MaxRetries(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	ctx := context.Background()
 	o.ctx = ctx
 
@@ -3466,7 +3480,7 @@ func TestHandleServiceDone_WgDoneTrue_MaxRetries(t *testing.T) {
 }
 
 func TestHandleServiceDone_WgDoneTrue_BackoffCancelled(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	ctx, cancel := context.WithCancel(context.Background())
 	o.ctx = ctx
 
@@ -3504,7 +3518,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelled(t *testing.T) {
 func TestStart_DepStatusCheck_Whitebox(t *testing.T) {
 	// Directly test the dependency-failure check in Start's goroutine,
 	// bypassing the race with goroutine scheduling.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	o.nameIndex = make(map[string]*serviceEntry)
 
 	depEntry := &serviceEntry{
@@ -3559,7 +3573,7 @@ func TestStart_DepStatusCheck_Whitebox(t *testing.T) {
 
 func TestRegisterFunc_v3(t *testing.T) {
 	t.Run("start_stop_lifecycle", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		var started atomic.Int32
 		var stopped atomic.Int32
 
@@ -3587,7 +3601,7 @@ func TestRegisterFunc_v3(t *testing.T) {
 	})
 
 	t.Run("with_options", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		err := o.RegisterFunc("opt-fn",
 			func(ctx ServiceContext) error { <-ctx.Done(); return ctx.Err() },
 			func() error { return nil },
@@ -3609,7 +3623,7 @@ func TestRegisterFunc_v3(t *testing.T) {
 
 func TestGroup(t *testing.T) {
 	t.Run("group_isolation", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}, WithName("a"), WithGroup("alpha"))
@@ -3632,7 +3646,7 @@ func TestGroup(t *testing.T) {
 	})
 
 	t.Run("start_group_and_stop_group", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}, WithName("s1"), WithGroup("workers"))
@@ -3671,7 +3685,7 @@ func TestGroup(t *testing.T) {
 	})
 
 	t.Run("statuses_by_group_empty", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		m := o.StatusesByGroup("nonexistent")
 		if len(m) != 0 {
 			t.Errorf("expected empty map, got %v", m)
@@ -3682,7 +3696,7 @@ func TestGroup(t *testing.T) {
 // ── WithLabel / StatusesByLabel ──
 
 func TestLabel(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(&testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 	}, WithName("web"), WithLabel("tier", "frontend"), WithLabel("env", "prod"))
@@ -3719,7 +3733,7 @@ func TestLabel(t *testing.T) {
 
 func TestSoftDep(t *testing.T) {
 	t.Run("soft_dep_present_runs", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		base := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}
@@ -3744,7 +3758,7 @@ func TestSoftDep(t *testing.T) {
 	})
 
 	t.Run("soft_dep_missing_ignored", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}
@@ -3765,7 +3779,7 @@ func TestSoftDep(t *testing.T) {
 	t.Run("soft_dep_runonce_stopped_aborts", func(t *testing.T) {
 		// A runOnce service transitions to StatusStopped on success.
 		// A persistent service that soft-depends on it should see it as failed/skipped.
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		gate := &testSvc{
 			startFn: func(ctx context.Context) error { return nil },
 		}
@@ -3787,15 +3801,15 @@ func TestSoftDep(t *testing.T) {
 func TestSoftDep_Ordering(t *testing.T) {
 	var order []string
 	var mu sync.Mutex
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnBeforeStart: func(name string) error {
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithGlobalOnBeforeStart(func(name string) error {
 			mu.Lock()
 			order = append(order, name)
 			mu.Unlock()
 			return nil
-		},
-	})
+		}),
+	)
 	base := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
 	dep := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
 	_ = o.Register(base, WithName("base"))
@@ -3814,7 +3828,7 @@ func TestSoftDep_Ordering(t *testing.T) {
 // TestSoftDep_Cycle verifies that a soft-dependency cycle among registered
 // services is detected at Register time.
 func TestSoftDep_Cycle(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(&testSvc{}, WithName("a"), DependsOnSoft("b"))
 	err := o.Register(&testSvc{}, WithName("b"), DependsOnSoft("a"))
 	if !errors.Is(err, ErrDependencyCycle) {
@@ -3825,7 +3839,7 @@ func TestSoftDep_Cycle(t *testing.T) {
 // TestSoftDep_Cycle_Transitive verifies a 3-node soft-dependency cycle is
 // detected via the recursive soft-edge traversal.
 func TestSoftDep_Cycle_Transitive(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(&testSvc{}, WithName("a"), DependsOnSoft("b"))
 	_ = o.Register(&testSvc{}, WithName("b"), DependsOnSoft("c"))
 	err := o.Register(&testSvc{}, WithName("c"), DependsOnSoft("a"))
@@ -3836,7 +3850,7 @@ func TestSoftDep_Cycle_Transitive(t *testing.T) {
 
 // TestSoftDep_SelfDependency verifies a soft self-dependency is rejected.
 func TestSoftDep_SelfDependency(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	err := o.Register(&testSvc{}, WithName("self"), DependsOnSoft("self"))
 	if !errors.Is(err, ErrDependencyCycle) {
 		t.Fatalf("expected ErrDependencyCycle for soft self-dependency, got %v", err)
@@ -3847,7 +3861,7 @@ func TestSoftDep_SelfDependency(t *testing.T) {
 
 func TestStartCondition(t *testing.T) {
 	t.Run("condition_true_starts", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}
@@ -3862,7 +3876,7 @@ func TestStartCondition(t *testing.T) {
 	})
 
 	t.Run("condition_false_skipped", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{}
 		_ = o.Register(svc, WithName("no"), WithStartCondition(func() bool { return false }))
 		_ = o.Start()
@@ -3877,7 +3891,7 @@ func TestStartCondition(t *testing.T) {
 	})
 
 	t.Run("condition_false_still_reports_in_statuses", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&testSvc{}, WithName("skipped"), WithStartCondition(func() bool { return false }))
 		_ = o.Start()
 		defer o.Stop(time.Second)
@@ -3893,7 +3907,7 @@ func TestStartCondition(t *testing.T) {
 
 func TestStopTimeout(t *testing.T) {
 	t.Run("per_service_stop_timeout", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 			stopFn: func() error {
@@ -3911,7 +3925,7 @@ func TestStopTimeout(t *testing.T) {
 	})
 
 	t.Run("stop_timeout_does_not_block_other_services", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		slowSvc := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 			stopFn: func() error {
@@ -3948,7 +3962,7 @@ func TestStopTimeout(t *testing.T) {
 
 func TestReadiness(t *testing.T) {
 	t.Run("is_ready_when_ready_returns_nil", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &readySvc{
 			testSvc: testSvc{
 				startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -3966,7 +3980,7 @@ func TestReadiness(t *testing.T) {
 	})
 
 	t.Run("is_not_ready_when_ready_returns_error", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &readySvc{
 			testSvc: testSvc{
 				startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -3984,7 +3998,7 @@ func TestReadiness(t *testing.T) {
 	})
 
 	t.Run("is_not_ready_when_not_running", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		_ = o.Register(&readySvc{}, WithName("stopped"))
 		if o.IsReady("stopped") {
 			t.Error("expected IsReady false when not running")
@@ -3992,7 +4006,7 @@ func TestReadiness(t *testing.T) {
 	})
 
 	t.Run("is_ready_no_checker_defaults_true", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}
@@ -4007,7 +4021,7 @@ func TestReadiness(t *testing.T) {
 	})
 
 	t.Run("is_ready_not_found", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		if o.IsReady("ghost") {
 			t.Error("expected IsReady false for unknown service")
 		}
@@ -4020,16 +4034,16 @@ func TestOnStateChange(t *testing.T) {
 	var events []struct{ name, from, to string }
 	var mu sync.Mutex
 
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnStateChange: func(name string, from, to ServiceStatus) {
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnStateChange(func(name string, from, to ServiceStatus) {
 			mu.Lock()
 			events = append(events, struct{ name, from, to string }{
 				name, from.String(), to.String(),
 			})
 			mu.Unlock()
-		},
-	})
+		}),
+	)
 
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -4080,15 +4094,15 @@ func TestOnCrash(t *testing.T) {
 		var crashErr error
 		var mu sync.Mutex
 
-		o := New(Config{
-			LogLevel: LogLevelWarn,
-			OnCrash: func(name string, err error) {
+		o := New(
+			WithLogLevel(LogLevelWarn),
+			WithOnCrash(func(name string, err error) {
 				mu.Lock()
 				crashName = name
 				crashErr = err
 				mu.Unlock()
-			},
-		})
+			}),
+		)
 
 		// StatusCrashed is set when a runOnce service returns a non-Canceled error.
 		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("crasher"), WithRunOnce())
@@ -4109,7 +4123,7 @@ func TestOnCrash(t *testing.T) {
 	})
 
 	t.Run("no_hook_no_panic", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("nocb"))
 		_ = o.Start()
 		time.Sleep(100 * time.Millisecond)
@@ -4122,7 +4136,7 @@ func TestOnCrash(t *testing.T) {
 
 func TestWaitFor(t *testing.T) {
 	t.Run("successful_wait", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		svc := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 		}
@@ -4137,7 +4151,7 @@ func TestWaitFor(t *testing.T) {
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		// A registered-but-never-started service stays StatusRegistered.
 		// WaitFor(StatusRunning) will never succeed.
 		_ = o.Register(&testSvc{}, WithName("neverstarted"))
@@ -4152,7 +4166,7 @@ func TestWaitFor(t *testing.T) {
 	})
 
 	t.Run("service_not_found", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		err := o.WaitFor("ghost", StatusRunning, 100*time.Millisecond)
 		if err == nil {
 			t.Error("expected error for unknown service")
@@ -4166,7 +4180,7 @@ func TestWaitFor(t *testing.T) {
 // ── Metrics ──
 
 func TestMetrics(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	svc := &testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 	}
@@ -4189,7 +4203,7 @@ func TestMetrics(t *testing.T) {
 
 func TestMetrics_Crashes(t *testing.T) {
 	// StatusCrashed is only set for runOnce services that return an error.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(&errSvc{err: errors.New("crash")}, WithName("crasher"), WithRunOnce())
 	o.Start() // will fail; logCh already closed by stopStartedServices
 
@@ -4200,7 +4214,7 @@ func TestMetrics_Crashes(t *testing.T) {
 }
 
 func TestMetrics_Restarts(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	var factoryCalls atomic.Int32
 	factory := func() Service {
 		factoryCalls.Add(1)
@@ -4224,12 +4238,10 @@ func TestMetrics_Restarts(t *testing.T) {
 }
 
 func TestMetrics_HealthFails(t *testing.T) {
-	o := New(Config{
-		LogLevel:        LogLevelWarn,
-		HealthInterval:  50 * time.Millisecond,
-		HealthTimeout:   500 * time.Millisecond,
-		HealthThreshold: 10, // high threshold to avoid triggering restart
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 10), // high threshold to avoid restart
+	)
 	svc := &healthSvc{
 		testSvc: testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -4252,7 +4264,7 @@ func TestMetrics_HealthFails(t *testing.T) {
 // ── Done ──
 
 func TestDone(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	_ = o.Register(&testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
 	}, WithName("d"))
@@ -4278,7 +4290,7 @@ func TestDone(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	t.Run("validation_passes", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		err := o.Register(&validSvc{}, WithName("pass"))
 		if err != nil {
 			t.Errorf("valid service should register: %v", err)
@@ -4286,7 +4298,7 @@ func TestValidate(t *testing.T) {
 	})
 
 	t.Run("validation_fails", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		wantErr := errors.New("invalid config")
 		err := o.Register(&validSvc{validateErr: wantErr}, WithName("fail"))
 		if err == nil {
@@ -4298,7 +4310,7 @@ func TestValidate(t *testing.T) {
 	})
 
 	t.Run("validation_no_validator_interface", func(t *testing.T) {
-		o := New(Config{})
+		o := New()
 		err := o.Register(&namedSvc{}, WithName("plain"))
 		if err != nil {
 			t.Errorf("service without Validator should register: %v", err)
@@ -4309,14 +4321,13 @@ func TestValidate(t *testing.T) {
 // ── BeforeHealthCheck / AfterHealthCheck ──
 
 func TestHealthCheckHooks(t *testing.T) {
-	o := New(Config{
-		HealthInterval: 50 * time.Millisecond,
-		HealthTimeout:  500 * time.Millisecond,
-		BeforeHealthCheck: func(name string) error {
+	o := New(
+		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 3),
+		WithBeforeHealthCheck(func(name string) error {
 			return nil
-		},
-		AfterHealthCheck: func(name string, err error) {},
-	})
+		}),
+		WithAfterHealthCheck(func(name string, err error) {}),
+	)
 	svc := &healthSvc{
 		testSvc: testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -4341,13 +4352,12 @@ func TestBeforeHealthCheckHookError(t *testing.T) {
 	old := os.Stderr
 	os.Stderr = w
 
-	o := New(Config{
-		HealthInterval: 50 * time.Millisecond,
-		HealthTimeout:  500 * time.Millisecond,
-		BeforeHealthCheck: func(name string) error {
+	o := New(
+		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 3),
+		WithBeforeHealthCheck(func(name string) error {
 			return errors.New("before-health error")
-		},
-	})
+		}),
+	)
 	svc := &healthSvc{
 		testSvc: testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -4373,13 +4383,12 @@ func TestBeforeHealthCheckHookError(t *testing.T) {
 
 func TestAfterHealthCheckHook(t *testing.T) {
 	var lastErr error
-	o := New(Config{
-		HealthInterval: 50 * time.Millisecond,
-		HealthTimeout:  500 * time.Millisecond,
-		AfterHealthCheck: func(name string, err error) {
+	o := New(
+		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 3),
+		WithAfterHealthCheck(func(name string, err error) {
 			lastErr = err
-		},
-	})
+		}),
+	)
 	svc := &healthSvc{
 		testSvc: testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -4410,9 +4419,9 @@ func TestStateChangeHooksWithGroups(t *testing.T) {
 	}
 	var mu sync.Mutex
 
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnStateChange: func(name string, from, to ServiceStatus) {
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnStateChange(func(name string, from, to ServiceStatus) {
 			mu.Lock()
 			events = append(events, struct {
 				name string
@@ -4420,8 +4429,8 @@ func TestStateChangeHooksWithGroups(t *testing.T) {
 				to   string
 			}{name, from.String(), to.String()})
 			mu.Unlock()
-		},
-	})
+		}),
+	)
 
 	_ = o.Register(&testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -4485,14 +4494,14 @@ func TestOnStateChange_NoDuplicateTransitions(t *testing.T) {
 	var events int
 	var mu sync.Mutex
 
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnStateChange: func(name string, from, to ServiceStatus) {
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnStateChange(func(name string, from, to ServiceStatus) {
 			mu.Lock()
 			events++
 			mu.Unlock()
-		},
-	})
+		}),
+	)
 
 	_ = o.Register(&testSvc{
 		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -4520,14 +4529,14 @@ func TestOnCrash_WithSelfHeal(t *testing.T) {
 	var crashes []string
 	var mu sync.Mutex
 
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnCrash: func(name string, err error) {
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnCrash(func(name string, err error) {
 			mu.Lock()
 			crashes = append(crashes, name)
 			mu.Unlock()
-		},
-	})
+		}),
+	)
 
 	var factoryCalls atomic.Int32
 	factory := func() Service {
@@ -4576,10 +4585,10 @@ func waitForStatus(t *testing.T, o *Orchestrator, name string, target ServiceSta
 func TestCrashSemantics_PersistentError(t *testing.T) {
 	var crashName string
 	var crashErr error
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnCrash:  func(name string, err error) { crashName = name; crashErr = err },
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnCrash(func(name string, err error) { crashName = name; crashErr = err }),
+	)
 	_ = o.Register(&errSvc{err: errors.New("persistent boom")}, WithName("p"))
 	_ = o.Start()
 	defer o.Stop(time.Second)
@@ -4599,10 +4608,10 @@ func TestCrashSemantics_PersistentError(t *testing.T) {
 
 func TestCrashSemantics_Panic(t *testing.T) {
 	var crashErr error
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnCrash:  func(name string, err error) { crashErr = err },
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnCrash(func(name string, err error) { crashErr = err }),
+	)
 	_ = o.Register(&panicSvc{msg: "kaboom"}, WithName("p"))
 	_ = o.Start()
 	defer o.Stop(time.Second)
@@ -4619,10 +4628,10 @@ func TestCrashSemantics_Panic(t *testing.T) {
 
 func TestCrashSemantics_CleanExit(t *testing.T) {
 	var crashCalls atomic.Int32
-	o := New(Config{
-		LogLevel: LogLevelWarn,
-		OnCrash:  func(name string, err error) { crashCalls.Add(1) },
-	})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnCrash(func(name string, err error) { crashCalls.Add(1) }),
+	)
 	_ = o.Register(&testSvc{startFn: func(ctx context.Context) error { return nil }}, WithName("clean"))
 	_ = o.Start()
 	defer o.Stop(time.Second)
@@ -4639,7 +4648,10 @@ func TestCrashSemantics_CleanExit(t *testing.T) {
 
 func TestSetStatusErr_NilError_FabricatesMessage(t *testing.T) {
 	var got error
-	o := New(Config{LogLevel: LogLevelWarn, OnCrash: func(name string, err error) { got = err }})
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithOnCrash(func(name string, err error) { got = err }),
+	)
 	entry := &serviceEntry{name: "x", status: StatusRunning}
 	o.setStatusErr(entry, StatusCrashed, nil)
 	if got == nil {
@@ -4657,7 +4669,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 	// 3. In that block, wgDone is already true → else branch
 	// Approach: manually set wgDone=true, have factory and non-cancelled context,
 	// then cancel ctx during backoff.
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	ctx, cancel := context.WithCancel(context.Background())
 	o.ctx = ctx
 
@@ -4706,7 +4718,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 
 func TestStartGroup_Complete(t *testing.T) {
 	t.Run("start_group_successfully", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -4752,7 +4764,7 @@ func TestStartGroup_Complete(t *testing.T) {
 	})
 
 	t.Run("start_group_toposort_error", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -4785,7 +4797,7 @@ func TestStartGroup_Complete(t *testing.T) {
 	})
 
 	t.Run("start_group_start_failure", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
@@ -4811,7 +4823,7 @@ func TestStartGroup_Complete(t *testing.T) {
 	})
 
 	t.Run("start_group_empty", func(t *testing.T) {
-		o := New(Config{LogLevel: LogLevelWarn})
+		o := New(WithLogLevel(LogLevelWarn))
 		err := o.StartGroup("nonexistent")
 		if err != nil {
 			t.Fatalf("StartGroup with empty group should not error: %v", err)
@@ -4860,7 +4872,7 @@ func (tl *testLogger) callsMatching(msg string) []testLogCall {
 
 func TestCustomLogger_BasicDelegation(t *testing.T) {
 	tl := &testLogger{}
-	o := New(Config{Logger: tl, LogLevel: LogLevelError}) // LogLevel should be ignored
+	o := New(WithLogger(tl), WithLogLevel(LogLevelError)) // LogLevel should be ignored
 	o.Register(&testSvc{}, WithName("alpha"))
 	o.Start()
 
@@ -4904,7 +4916,7 @@ func TestCustomLogger_NoStderrOutput(t *testing.T) {
 	os.Stderr = w
 
 	tl := &testLogger{}
-	o := New(Config{Logger: tl})
+	o := New(WithLogger(tl))
 	o.Register(&testSvc{}, WithName("silent"))
 	o.Start()
 
@@ -4927,7 +4939,7 @@ func TestCustomLogger_NoStderrOutput(t *testing.T) {
 func TestCustomLogger_SelfHeal(t *testing.T) {
 	tl := &testLogger{}
 	var factoryCalls atomic.Int32
-	o := New(Config{Logger: tl, LogLevel: LogLevelWarn})
+	o := New(WithLogger(tl), WithLogLevel(LogLevelWarn))
 	_ = o.Register(&testSvc{
 		startFn: func(ctx context.Context) error {
 			return errors.New("crash")
@@ -4975,7 +4987,7 @@ func TestCustomLogger_StartErrorPath(t *testing.T) {
 	// Verify that the cron error path in Start doesn't panic
 	// when custom logger is set (logCh is nil).
 	tl := &testLogger{}
-	o := New(Config{Logger: tl})
+	o := New(WithLogger(tl))
 	err := o.Register(&testSvc{}, WithName("x"), WithCron("invalid cron spec", CronParallel))
 	if err == nil {
 		// Register succeeded, but Start should fail due to invalid cron.
@@ -4994,7 +5006,7 @@ func TestCustomLogger_StartErrorPath(t *testing.T) {
 
 func TestCustomLogger_HandlesAllLevels(t *testing.T) {
 	tl := &testLogger{}
-	o := New(Config{Logger: tl})
+	o := New(WithLogger(tl))
 
 	o.Register(&testSvc{}, WithName("levels"))
 	o.Start()
@@ -5022,7 +5034,7 @@ func TestCustomLogger_HandlesAllLevels(t *testing.T) {
 }
 
 func TestStopGroup_StopError(t *testing.T) {
-	o := New(Config{LogLevel: LogLevelWarn})
+	o := New(WithLogLevel(LogLevelWarn))
 	o.ctx, o.cancel = context.WithCancel(context.Background())
 	o.logCh = make(chan logEntry, 1)
 	o.logQuit = make(chan struct{})

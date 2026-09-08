@@ -41,8 +41,8 @@ func (l LogLevel) String() string {
 	}
 }
 
-// Config holds orchestrator configuration.
-type Config struct {
+// config holds orchestrator configuration accumulated from Option functions.
+type config struct {
 	// Logger is an optional custom logger. When set, gorch sends all log output
 	// through it instead of the built-in stderr logger. The service name is
 	// prepended as a "service"=<name> key-value pair to every call.
@@ -50,7 +50,8 @@ type Config struct {
 	// writes to stderr with a fixed timestamp+level+service format.
 	Logger Logger
 
-	LogLevel LogLevel // defaults to LogLevelInfo if zero; ignored when Logger is set
+	LogLevel    LogLevel // defaults to LogLevelInfo; ignored when Logger is set
+	logLevelSet bool     // true if WithLogLevel was called (Debug is otherwise indistinguishable from zero)
 
 	// DefaultStartTimeout is the default per-service start deadline.
 	// 0 means no timeout (use WithStartTimeout per-service).
@@ -60,10 +61,10 @@ type Config struct {
 	// HealthInterval: how often to probe. Default: 30s.
 	// HealthTimeout: per-probe deadline. Default: 5s.
 	// HealthThreshold: consecutive failures before restart. Default: 3.
-	// A zero HealthInterval disables health checks entirely.
 	HealthInterval  time.Duration
 	HealthTimeout   time.Duration
 	HealthThreshold int
+	healthDisabled  bool // true when WithHealthChecksDisabled is used
 
 	// Global lifecycle hooks (called for every service unless overridden).
 	OnBeforeStart func(name string) error
@@ -78,6 +79,83 @@ type Config struct {
 	// Health check hooks.
 	BeforeHealthCheck func(name string) error
 	AfterHealthCheck  func(name string, err error)
+}
+
+// Option configures an Orchestrator at construction via New.
+type Option func(*config)
+
+// WithLogger sets a custom logger. When set, gorch sends all log output through
+// it instead of the built-in stderr logger.
+func WithLogger(l Logger) Option {
+	return func(c *config) { c.Logger = l }
+}
+
+// WithLogLevel sets the minimum log level. Defaults to LogLevelInfo when absent.
+// Ignored when a custom Logger is set.
+func WithLogLevel(lvl LogLevel) Option {
+	return func(c *config) { c.LogLevel = lvl; c.logLevelSet = true }
+}
+
+// WithDefaultStartTimeout sets the default per-service start deadline.
+// 0 means no timeout (use WithStartTimeout per-service).
+func WithDefaultStartTimeout(d time.Duration) Option {
+	return func(c *config) { c.DefaultStartTimeout = d }
+}
+
+// WithHealthChecks enables periodic health checks with the given interval,
+// per-probe timeout, and consecutive-failure threshold. Zero values fall back
+// to the defaults (30s interval, 5s timeout, threshold 3).
+func WithHealthChecks(interval, timeout time.Duration, threshold int) Option {
+	return func(c *config) {
+		c.HealthInterval = interval
+		c.HealthTimeout = timeout
+		c.HealthThreshold = threshold
+	}
+}
+
+// WithHealthChecksDisabled disables the periodic health-check loop entirely.
+func WithHealthChecksDisabled() Option {
+	return func(c *config) { c.healthDisabled = true }
+}
+
+// WithGlobalOnBeforeStart sets a global hook called just before each service's Start.
+func WithGlobalOnBeforeStart(fn func(name string) error) Option {
+	return func(c *config) { c.OnBeforeStart = fn }
+}
+
+// WithGlobalOnAfterStart sets a global hook called after each service's Start returns.
+func WithGlobalOnAfterStart(fn func(name string, err error)) Option {
+	return func(c *config) { c.OnAfterStart = fn }
+}
+
+// WithGlobalOnBeforeStop sets a global hook called just before each service's Stop.
+func WithGlobalOnBeforeStop(fn func(name string) error) Option {
+	return func(c *config) { c.OnBeforeStop = fn }
+}
+
+// WithGlobalOnAfterStop sets a global hook called after each service's Stop returns.
+func WithGlobalOnAfterStop(fn func(name string, err error)) Option {
+	return func(c *config) { c.OnAfterStop = fn }
+}
+
+// WithOnStateChange sets a callback fired on every status transition.
+func WithOnStateChange(fn func(name string, from, to ServiceStatus)) Option {
+	return func(c *config) { c.OnStateChange = fn }
+}
+
+// WithOnCrash sets a callback fired when a service reaches StatusCrashed.
+func WithOnCrash(fn func(name string, err error)) Option {
+	return func(c *config) { c.OnCrash = fn }
+}
+
+// WithBeforeHealthCheck sets a hook fired before each health probe.
+func WithBeforeHealthCheck(fn func(name string) error) Option {
+	return func(c *config) { c.BeforeHealthCheck = fn }
+}
+
+// WithAfterHealthCheck sets a hook fired after each health probe.
+func WithAfterHealthCheck(fn func(name string, err error)) Option {
+	return func(c *config) { c.AfterHealthCheck = fn }
 }
 
 // Metrics holds counter snapshots for orchestrator-level events.
@@ -216,7 +294,7 @@ func (e *serviceEntry) setHealthFailures(n int) {
 
 // Orchestrator manages service lifecycles.
 type Orchestrator struct {
-	cfg     Config
+	cfg     config
 	started bool
 	mu      sync.RWMutex // protects started, entries slice, nameIndex
 
@@ -255,20 +333,30 @@ type Orchestrator struct {
 }
 
 // New creates a new Orchestrator. Each call returns a fresh, independent instance.
-// Orchestrators can be nested: a service may create its own gorch to manage sub-services.
-func New(cfg Config) *Orchestrator {
-	if cfg.LogLevel == 0 {
+// Orchestrators can be nested: a service may create its own gorch to manage
+// sub-services. Configure via Option functions; the zero-option call uses the
+// defaults (LogLevelInfo, health checks every 30s with a 5s probe timeout).
+func New(opts ...Option) *Orchestrator {
+	cfg := config{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if !cfg.logLevelSet {
 		cfg.LogLevel = LogLevelInfo
 	}
-	// Health defaults
-	if cfg.HealthInterval == 0 {
-		cfg.HealthInterval = 30 * time.Second
-	}
-	if cfg.HealthTimeout == 0 {
-		cfg.HealthTimeout = 5 * time.Second
-	}
-	if cfg.HealthThreshold == 0 {
-		cfg.HealthThreshold = 3
+	// Health defaults (or disable when explicitly requested).
+	if cfg.healthDisabled {
+		cfg.HealthInterval = 0
+	} else {
+		if cfg.HealthInterval == 0 {
+			cfg.HealthInterval = 30 * time.Second
+		}
+		if cfg.HealthTimeout == 0 {
+			cfg.HealthTimeout = 5 * time.Second
+		}
+		if cfg.HealthThreshold == 0 {
+			cfg.HealthThreshold = 3
+		}
 	}
 	o := &Orchestrator{
 		cfg:       cfg,
@@ -1090,7 +1178,7 @@ func (o *Orchestrator) Health() map[string]error {
 
 // RegisterFunc registers a closure-based service.
 func (o *Orchestrator) RegisterFunc(name string, startFn func(ctx ServiceContext) error, stopFn func() error, opts ...RegisterOption) error {
-	svc := &funcService{startFn: func(ctx context.Context) error { return startFn(ctx.(ServiceContext)) }, stopFn: stopFn}
+	svc := &funcService{startFn: startFn, stopFn: stopFn}
 	allOpts := make([]RegisterOption, 0, len(opts)+1)
 	allOpts = append(allOpts, WithName(name))
 	allOpts = append(allOpts, opts...)

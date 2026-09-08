@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -14,7 +13,7 @@ import (
 // Publisher emits events on the "events" topic every second.
 type Publisher struct{}
 
-func (p *Publisher) Start(ctx context.Context) error {
+func (p *Publisher) Start(ctx gorch.ServiceContext) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for i := 0; ; i++ {
@@ -22,10 +21,8 @@ func (p *Publisher) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			// ctx is a ServiceContext (it embeds context.Context).
-			sc := ctx.(gorch.ServiceContext)
-			sc.Messenger.Publish(fmt.Sprintf("event #%d", i), "events")
-			sc.Logger.Info("published event", "seq", i)
+			ctx.Messenger.Publish(fmt.Sprintf("event #%d", i), "events")
+			ctx.Logger.Info("published event", "seq", i)
 		}
 	}
 }
@@ -37,9 +34,8 @@ type Subscriber struct {
 	name string
 }
 
-func (s *Subscriber) Start(ctx context.Context) error {
-	sc := ctx.(gorch.ServiceContext)
-	ch, unsub := sc.Messenger.Subscribe("events")
+func (s *Subscriber) Start(ctx gorch.ServiceContext) error {
+	ch, unsub := ctx.Messenger.Subscribe("events")
 	defer unsub()
 
 	for {
@@ -47,7 +43,7 @@ func (s *Subscriber) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case msg := <-ch:
-			sc.Logger.Info("received", "msg", msg, "subscriber", s.name)
+			ctx.Logger.Info("received", "msg", msg, "subscriber", s.name)
 		}
 	}
 }
@@ -55,7 +51,7 @@ func (s *Subscriber) Start(ctx context.Context) error {
 func (s *Subscriber) Stop() error { return nil }
 
 func main() {
-	orch := gorch.New(gorch.Config{LogLevel: gorch.LogLevelDebug})
+	orch := gorch.New(gorch.WithLogLevel(gorch.LogLevelDebug))
 
 	orch.Register(&Publisher{})
 	orch.Register(&Subscriber{name: "sub-1"})

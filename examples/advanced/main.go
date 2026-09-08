@@ -35,9 +35,8 @@ type ConfigLoader struct {
 	config *Config
 }
 
-func (l *ConfigLoader) Start(ctx context.Context) error {
-	sc := ctx.(gorch.ServiceContext)
-	sc.Logger.Info("loading configuration")
+func (l *ConfigLoader) Start(ctx gorch.ServiceContext) error {
+	ctx.Logger.Info("loading configuration")
 	time.Sleep(100 * time.Millisecond) // simulate I/O
 	l.config.loaded.Store(true)
 	return nil
@@ -51,7 +50,7 @@ type MetricsCollector struct {
 	healthy atomic.Bool
 }
 
-func (m *MetricsCollector) Start(ctx context.Context) error {
+func (m *MetricsCollector) Start(ctx gorch.ServiceContext) error {
 	m.healthy.Store(true)
 	<-ctx.Done()
 	return nil
@@ -81,13 +80,12 @@ type APIServer struct {
 	healthy atomic.Bool
 }
 
-func (a *APIServer) Start(ctx context.Context) error {
-	sc := ctx.(gorch.ServiceContext)
-	sc.Logger.Info("api-server booting up…")
+func (a *APIServer) Start(ctx gorch.ServiceContext) error {
+	ctx.Logger.Info("api-server booting up…")
 	time.Sleep(200 * time.Millisecond) // simulated warm-up
 	a.ready.Store(true)
 	a.healthy.Store(true)
-	sc.Logger.Info("api-server ready to serve")
+	ctx.Logger.Info("api-server ready to serve")
 	<-ctx.Done()
 	return nil
 }
@@ -119,8 +117,7 @@ type BackgroundWorker struct {
 	ticks atomic.Int64
 }
 
-func (w *BackgroundWorker) Start(ctx context.Context) error {
-	sc := ctx.(gorch.ServiceContext)
+func (w *BackgroundWorker) Start(ctx gorch.ServiceContext) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -129,7 +126,7 @@ func (w *BackgroundWorker) Start(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			n := w.ticks.Add(1)
-			sc.Logger.Debug("worker tick", "count", n)
+			ctx.Logger.Debug("worker tick", "count", n)
 		}
 	}
 }
@@ -143,37 +140,35 @@ func main() {
 	cfg := &Config{version: "1.0.0"}
 
 	// Orchestrator with hooks. Health checks run every 2s (demo pace).
-	orch := gorch.New(gorch.Config{
-		LogLevel:        gorch.LogLevelDebug,
-		HealthInterval:  2 * time.Second,
-		HealthTimeout:   1 * time.Second,
-		HealthThreshold: 2,
+	orch := gorch.New(
+		gorch.WithLogLevel(gorch.LogLevelDebug),
+		gorch.WithHealthChecks(2*time.Second, time.Second, 2),
 		// No global start timeout — persistent services block in Start().
 		// Use WithStartTimeout per-service for one-shot init tasks.
 
 		// OnStateChange fires on every status transition.
-		OnStateChange: func(name string, from, to gorch.ServiceStatus) {
+		gorch.WithOnStateChange(func(name string, from, to gorch.ServiceStatus) {
 			fmt.Printf("[hook] %s: %s → %s\n", name, from, to)
-		},
+		}),
 
 		// OnCrash fires when a service reaches StatusCrashed.
-		OnCrash: func(name string, err error) {
+		gorch.WithOnCrash(func(name string, err error) {
 			fmt.Printf("[hook] CRASH: %s — %v\n", name, err)
-		},
+		}),
 
 		// BeforeHealthCheck fires before each service health probe.
-		BeforeHealthCheck: func(name string) error {
+		gorch.WithBeforeHealthCheck(func(name string) error {
 			fmt.Printf("[health] probing %s\n", name)
 			return nil
-		},
+		}),
 
 		// AfterHealthCheck fires after the probe (err is the probe result).
-		AfterHealthCheck: func(name string, err error) {
+		gorch.WithAfterHealthCheck(func(name string, err error) {
 			if err != nil {
 				fmt.Printf("[health] %s: UNHEALTHY — %v\n", name, err)
 			}
-		},
-	})
+		}),
+	)
 
 	// ── Register infra-group services ──
 
