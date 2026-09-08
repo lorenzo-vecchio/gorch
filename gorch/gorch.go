@@ -228,22 +228,26 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 		if dep == cfg.name {
 			return fmt.Errorf("%w: service %s depends on itself", ErrDependencyCycle, cfg.name)
 		}
-		depEntry, ok := o.nameIndex[dep]
-		if !ok {
-			// Check if dep is being registered in this batch (entries not yet in nameIndex).
-			found := false
-			for _, e := range o.entries {
-				if e.cfg.name == dep {
-					found = true
-					depEntry = e
-					break
-				}
-			}
-			if !found {
-				return fmt.Errorf("gorch: dependency %q not found for service %s", dep, cfg.name)
-			}
+		depEntry := o.lookupEntry(dep)
+		if depEntry == nil {
+			return fmt.Errorf("gorch: dependency %q not found for service %s", dep, cfg.name)
 		}
 		// Check if dep transitively depends on cfg.name (would create a cycle).
+		if o.dependsOnRecursive(depEntry, cfg.name) {
+			return fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
+		}
+	}
+
+	// Soft dependencies: only validate cycles when the target is already
+	// registered; missing targets are tolerated by design.
+	for _, dep := range cfg.softDependsOn {
+		if dep == cfg.name {
+			return fmt.Errorf("%w: service %s soft-depends on itself", ErrDependencyCycle, cfg.name)
+		}
+		depEntry := o.lookupEntry(dep)
+		if depEntry == nil {
+			continue
+		}
 		if o.dependsOnRecursive(depEntry, cfg.name) {
 			return fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
 		}
@@ -262,7 +266,23 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	return nil
 }
 
-// dependsOnRecursive checks whether entry transitively depends on target.
+// lookupEntry returns the registered entry with the given name, searching the
+// nameIndex first and then the entries slice (for entries registered in the
+// same batch). Returns nil if no such entry exists.
+func (o *Orchestrator) lookupEntry(name string) *serviceEntry {
+	if e, ok := o.nameIndex[name]; ok {
+		return e
+	}
+	for _, e := range o.entries {
+		if e.cfg.name == name {
+			return e
+		}
+	}
+	return nil
+}
+
+// dependsOnRecursive checks whether entry transitively depends on target via
+// either hard or soft dependency edges.
 // ponytail: DFS on small graphs (registration-time only); O(V+E) fine.
 func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bool {
 	if entry == nil {
@@ -272,18 +292,15 @@ func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bo
 		if dep == target {
 			return true
 		}
-		depEntry, ok := o.nameIndex[dep]
-		if !ok {
-			// check entries slice for newly registered
-			for _, e := range o.entries {
-				if e.cfg.name == dep {
-					depEntry = e
-					ok = true
-					break
-				}
-			}
+		if o.dependsOnRecursive(o.lookupEntry(dep), target) {
+			return true
 		}
-		if ok && o.dependsOnRecursive(depEntry, target) {
+	}
+	for _, dep := range entry.cfg.softDependsOn {
+		if dep == target {
+			return true
+		}
+		if o.dependsOnRecursive(o.lookupEntry(dep), target) {
 			return true
 		}
 	}
@@ -1152,9 +1169,20 @@ func (o *Orchestrator) topoSort(entries []*serviceEntry) ([][]*serviceEntry, err
 		if _, ok := inDegree[name]; !ok {
 			inDegree[name] = 0
 		}
+	}
+	// Add hard edges, then soft edges (only when the soft dep is present in
+	// this entry set — otherwise it is ignored).
+	for _, e := range entries {
+		name := e.name
 		for _, dep := range e.cfg.dependsOn {
 			children[dep] = append(children[dep], name)
 			inDegree[name]++
+		}
+		for _, dep := range e.cfg.softDependsOn {
+			if _, ok := byName[dep]; ok {
+				children[dep] = append(children[dep], name)
+				inDegree[name]++
+			}
 		}
 	}
 

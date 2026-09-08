@@ -3552,6 +3552,67 @@ func TestSoftDep(t *testing.T) {
 	})
 }
 
+// TestSoftDep_Ordering verifies that a soft dependency, when present, provides
+// a real start ordering (dependent starts after its soft dep).
+func TestSoftDep_Ordering(t *testing.T) {
+	var order []string
+	var mu sync.Mutex
+	o := New(Config{
+		LogLevel: LogLevelWarn,
+		OnBeforeStart: func(name string) error {
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			return nil
+		},
+	})
+	base := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	dep := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	_ = o.Register(base, WithName("base"))
+	_ = o.Register(dep, WithName("dep"), DependsOnSoft("base"))
+	_ = o.Start()
+	defer o.Stop(time.Second)
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) < 2 || order[0] != "base" || order[1] != "dep" {
+		t.Errorf("expected base to start before dep, got %v", order)
+	}
+}
+
+// TestSoftDep_Cycle verifies that a soft-dependency cycle among registered
+// services is detected at Register time.
+func TestSoftDep_Cycle(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	_ = o.Register(&testSvc{}, WithName("a"), DependsOnSoft("b"))
+	err := o.Register(&testSvc{}, WithName("b"), DependsOnSoft("a"))
+	if !errors.Is(err, ErrDependencyCycle) {
+		t.Fatalf("expected ErrDependencyCycle for soft-dep cycle, got %v", err)
+	}
+}
+
+// TestSoftDep_Cycle_Transitive verifies a 3-node soft-dependency cycle is
+// detected via the recursive soft-edge traversal.
+func TestSoftDep_Cycle_Transitive(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	_ = o.Register(&testSvc{}, WithName("a"), DependsOnSoft("b"))
+	_ = o.Register(&testSvc{}, WithName("b"), DependsOnSoft("c"))
+	err := o.Register(&testSvc{}, WithName("c"), DependsOnSoft("a"))
+	if !errors.Is(err, ErrDependencyCycle) {
+		t.Fatalf("expected ErrDependencyCycle for transitive soft-dep cycle, got %v", err)
+	}
+}
+
+// TestSoftDep_SelfDependency verifies a soft self-dependency is rejected.
+func TestSoftDep_SelfDependency(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	err := o.Register(&testSvc{}, WithName("self"), DependsOnSoft("self"))
+	if !errors.Is(err, ErrDependencyCycle) {
+		t.Fatalf("expected ErrDependencyCycle for soft self-dependency, got %v", err)
+	}
+}
+
 // ── WithStartCondition ──
 
 func TestStartCondition(t *testing.T) {
