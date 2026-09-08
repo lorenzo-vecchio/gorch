@@ -327,31 +327,19 @@ func newMessenger() *Messenger {
 // Subscribe registers interest in a topic. Returns a receive-only channel and an
 // unsubscribe function. The channel is buffered (cap 16). Thread-safe.
 func (m *Messenger) Subscribe(topic string) (<-chan any, func()) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	ch := make(chan any, 16)
-	m.subs[topic] = append(m.subs[topic], ch)
-	unsubscribe := sync.OnceValue(func() struct{} {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		subs := m.subs[topic]
-		for i, c := range subs {
-			if c == ch {
-				m.subs[topic] = append(subs[:i], subs[i+1:]...)
-				return struct{}{}
-			}
-		}
-		return struct{}{}
-	})
-	return ch, func() { unsubscribe() }
+	return m.SubscribeWithBuffer(topic, 16)
 }
 
 // SubscribeWithBuffer registers interest in a topic with a caller-specified
 // buffer size. Returns a receive-only channel and an unsubscribe function.
+// Safe to call after Drain (subscriptions are lazily re-initialized).
 // Thread-safe.
 func (m *Messenger) SubscribeWithBuffer(topic string, bufSize int) (<-chan any, func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.subs == nil {
+		m.subs = make(map[string][]chan any)
+	}
 	ch := make(chan any, bufSize)
 	m.subs[topic] = append(m.subs[topic], ch)
 	unsubscribe := sync.OnceValue(func() struct{} {
@@ -462,22 +450,19 @@ func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-
 	return out, nil
 }
 
-// Drain closes all subscriber channels and clears all subscriptions.
-// After Drain, the Messenger is empty and no new publishes will be
-// received by prior subscribers. Thread-safe.
+// Drain closes all subscriber channels and clears all subscriptions. Buffered
+// messages are delivered to receivers before they observe the close. After
+// Drain, the Messenger is empty, Publish is a no-op, and a subsequent
+// Subscribe re-initializes the subscription map. Thread-safe.
 func (m *Messenger) Drain() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for topic, subs := range m.subs {
+	for _, subs := range m.subs {
 		for _, ch := range subs {
-			select {
-			case <-ch:
-			default:
-			}
 			close(ch)
 		}
-		delete(m.subs, topic)
 	}
+	m.subs = nil
 }
 
 // gobBuf is a simple bytes.Buffer wrapper for gob encoding.

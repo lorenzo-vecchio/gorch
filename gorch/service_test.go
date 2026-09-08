@@ -1434,11 +1434,35 @@ func TestDrain_Complete(t *testing.T) {
 		m := newMessenger()
 		ch, _ := m.Subscribe("t")
 		m.Publish("fill", "t")
-		// Channel has data; drain should clear it via select default and close.
 		m.Drain()
-		_, ok := <-ch
+
+		// Buffered message is delivered before the channel close is observed.
+		v, ok := <-ch
+		if !ok {
+			t.Error("buffered message should be delivered before close")
+		}
+		if v != "fill" {
+			t.Errorf("expected 'fill', got %v", v)
+		}
+		_, ok = <-ch
 		if ok {
-			t.Error("channel should be closed after drain")
+			t.Error("channel should be closed after draining the buffer")
+		}
+	})
+
+	t.Run("subscribe_after_drain", func(t *testing.T) {
+		m := newMessenger()
+		m.Drain()
+		// Subscribe after Drain must lazily re-initialize and not panic.
+		ch, _ := m.Subscribe("t")
+		m.Publish("hello", "t")
+		select {
+		case v := <-ch:
+			if v != "hello" {
+				t.Errorf("expected 'hello', got %v", v)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("expected message after re-subscribe")
 		}
 	})
 }

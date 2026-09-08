@@ -152,14 +152,6 @@ func TestNew_Defaults(t *testing.T) {
 		}
 	})
 
-	t.Run("messengerDone_initialized", func(t *testing.T) {
-		o := New(Config{})
-		cleanup := o.messengerDone()
-		if cleanup == nil {
-			t.Fatal("expected messengerDone to return cleanup func")
-		}
-	})
-
 	t.Run("health_defaults", func(t *testing.T) {
 		o := New(Config{})
 		if o.cfg.HealthInterval != 30*time.Second {
@@ -300,13 +292,6 @@ func TestStart(t *testing.T) {
 			started:   true,
 			messenger: newMessenger(),
 		}
-		o.messengerDone = sync.OnceValue(func() func() {
-			return func() {
-				o.messenger.mu.Lock()
-				o.messenger.subs = nil
-				o.messenger.mu.Unlock()
-			}
-		})
 		err := o.Start()
 		if !errors.Is(err, ErrAlreadyStarted) {
 			t.Errorf("expected ErrAlreadyStarted, got %v", err)
@@ -481,6 +466,35 @@ func TestStop_Timeout_LogPumpExits(t *testing.T) {
 	err := o.Stop(50 * time.Millisecond)
 	if !errors.Is(err, ErrStopTimeout) {
 		t.Fatalf("expected ErrStopTimeout, got %v", err)
+	}
+}
+
+// TestStop_ClosesMessengerSubscriberChannels verifies that a subscriber blocked
+// on receive observes a channel close when the orchestrator stops.
+func TestStop_ClosesMessengerSubscriberChannels(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	_ = o.Start()
+	ch, _ := o.messenger.Subscribe("topic")
+	_ = o.Stop(time.Second)
+
+	_, ok := <-ch
+	if ok {
+		t.Error("expected subscriber channel to be closed on Stop")
+	}
+}
+
+// TestStop_SubscribeAfterStopDoesNotPanic verifies the messenger re-initializes
+// its subscription map lazily so a late Subscribe does not panic.
+func TestStop_SubscribeAfterStopDoesNotPanic(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn})
+	_ = o.Start()
+	_ = o.Stop(time.Second)
+
+	ch, _ := o.messenger.Subscribe("topic")
+	o.messenger.Publish("x", "topic")
+	select {
+	case <-ch:
+	default:
 	}
 }
 

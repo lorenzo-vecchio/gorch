@@ -243,9 +243,6 @@ type Orchestrator struct {
 	stopOnce  sync.Once
 	startOnce sync.Once
 
-	// messengerDone computes the messenger shutdown cleanup once via sync.OnceValue.
-	messengerDone func() func()
-
 	metricsStarts      atomic.Int64
 	metricsStops       atomic.Int64
 	metricsCrashes     atomic.Int64
@@ -274,13 +271,6 @@ func New(cfg Config) *Orchestrator {
 		messenger: newMessenger(),
 		nameIndex: make(map[string]*serviceEntry),
 	}
-	o.messengerDone = sync.OnceValue(func() func() {
-		return func() {
-			o.messenger.mu.Lock()
-			o.messenger.subs = nil
-			o.messenger.mu.Unlock()
-		}
-	})
 	return o
 }
 
@@ -879,8 +869,7 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		}
 
 		// 5. Clean up messenger subscriptions.
-		cleanup := o.messengerDone()
-		cleanup()
+		o.messenger.Drain()
 
 		// 6. Wait for all services + log-pump with timeout.
 		done := make(chan struct{})
