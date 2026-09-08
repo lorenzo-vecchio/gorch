@@ -972,16 +972,16 @@ func (o *Orchestrator) Health() map[string]error {
 	o.mu.Unlock()
 
 	result := make(map[string]error, len(entries))
-	ctx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
-	defer cancel()
-
 	for _, e := range entries {
 		hc, ok := e.svc.(HealthChecker)
 		if !ok {
 			result[e.name] = nil
 			continue
 		}
-		result[e.name] = hc.Health(ctx)
+		// Per-probe deadline so a slow checker does not fail later probes.
+		probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
+		result[e.name] = hc.Health(probeCtx)
+		cancel()
 	}
 	return result
 }
@@ -1246,9 +1246,6 @@ func (o *Orchestrator) runHealthChecks() {
 	copy(entries, o.entries)
 	o.mu.Unlock()
 
-	probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
-	defer cancel()
-
 	for _, e := range entries {
 		hc, ok := e.svc.(HealthChecker)
 		if !ok {
@@ -1268,7 +1265,11 @@ func (o *Orchestrator) runHealthChecks() {
 			}
 		}
 
+		// Each probe gets a fresh per-service deadline so a slow checker does
+		// not fail all later probes with an expired context.
+		probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
 		healthErr := hc.Health(probeCtx)
+		cancel()
 		if o.cfg.AfterHealthCheck != nil {
 			o.cfg.AfterHealthCheck(e.name, healthErr)
 		}

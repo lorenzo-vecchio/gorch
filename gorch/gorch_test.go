@@ -2464,6 +2464,78 @@ func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
 	}
 }
 
+func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
+	// A slow checker that consumes its whole deadline must not fail a later
+	// instant checker: each probe gets a fresh per-service timeout.
+	o := New(Config{HealthTimeout: 50 * time.Millisecond})
+	logCh := make(chan logEntry, 1)
+	slow := &serviceEntry{
+		name: "slow",
+		svc: &healthSvc{healthFn: func(ctx context.Context) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+				return errors.New("slow")
+			}
+		}},
+		cfg:    registerConfig{name: "slow"},
+		status: StatusRunning,
+		logger: newServiceLogger("slow", logCh, nil),
+	}
+	fast := &serviceEntry{
+		name: "fast",
+		svc: &healthSvc{healthFn: func(ctx context.Context) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
+		}},
+		cfg:    registerConfig{name: "fast"},
+		status: StatusRunning,
+		logger: newServiceLogger("fast", logCh, nil),
+	}
+	o.entries = append(o.entries, slow, fast)
+
+	o.runHealthChecks()
+
+	if fast.healthFailures != 0 {
+		t.Errorf("fast should be healthy with a fresh per-probe timeout, got %d failures", fast.healthFailures)
+	}
+	if slow.healthFailures < 1 {
+		t.Errorf("slow should have failed its probe (timed out), got %d failures", slow.healthFailures)
+	}
+}
+
+func TestHealth_PerProbeTimeout(t *testing.T) {
+	o := New(Config{LogLevel: LogLevelWarn, HealthTimeout: 50 * time.Millisecond})
+	slow := &healthSvc{healthFn: func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			return errors.New("slow")
+		}
+	}}
+	fast := &healthSvc{healthFn: func(ctx context.Context) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	}}
+	_ = o.Register(slow, WithName("slow"))
+	_ = o.Register(fast, WithName("fast"))
+
+	results := o.Health()
+
+	if results["fast"] != nil {
+		t.Errorf("fast should be healthy with a fresh per-probe timeout, got %v", results["fast"])
+	}
+	if results["slow"] == nil {
+		t.Error("slow should be unhealthy (probe deadline expired)")
+	}
+}
+
 func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
 	o := New(Config{HealthThreshold: 3})
 	logCh := make(chan logEntry, 1)
