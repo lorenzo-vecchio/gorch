@@ -291,17 +291,19 @@ func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bo
 }
 
 // Start begins the orchestrator lifecycle. Returns ErrAlreadyStarted if already started.
-// Idempotent: calling Start multiple times returns nil after the first.
-// Thread-safe.
+// If Start fails, the orchestrator is reset and may be started again (e.g. to retry
+// after a transient dependency failure). Thread-safe.
 func (o *Orchestrator) Start() error {
+	o.mu.Lock()
+	if o.started {
+		o.mu.Unlock()
+		return ErrAlreadyStarted
+	}
+	o.mu.Unlock()
+
 	var startErr error
 	o.startOnce.Do(func() {
 		o.mu.Lock()
-		if o.started {
-			o.mu.Unlock()
-			startErr = ErrAlreadyStarted
-			return
-		}
 		o.started = true
 		o.mu.Unlock()
 
@@ -471,7 +473,46 @@ func (o *Orchestrator) Start() error {
 			go o.healthCheckLoop(healthCtx)
 		}
 	})
+	if startErr != nil {
+		o.resetAfterStartFailure()
+	}
 	return startErr
+}
+
+// resetAfterStartFailure rolls back all state mutated by a failed Start so the
+// orchestrator can be started again. It first waits for all service goroutines
+// and the log-pump to fully wind down (they were signalled by stopStartedServices
+// or the cron-error path) before resetting.
+func (o *Orchestrator) resetAfterStartFailure() {
+	o.wg.Wait()
+	if o.logPumpDone != nil {
+		<-o.logPumpDone
+	}
+
+	o.mu.Lock()
+	o.started = false
+	o.mu.Unlock()
+	o.startOnce = sync.Once{}
+	o.stopOnce = sync.Once{}
+
+	o.ctx = nil
+	o.cancel = nil
+	o.cronSched = nil
+	o.logCh = nil
+	o.logQuit = nil
+	o.logPumpDone = nil
+	o.healthCancel = nil
+	o.healthDone = nil
+
+	for _, entry := range o.entries {
+		entry.status = StatusRegistered
+		entry.wgDone = false
+		entry.cancel = nil
+		entry.retryCount = 0
+		entry.healthFailures = 0
+		entry.stableSince = time.Time{}
+		entry.logger = nil
+	}
 }
 
 // startOneService runs a single non-cron service with timeout and hooks.

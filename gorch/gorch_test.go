@@ -272,15 +272,15 @@ func TestStart(t *testing.T) {
 		_ = o.Stop(1 * time.Second)
 	})
 
-	t.Run("double_start_returns_nil", func(t *testing.T) {
+	t.Run("double_start_returns_ErrAlreadyStarted", func(t *testing.T) {
 		o := New(Config{LogLevel: LogLevelWarn})
 		err1 := o.Start()
 		err2 := o.Start()
 		if err1 != nil {
 			t.Errorf("first Start returned error: %v", err1)
 		}
-		if err2 != nil {
-			t.Errorf("second Start returned: %v", err2)
+		if !errors.Is(err2, ErrAlreadyStarted) {
+			t.Errorf("second Start returned: %v, want ErrAlreadyStarted", err2)
 		}
 		_ = o.Stop(1 * time.Second)
 	})
@@ -310,6 +310,54 @@ func TestStart(t *testing.T) {
 		err := o.Start()
 		if !errors.Is(err, ErrAlreadyStarted) {
 			t.Errorf("expected ErrAlreadyStarted, got %v", err)
+		}
+	})
+}
+
+// TestStart_RetryAfterFailure verifies that a failed Start does not brick the
+// orchestrator: it can be registered against, restarted, and stopped.
+func TestStart_RetryAfterFailure(t *testing.T) {
+	t.Run("register_after_failed_start_succeeds", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("gate"), WithRunOnce())
+		if err := o.Start(); err == nil {
+			t.Fatal("expected Start to fail")
+		}
+		if err := o.Register(&namedSvc{name: "later"}); err != nil {
+			t.Errorf("Register after failed Start returned %v", err)
+		}
+	})
+
+	t.Run("start_after_failed_start_actually_starts", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		var gateCalls atomic.Int32
+		gate := &testSvc{startFn: func(ctx context.Context) error {
+			if gateCalls.Add(1) == 1 {
+				return errors.New("transient gate failure")
+			}
+			return nil
+		}}
+		_ = o.Register(gate, WithName("gate"), WithRunOnce())
+		_ = o.Register(&namedSvc{name: "svc"}, WithName("svc"))
+		if err := o.Start(); err == nil {
+			t.Fatal("expected first Start to fail")
+		}
+		if err := o.Start(); err != nil {
+			t.Fatalf("second Start returned %v", err)
+		}
+		defer o.Stop(time.Second)
+		s, ok := o.Status("svc")
+		if !ok || s != StatusRunning {
+			t.Errorf("expected svc to be running, got %v (ok=%v)", s, ok)
+		}
+	})
+
+	t.Run("stop_after_failed_start_is_noop", func(t *testing.T) {
+		o := New(Config{LogLevel: LogLevelWarn})
+		_ = o.Register(&errSvc{err: errors.New("boom")}, WithName("gate"), WithRunOnce())
+		_ = o.Start()
+		if err := o.Stop(time.Second); err != nil {
+			t.Errorf("Stop after failed Start returned %v", err)
 		}
 	})
 }
