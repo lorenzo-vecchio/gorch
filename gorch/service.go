@@ -318,6 +318,9 @@ type Messenger struct {
 }
 
 func newMessenger() *Messenger {
+	// Register the Message envelope so it can be gob-encoded as an interface
+	// value (e.g. passed through Request's untyped `any` payload).
+	gob.Register(Message{})
 	return &Messenger{subs: make(map[string][]chan any)}
 }
 
@@ -412,34 +415,37 @@ func (m *Messenger) Request(ctx context.Context, msg any, topic string) (any, er
 	}
 }
 
+// requestMessage publishes an already-built request Message and returns the
+// reply channel plus an unsubscribe func. It assigns a unique ReplyTopic and
+// subscribes before publishing to avoid a reply race. Thread-safe.
+func (m *Messenger) requestMessage(wrapper Message, topic string) (<-chan any, func()) {
+	replyTopic := "_reply." + newUUID(rand.Reader)
+	wrapper.ReplyTopic = replyTopic
+	replyCh, unsub := m.Subscribe(replyTopic)
+	m.Publish(wrapper, topic)
+	return replyCh, unsub
+}
+
 // RequestAsync is like Request but returns immediately with a response
 // channel. The caller must select on the channel and ctx.Done().
 // Thread-safe.
 func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-chan any, error) {
-	// generate unique reply topic
-	replyTopic := "_reply." + newUUID(rand.Reader)
-
-	// subscribe before publishing to avoid race
-	replyCh, unsub := m.Subscribe(replyTopic)
-
 	// encode payload with gob
 	var payload []byte
 	if msg != nil {
 		var buf gobBuf
 		if err := gob.NewEncoder(&buf).Encode(&msg); err != nil {
-			unsub()
 			return nil, fmt.Errorf("gorch: failed to encode request: %w", err)
 		}
 		payload = buf.Bytes()
 	}
 
 	wrapper := Message{
-		Payload:    payload,
-		Topic:      topic,
-		ReplyTopic: replyTopic,
+		Payload: payload,
+		Topic:   topic,
 	}
 
-	m.Publish(wrapper, topic)
+	replyCh, unsub := m.requestMessage(wrapper, topic)
 
 	// spawn cleanup goroutine that waits for context done, then unsubs
 	go func() {

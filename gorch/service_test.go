@@ -1239,27 +1239,14 @@ func TestSubscribeWithBuffer_DoubleUnsubscribe(t *testing.T) {
 
 func TestTypedRequest_HappyPath(t *testing.T) {
 	m := newMessenger()
-	gob.Register(Message{})
-	RegisterType[int](m)
 
-	// Responder: TypedRequest double-wraps via RequestAsync.
-	// 1. TypedRequest gob-encodes req → inner Message.Payload
-	// 2. RequestAsync gob-encodes inner Message through *any → outer Message.Payload
-	// 3. Outer Message is published
-	// So responder must: decode outer Payload → any → Message → decode inner Payload → req.
-	rawCh, _ := m.Subscribe("req")
+	// Responder: TypedSubscribeRequest + TypedRespond — no manual gob anywhere.
+	reqCh, unsub := TypedSubscribeRequest[int](m, "req")
+	defer unsub()
 	go func() {
-		outer := (<-rawCh).(Message)
-		var decodedAny any
-		gob.NewDecoder(bytes.NewReader(outer.Payload)).Decode(&decodedAny)
-		inner := decodedAny.(Message)
-		var req int
-		gob.NewDecoder(bytes.NewReader(inner.Payload)).Decode(&req)
-		resp := Message{
-			Payload:  gobEncode(req * 2),
-			TypeName: "int",
+		for env := range reqCh {
+			TypedRespond(m, env.Value*2, env.ReplyTopic)
 		}
-		m.Publish(resp, outer.ReplyTopic)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1274,9 +1261,47 @@ func TestTypedRequest_HappyPath(t *testing.T) {
 	}
 }
 
+func TestTypedRequest_SingleEncoding(t *testing.T) {
+	// TypedRequest must publish a single Message whose Payload is the gob-encoded
+	// request (no double-encoding via Request).
+	m := newMessenger()
+
+	rawCh, _ := m.Subscribe("req")
+	var got Message
+	done := make(chan struct{})
+	go func() {
+		got = (<-rawCh).(Message)
+		TypedRespond(m, 42, got.ReplyTopic)
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	result, err := TypedRequest[int, int](m, ctx, 21, "req")
+	if err != nil {
+		t.Fatalf("TypedRequest failed: %v", err)
+	}
+	<-done
+	if result != 42 {
+		t.Errorf("expected 42, got %v", result)
+	}
+
+	// Payload should decode directly into an int (not a nested Message).
+	var req int
+	if err := gob.NewDecoder(bytes.NewReader(got.Payload)).Decode(&req); err != nil {
+		t.Fatalf("payload should decode directly to int: %v", err)
+	}
+	if req != 21 {
+		t.Errorf("expected 21, got %d", req)
+	}
+	if got.ReplyTopic == "" {
+		t.Error("expected ReplyTopic to be set")
+	}
+}
+
 func TestTypedRequest_RequestError(t *testing.T) {
 	m := newMessenger()
-	gob.Register(Message{})
 	RegisterType[int](m)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -1290,7 +1315,6 @@ func TestTypedRequest_RequestError(t *testing.T) {
 
 func TestTypedRequest_NonMessageResponse(t *testing.T) {
 	m := newMessenger()
-	gob.Register(Message{})
 	RegisterType[int](m)
 
 	rawCh, _ := m.Subscribe("req")
@@ -1314,7 +1338,6 @@ func TestTypedRequest_NonMessageResponse(t *testing.T) {
 
 func TestTypedRequest_DecodeError(t *testing.T) {
 	m := newMessenger()
-	gob.Register(Message{})
 	RegisterType[int](m)
 
 	rawCh, _ := m.Subscribe("req")
@@ -1339,13 +1362,6 @@ func TestTypedRequest_DecodeError(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to decode response") {
 		t.Errorf("expected 'failed to decode response' in error, got: %v", err)
 	}
-}
-
-// gobEncode gob-encodes v and returns the bytes.
-func gobEncode(v any) []byte {
-	var buf bytes.Buffer
-	gob.NewEncoder(&buf).Encode(v)
-	return buf.Bytes()
 }
 
 // ── Drain (regression test) ──
@@ -1417,7 +1433,6 @@ func TestSubscribeWithBuffer_DoubleUnsubscribe_Raw(t *testing.T) {
 
 func TestTypedRequest_EncodeError(t *testing.T) {
 	m := newMessenger()
-	gob.Register(Message{})
 	RegisterType[chan int](m)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1429,5 +1444,71 @@ func TestTypedRequest_EncodeError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to encode request") {
 		t.Errorf("expected 'failed to encode request' in error, got: %v", err)
+	}
+}
+
+// ── TypedSubscribeRequest / TypedRespond ──
+
+func TestTypedSubscribeRequest_DropsNonMessageAndDecodeError(t *testing.T) {
+	m := newMessenger()
+	ch, unsub := TypedSubscribeRequest[int](m, "t")
+	defer unsub()
+
+	// Non-Message value → dropped.
+	m.Publish("plain string", "t")
+	// Undecodable payload → dropped.
+	m.Publish(Message{Payload: []byte{0xFF, 0xFF}, ReplyTopic: "x"}, "t")
+
+	// Valid message → delivered with its ReplyTopic.
+	var buf bytes.Buffer
+	_ = gob.NewEncoder(&buf).Encode(7)
+	m.Publish(Message{Payload: buf.Bytes(), ReplyTopic: "reply"}, "t")
+
+	select {
+	case env := <-ch:
+		if env.Value != 7 {
+			t.Errorf("expected 7, got %v", env.Value)
+		}
+		if env.ReplyTopic != "reply" {
+			t.Errorf("expected ReplyTopic 'reply', got %q", env.ReplyTopic)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid message should arrive")
+	}
+}
+
+func TestTypedSubscribeRequest_ChannelFull(t *testing.T) {
+	m := newMessenger()
+	ch, unsub := TypedSubscribeRequest[int](m, "t")
+	defer unsub()
+
+	var buf bytes.Buffer
+	_ = gob.NewEncoder(&buf).Encode(42)
+	payload := append([]byte(nil), buf.Bytes()...)
+
+	// typedCh cap is 16; messages 17+ hit the non-blocking default branch.
+	for i := 0; i < 20; i++ {
+		m.Publish(Message{Payload: payload, ReplyTopic: "r"}, "t")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	for i := 0; i < 16; i++ {
+		select {
+		case <-ch:
+		case <-time.After(10 * time.Millisecond):
+			return
+		}
+	}
+}
+
+func TestTypedRespond_EncodeError(t *testing.T) {
+	m := newMessenger()
+	rawCh, _ := m.Subscribe("reply")
+	// A channel value cannot be gob-encoded; TypedRespond must drop silently.
+	TypedRespond(m, make(chan int), "reply")
+	select {
+	case <-rawCh:
+		t.Error("encode error should drop the reply silently")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
