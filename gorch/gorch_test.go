@@ -386,6 +386,30 @@ func TestStop(t *testing.T) {
 		}
 	})
 
+	t.Run("stop_before_start_does_not_poison_later_stop", func(t *testing.T) {
+		o := New()
+		svc := &testSvc{}
+		_ = o.Register(svc)
+		// First Stop is a no-op and must not consume stopOnce.
+		if err := o.Stop(1 * time.Second); err != nil {
+			t.Errorf("no-op Stop returned error: %v", err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start returned error: %v", err)
+		}
+		if err := o.Stop(1 * time.Second); err != nil {
+			t.Errorf("later Stop returned error: %v", err)
+		}
+		if svc.stopCalls.Load() != 1 {
+			t.Errorf("expected exactly 1 svc Stop call after later Stop, got %d", svc.stopCalls.Load())
+		}
+		select {
+		case <-o.Done():
+		case <-time.After(1 * time.Second):
+			t.Errorf("expected Done() to be closed after later Stop")
+		}
+	})
+
 	t.Run("stop_calls_svc_stop", func(t *testing.T) {
 		o := New()
 		svc := &testSvc{}

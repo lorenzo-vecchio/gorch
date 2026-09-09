@@ -342,6 +342,9 @@ func (o *Orchestrator) Start() error {
 	o.startOnce.Do(func() {
 		o.mu.Lock()
 		o.started = true
+		// A no-op Stop() before Start() is harmless but consumes stopOnce; clear it
+		// now that a genuine start is under way so the real shutdown is not skipped.
+		o.stopOnce = sync.Once{}
 		o.mu.Unlock()
 
 		o.ctx, o.cancel = context.WithCancel(context.Background())
