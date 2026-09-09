@@ -248,22 +248,21 @@ messenger.Publish(msg)           // broadcast to ALL subscribers
 
 ### Request-reply
 
-`Request` publishes a message and blocks until a response arrives (or ctx expires). The responding service receives a `Message` with a `ReplyTopic` field and publishes its reply there.
+`Request` publishes a message and blocks until a response arrives (or ctx expires). The responder receives a `Message` with a `ReplyTopic` field and publishes its reply there. The payload is gob-encoded, so decoding it by hand is error-prone: implement the responder with the typed helpers (`TypedSubscribeRequest`/`TypedRespond`) instead.
 
 ```go
 // Requestor:
 resp, err := messenger.Request(ctx, payload, "orders.create")
 
-// Responder (inside a service goroutine):
-rawCh, _ := messenger.Subscribe("orders.create")
-for val := range rawCh {
-    msg := val.(gorch.Message)
-    // ... process msg.Payload ...
-    messenger.Publish(response, msg.ReplyTopic)
+// Responder (inside a service goroutine): messages arrive already decoded,
+// and the reply is encoded by TypedRespond — see "Typed Request-Reply".
+reqCh, _ := gorch.TypedSubscribeRequest[CreateOrderReq](messenger, "orders.create")
+for env := range reqCh {
+    gorch.TypedRespond(messenger, processOrder(env.Value), env.ReplyTopic)
 }
 ```
 
-`RequestAsync` returns a response channel immediately without blocking.
+For a fully type-safe round trip (typed requestor included), use `TypedRequest` — described in "Typed Request-Reply" below. `RequestAsync` returns a response channel immediately without blocking.
 
 ### Typed messages
 
@@ -293,7 +292,8 @@ Services log via `ServiceLogger`:
 
 ```go
 sc.Logger.Info("request completed", "status", 200, "latency", 12*time.Millisecond)
-// 2026-07-27 14:30:05.123 INFO  *main.MyService --- request completed status=200 latency=12ms
+// 2026-07-27 14:30:05.123 INFO  my-service --- request completed status=200 latency=12ms
+// (the prefix is the service name: WithName, or the auto-assigned $N)
 ```
 
 The built-in log-pump writes to `os.Stderr`. Log level filters entries: `Debug < Info < Warn < Error`.
