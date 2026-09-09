@@ -113,8 +113,9 @@ func WithStartTimeout(d time.Duration) RegisterOption {
 }
 
 // WithRunOnce marks a service as a one-shot init task. It runs before
-// persistent services, never receives Stop(), and transitions to
-// StatusStopped when Start returns. If Start returns an error, startup aborts.
+// persistent services and transitions to StatusSucceeded when Start returns.
+// Stop() is called at orchestrator shutdown — make Stop idempotent.
+// If Start returns an error, startup aborts.
 func WithRunOnce() RegisterOption {
 	return func(cfg *registerConfig) {
 		cfg.runOnce = true

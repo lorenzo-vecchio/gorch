@@ -25,7 +25,7 @@ Requires Go 1.25+.
 - **Self-healing** — auto-restart crashed services with a factory-provided fresh instance and configurable backoff/retry.
 - **Health checks** — `HealthChecker` interface; orchestrator probes services on configurable intervals, auto-restarts unhealthy services.
 - **Backoff & retry** — `ExponentialBackoff` and `ConstantBackoff` strategies, max retries, stability-window retry reset.
-- **One-shot services** — init/gate tasks that run once before persistent services and never receive `Stop()`.
+- **One-shot services** — init/gate tasks that run once before persistent services; `Stop()` is called at shutdown.
 - **Lifecycle hooks** — `OnBeforeStart`, `OnAfterStart`, `OnBeforeStop`, `OnAfterStop` (global or per-service overrides).
 - **Status introspection** — `Status`, `Statuses`, `Names`, `Count` for runtime observability.
 - **Error aggregation** — `errors.Join` in `Start`/`Stop` so all failures are reported, not just the first.
@@ -162,7 +162,7 @@ count := orch.Count()                      // total registered services
 
 ### One-shot / init services
 
-`WithRunOnce` marks a service as a one-shot init task. It runs before persistent services and transitions to `StatusSucceeded` when `Start` returns. If `Start` returns an error, startup aborts.
+`WithRunOnce` marks a service as a one-shot init task. It runs before persistent services and transitions to `StatusSucceeded` when `Start` returns. `Stop()` is called at orchestrator shutdown (make it idempotent). If `Start` returns an error, startup aborts.
 
 ```go
 orch.Register(migrator, gorch.WithRunOnce())
