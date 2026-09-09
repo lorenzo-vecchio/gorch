@@ -709,6 +709,7 @@ func TestServiceStatus_String(t *testing.T) {
 		{StatusStopping, "stopping"},
 		{StatusStopped, "stopped"},
 		{StatusCrashed, "crashed"},
+		{StatusSucceeded, "succeeded"},
 		{ServiceStatus(99), "unknown"},
 		{ServiceStatus(-1), "unknown"},
 	}

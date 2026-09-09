@@ -158,11 +158,11 @@ names := orch.Names()                      // []string in registration order
 count := orch.Count()                      // total registered services
 ```
 
-`ServiceStatus` values: `StatusRegistered`, `StatusStarting`, `StatusRunning`, `StatusStopping`, `StatusStopped`, `StatusCrashed`. Each has a `String()` method.
+`ServiceStatus` values: `StatusRegistered`, `StatusStarting`, `StatusRunning`, `StatusStopping`, `StatusStopped`, `StatusCrashed`, `StatusSucceeded`. Each has a `String()` method. `StatusSucceeded` marks a one-shot service whose `Start` completed without error (a successful gate); dependents are not aborted by it.
 
 ### One-shot / init services
 
-`WithRunOnce` marks a service as a one-shot init task. It runs before persistent services, never receives `Stop()`, and transitions to `StatusStopped` when `Start` returns. If `Start` returns an error, startup aborts.
+`WithRunOnce` marks a service as a one-shot init task. It runs before persistent services and transitions to `StatusSucceeded` when `Start` returns. If `Start` returns an error, startup aborts.
 
 ```go
 orch.Register(migrator, gorch.WithRunOnce())

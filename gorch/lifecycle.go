@@ -88,7 +88,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 			return err
 		}
 		entry.wgDone = true
-		o.setStatus(entry, StatusStopped)
+		o.setStatus(entry, StatusSucceeded)
 		o.callAfterStartHook(entry, nil)
 		// wg.Done not needed—runOnce doesn't add to wg
 		return nil

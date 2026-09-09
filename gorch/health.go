@@ -35,6 +35,10 @@ const (
 	StatusStopping
 	StatusStopped
 	StatusCrashed
+	// StatusSucceeded marks a runOnce service whose Start completed without
+	// error: it is a successful gate, distinct from StatusStopped so dependents
+	// are not aborted by a gate that did its job.
+	StatusSucceeded
 )
 
 // String returns a human-readable name for the status.
@@ -52,6 +56,8 @@ func (s ServiceStatus) String() string {
 		return "stopped"
 	case StatusCrashed:
 		return "crashed"
+	case StatusSucceeded:
+		return "succeeded"
 	default:
 		return "unknown"
 	}

@@ -2103,7 +2103,7 @@ func TestOneShot(t *testing.T) {
 		}
 	})
 
-	t.Run("transitions_to_stopped", func(t *testing.T) {
+	t.Run("transitions_to_succeeded", func(t *testing.T) {
 		o := New(WithLogLevel(LogLevelWarn))
 		oneShot := &testSvc{
 			startFn: func(ctx context.Context) error { return nil },
@@ -2118,10 +2118,31 @@ func TestOneShot(t *testing.T) {
 		if !ok {
 			t.Fatal("expected init to be found")
 		}
-		if s != StatusStopped {
-			t.Errorf("one-shot should be StatusStopped, got %v", s)
+		if s != StatusSucceeded {
+			t.Errorf("one-shot should be StatusSucceeded, got %v", s)
+		}
+		if s.String() != "succeeded" {
+			t.Errorf("expected String() == %q, got %q", "succeeded", s.String())
 		}
 		_ = o.Stop(time.Second)
+	})
+
+	t.Run("hard_dep_on_runonce_is_cycle", func(t *testing.T) {
+		// runOnce gates are not part of the persistent topo set, so a hard
+		// DependsOn on one is a dependency cycle by construction (use ordering,
+		// not a hard edge, to run after a gate).
+		o := New(WithLogLevel(LogLevelWarn))
+		gate := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+		_ = o.Register(gate, WithName("gate"), WithRunOnce())
+		_ = o.Register(&testSvc{}, WithName("worker"), DependsOn("gate"))
+		err := o.Start()
+		if err == nil {
+			o.Stop(time.Second)
+			t.Fatal("expected ErrDependencyCycle for a hard dep on a runOnce gate")
+		}
+		if !errors.Is(err, ErrDependencyCycle) {
+			t.Errorf("expected ErrDependencyCycle, got %v", err)
+		}
 	})
 
 	t.Run("context_canceled_is_not_an_error", func(t *testing.T) {
@@ -3849,9 +3870,9 @@ func TestSoftDep(t *testing.T) {
 	// ponytail: soft_dep_failed_aborts omitted; Start's parallel goroutine
 	// dep check races with handleServiceDone status update.
 
-	t.Run("soft_dep_runonce_stopped_aborts", func(t *testing.T) {
-		// A runOnce service transitions to StatusStopped on success.
-		// A persistent service that soft-depends on it should see it as failed/skipped.
+	t.Run("soft_dep_runonce_succeeded_passes", func(t *testing.T) {
+		// A runOnce service transitions to StatusSucceeded on success.
+		// A persistent service that soft-depends on it must start, not abort.
 		o := New(WithLogLevel(LogLevelWarn))
 		gate := &testSvc{
 			startFn: func(ctx context.Context) error { return nil },
@@ -3862,9 +3883,57 @@ func TestSoftDep(t *testing.T) {
 		_ = o.Register(gate, WithName("gate"), WithRunOnce())
 		_ = o.Register(svc, WithName("worker"), DependsOnSoft("gate"))
 		err := o.Start()
+		if err != nil {
+			o.Stop(time.Second)
+			t.Fatalf("expected no error when soft dep is a successful gate, got %v", err)
+		}
+		defer o.Stop(time.Second)
+		s, ok := o.Status("worker")
+		if !ok || s != StatusRunning {
+			t.Errorf("worker should be running behind a successful gate, got %v (ok=%v)", s, ok)
+		}
+	})
+
+	t.Run("soft_dep_skipped_gate_aborts", func(t *testing.T) {
+		// A runOnce gate whose start condition is false is skipped and left in
+		// StatusStopped (not an error, so Start proceeds); a persistent service
+		// that soft-depends on it must abort deterministically.
+		o := New(WithLogLevel(LogLevelWarn))
+		gate := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(gate, WithName("gate"), WithRunOnce(),
+			WithStartCondition(func() bool { return false }))
+		_ = o.Register(svc, WithName("worker"), DependsOnSoft("gate"))
+		err := o.Start()
 		if err == nil {
 			o.Stop(time.Second)
-			t.Fatal("expected error when soft dep is StatusStopped, got nil")
+			t.Fatal("expected error when the soft-dep gate was skipped, got nil")
+		}
+		if svc.startCalls.Load() > 0 {
+			t.Error("worker should not start when its soft-dep gate was skipped")
+		}
+	})
+
+	t.Run("soft_dep_runonce_failed_aborts", func(t *testing.T) {
+		// A soft dep on a runOnce gate that crashes must still abort the worker.
+		o := New(WithLogLevel(LogLevelWarn))
+		gate := &testSvc{
+			startFn: func(ctx context.Context) error { return errors.New("gate boom") },
+		}
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		}
+		_ = o.Register(gate, WithName("gate"), WithRunOnce())
+		_ = o.Register(svc, WithName("worker"), DependsOnSoft("gate"))
+		err := o.Start()
+		if err == nil {
+			o.Stop(time.Second)
+			t.Fatal("expected error when soft dep gate crashes, got nil")
+		}
+		if svc.startCalls.Load() > 0 {
+			t.Error("worker should not start when its soft-dep gate crashed")
 		}
 	})
 }
