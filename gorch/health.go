@@ -1,6 +1,9 @@
 package gorch
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // HealthChecker is implemented by services that can report their own health.
 // Health is called periodically by the orchestrator. A non-nil error means
@@ -53,3 +56,97 @@ func (s ServiceStatus) String() string {
 		return "unknown"
 	}
 }
+
+func (o *Orchestrator) Health() map[string]error {
+	o.mu.RLock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.RUnlock()
+
+	result := make(map[string]error, len(entries))
+	for _, e := range entries {
+		hc, ok := e.getSvc().(HealthChecker)
+		if !ok {
+			result[e.name] = nil
+			continue
+		}
+		// Per-probe deadline so a slow checker does not fail later probes.
+		probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
+		result[e.name] = hc.Health(probeCtx)
+		cancel()
+	}
+	return result
+}
+
+// RegisterFunc registers a closure-based service.
+func (o *Orchestrator) healthCheckLoop(ctx context.Context) {
+	defer o.wg.Done()
+	defer close(o.healthDone)
+	ticker := time.NewTicker(o.cfg.HealthInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			o.runHealthChecks()
+		}
+	}
+}
+
+func (o *Orchestrator) runHealthChecks() {
+	o.mu.RLock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.RUnlock()
+
+	for _, e := range entries {
+		hc, ok := e.getSvc().(HealthChecker)
+		if !ok {
+			continue
+		}
+
+		o.statusMu.RLock()
+		s := e.status
+		o.statusMu.RUnlock()
+		if s != StatusRunning {
+			continue
+		}
+
+		if o.cfg.BeforeHealthCheck != nil {
+			if err := o.cfg.BeforeHealthCheck(e.name); err != nil {
+				e.getLogger().Warn("before-health-check hook failed", "error", err.Error())
+			}
+		}
+
+		// Each probe gets a fresh per-service deadline so a slow checker does
+		// not fail all later probes with an expired context.
+		probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
+		healthErr := hc.Health(probeCtx)
+		cancel()
+		if o.cfg.AfterHealthCheck != nil {
+			o.cfg.AfterHealthCheck(e.name, healthErr)
+		}
+		failures := e.getHealthFailures()
+		if healthErr != nil {
+			failures++
+			o.metricsHealthFails.Add(1)
+			e.getLogger().Warn("health check failed", "failures", failures, "error", healthErr.Error())
+			if failures >= o.cfg.HealthThreshold && e.cfg.factory != nil {
+				e.getLogger().Error("health threshold reached, restarting service", "failures", failures)
+				e.setHealthFailures(0)
+				// Cancel the service's context → Start returns → handleServiceDone → self-heal.
+				if cancelFn := e.getCancel(); cancelFn != nil {
+					cancelFn()
+				}
+			} else {
+				e.setHealthFailures(failures)
+			}
+		} else {
+			e.setHealthFailures(0)
+		}
+	}
+}
+
+// ── Internal helpers ──
