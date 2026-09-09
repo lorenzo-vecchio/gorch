@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] — 2026-09-08
+## [0.4.0] — 2026-09-09
 
 ### Changed
 
@@ -19,8 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ServiceContext` directly instead of `context.Context`, removing the need for the
   unsafe `ctx.(gorch.ServiceContext)` assertion. `ServiceContext` embeds
   `context.Context`, so existing `<-ctx.Done()` bodies keep compiling unchanged.
-
-## [0.3.2] — 2026-09-08
 
 ### Fixed
 
