@@ -5,7 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] — 2026-09-09
+
+### Changed
+
+- **Breaking:** new `StatusSucceeded` service status. A runOnce gate whose `Start`
+  completes without error now transitions to `StatusSucceeded` (previously
+  `StatusStopped`), so a persistent service that soft-depends on a successful gate
+  starts instead of being aborted with `ErrStartAborted`. A crashed or skipped gate
+  still aborts its dependents.
+- **Breaking:** `IsReady(ctx, name)` now takes a `context.Context`; the
+  `ReadinessChecker` probe runs with a caller-supplied deadline instead of blocking
+  forever on `context.Background()`.
+- Unnamed services log under their auto-assigned `$N` name — matching
+  `Status()`/`Names()` — instead of their reflect type.
+- `go.mod` now declares `go 1.25` (no toolchain patch pin).
+
+### Fixed
+
+- A no-op `Stop()` before `Start()` no longer poisons the later `Stop`: the real
+  shutdown was silently skipped and services were left running.
+- A persistent service that fails synchronously within its start-timeout window now
+  makes `Start()` return the real error deterministically (and its dependents are
+  skipped) instead of silently succeeding. Self-heal services keep their restart
+  semantics.
+- `CronQueue` serializes ticks with a per-entry mutex instead of a spin-wait loop.
+
+### Docs
+
+- RunOnce `Stop()` contract, single-shot orchestrator lifecycle, typed request-reply
+  responder example, and reattached orphaned doc comments.
 
 ## [0.4.0] — 2026-09-09
 
