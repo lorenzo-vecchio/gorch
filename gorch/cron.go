@@ -3,7 +3,6 @@ package gorch
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/robfig/cron/v3"
 )
@@ -17,10 +16,8 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 		}
 		defer entry.running.Store(false)
 	case CronQueue:
-		for !entry.running.CompareAndSwap(false, true) {
-			time.Sleep(100 * time.Millisecond)
-		}
-		defer entry.running.Store(false)
+		entry.cronMu.Lock()
+		defer entry.cronMu.Unlock()
 	case CronParallel:
 	}
 
@@ -46,8 +43,11 @@ type CronMode int
 
 const (
 	CronParallel CronMode = iota // fire in new goroutine regardless
-	CronQueue                    // serialize: wait for previous to finish
-	CronSkip                     // drop this tick entirely
+	// CronQueue serializes ticks on a per-entry mutex: an overlapping tick
+	// blocks until the previous one finishes. robfig/cron spawns a goroutine per
+	// tick, so a long-running tick makes later ones pile up as blocked goroutines.
+	CronQueue
+	CronSkip // drop this tick entirely
 )
 
 // setupCron creates and starts the cron scheduler, registering every cron

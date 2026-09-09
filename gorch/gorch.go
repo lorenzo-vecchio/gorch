@@ -44,6 +44,8 @@ type serviceEntry struct {
 	wgDone bool // true once wg.Done() has been called for this entry
 	// CronSkip / CronQueue gate
 	running atomic.Bool
+	// CronQueue serialization lock (serialize ticks mode)
+	cronMu sync.Mutex
 }
 
 // getSvc returns the current service instance (thread-safe).
