@@ -150,5 +150,3 @@ func (l *ServiceLogger) emit(level LogLevel, msg string, args []any) {
 	default: // drop if channel full
 	}
 }
-
-// CronMode — concurrency policy when cron fires while previous invocation still runs.

@@ -619,7 +619,9 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 	return stopErr
 }
 
-// stopOneService calls Stop on a service with hooks and panic recovery.
+// Run starts the orchestrator, blocks on SIGINT/SIGTERM, then stops.
+// Returns any error from Start or aggregated errors from Stop.
+// Optional signals override the default signal set (SIGINT, SIGTERM).
 func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) error {
 	if err := o.Start(); err != nil {
 		return err
@@ -638,8 +640,7 @@ func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) erro
 	return o.Stop(stopTimeout)
 }
 
-// Status returns the current lifecycle status of a named service.
-// ok is false if no service with that name is registered.
+// RegisterFunc registers a closure-based service under the given name.
 // Thread-safe.
 func (o *Orchestrator) RegisterFunc(name string, startFn func(ctx ServiceContext) error, stopFn func() error, opts ...RegisterOption) error {
 	svc := &funcService{startFn: startFn, stopFn: stopFn}

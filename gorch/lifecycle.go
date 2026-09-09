@@ -227,10 +227,9 @@ func (o *Orchestrator) setStatusErr(entry *serviceEntry, s ServiceStatus, err er
 	}
 }
 
-// Stop gracefully shuts down the orchestrator. Waits up to timeout for services
-// to finish. Returns aggregated errors from all Stop failures, or ErrStopTimeout
-// if services don't all stop within the timeout.
-// Thread-safe. Safe to call on an orchestrator that was never started.
+// stopOneService stops a single service entry with before/after hooks and panic
+// recovery, honoring the entry's per-service stop timeout. It transitions the
+// entry Running/Starting → Stopping → Stopped.
 func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 	o.statusMu.RLock()
 	wasActive := entry.status == StatusRunning || entry.status == StatusStarting
@@ -308,9 +307,8 @@ func (o *Orchestrator) persistentEntries() []*serviceEntry {
 	return out
 }
 
-// Run starts the orchestrator, blocks on SIGINT/SIGTERM, then stops.
-// Returns any error from Start or aggregated errors from Stop.
-// Optional signals override the default signal set (SIGINT, SIGTERM).
+// runService runs a persistent service's Start to completion, recovering panics
+// and handing the exit to handleServiceDone.
 func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext) {
 	var exitErr error
 	defer func() {

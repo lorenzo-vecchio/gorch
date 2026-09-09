@@ -16,7 +16,9 @@ type Metrics struct {
 	HealthFails int64
 }
 
-// logEntry is an internal log record sent from ServiceLogger to the log-pump.
+// Status returns the current lifecycle status of a named service.
+// ok is false if no service with that name is registered.
+// Thread-safe.
 func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
 	o.mu.RLock()
 	entry, ok := o.nameIndex[name]
