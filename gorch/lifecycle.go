@@ -110,12 +110,25 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 				sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
 				exitErr = fmt.Errorf("panic: %v", r)
 			}
-			// Signal whether Start returned cleanly within the timeout window.
+			if entry.cfg.factory != nil {
+				// Self-heal: an exit (even an instant error) is handled by
+				// handleServiceDone's restart policy. Signal success before the
+				// (possibly blocking) restart logic so a start timeout never
+				// aborts Start for a service that self-heals.
+				select {
+				case startErrCh <- nil:
+				default:
+				}
+				o.handleServiceDone(entry, sc, exitErr)
+				return
+			}
+			// No self-heal: update status before signalling so a dependent's
+			// status check deterministically sees Crashed/Stopped, not Running.
+			o.handleServiceDone(entry, sc, exitErr)
 			select {
-			case startErrCh <- nil:
+			case startErrCh <- exitErr:
 			default:
 			}
-			o.handleServiceDone(entry, sc, exitErr)
 		}()
 		exitErr = entry.getSvc().Start(sc)
 		if exitErr != nil && exitErr != context.Canceled {
@@ -125,8 +138,14 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 
 	if timeout > 0 {
 		select {
-		case <-startErrCh:
-			// Start returned (possibly to handleServiceDone via defer).
+		case startErr := <-startErrCh:
+			// Start returned synchronously within the window. A real error is a
+			// start failure (status already Crashed via handleServiceDone above);
+			// a clean return or context.Canceled is not.
+			if startErr != nil && !errors.Is(startErr, context.Canceled) {
+				o.callAfterStartHook(entry, startErr)
+				return startErr
+			}
 			// The service is now in handleServiceDone.
 			o.callAfterStartHook(entry, nil)
 			return nil

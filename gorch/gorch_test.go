@@ -3325,10 +3325,11 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 // ── Dependency status check in Start (parallel level) ──
 
 func TestStart_DepStatusCheck(t *testing.T) {
+	// A fast clean Start return puts the service in StatusStopped (via
+	// handleServiceDone) BEFORE startOneService signals completion, so the
+	// dependent in the next level deterministically sees StatusStopped and is
+	// aborted — never started behind a dead dependency.
 	o := New(WithLogLevel(LogLevelWarn))
-	// A uses WithStartTimeout so startOneService waits for the goroutine's defer
-	// to send to startErrCh. With a fast Start return, there's a narrow window
-	// where the dependent's status check may or may not see StatusStopped.
 	svcA := &testSvc{startFn: func(ctx context.Context) error { return nil }}
 	svcB := &testSvc{}
 
@@ -3336,13 +3337,41 @@ func TestStart_DepStatusCheck(t *testing.T) {
 	_ = o.Register(svcB, WithName("b"), DependsOn("a"))
 
 	err := o.Start()
-	if err != nil {
-		// Race won: dep status check worked.
-		if !strings.Contains(err.Error(), "dependency") && !strings.Contains(err.Error(), "aborted") {
-			t.Errorf("unexpected error: %v", err)
-		}
-	} else {
-		o.Stop(500 * time.Millisecond)
+	if err == nil {
+		t.Fatal("expected ErrStartAborted: dependency a exited cleanly before b started")
+	}
+	if !strings.Contains(err.Error(), "aborted") && !strings.Contains(err.Error(), "dependency") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if svcB.startCalls.Load() > 0 {
+		t.Error("dependent should not start behind a stopped dependency")
+	}
+}
+
+func TestStart_InstantErrorPropagatesWithTimeout(t *testing.T) {
+	// A persistent service that errors synchronously within the start-timeout
+	// window aborts Start deterministically: the real error is returned (not
+	// swallowed) and the dependent in the next level is skipped.
+	o := New(WithLogLevel(LogLevelWarn))
+	failSvc := &testSvc{
+		startFn: func(ctx context.Context) error {
+			return errors.New("instant failure")
+		},
+	}
+	depSvc := &testSvc{}
+
+	_ = o.Register(failSvc, WithName("fail"), WithStartTimeout(500*time.Millisecond))
+	_ = o.Register(depSvc, WithName("dep"), DependsOn("fail"))
+
+	err := o.Start()
+	if err == nil {
+		t.Fatal("expected Start to return the instant error")
+	}
+	if !strings.Contains(err.Error(), "instant failure") {
+		t.Errorf("expected instant failure to propagate, got: %v", err)
+	}
+	if depSvc.startCalls.Load() > 0 {
+		t.Error("dependent should not start when a dependency fails instantly")
 	}
 }
 
@@ -4627,23 +4656,32 @@ func waitForStatus(t *testing.T, o *Orchestrator, name string, target ServiceSta
 }
 
 func TestCrashSemantics_PersistentError(t *testing.T) {
-	var crashName string
-	var crashErr error
+	crashCh := make(chan struct {
+		name string
+		err  error
+	}, 1)
 	o := New(
 		WithLogLevel(LogLevelWarn),
-		WithOnCrash(func(name string, err error) { crashName = name; crashErr = err }),
+		WithOnCrash(func(name string, err error) {
+			crashCh <- struct {
+				name string
+				err  error
+			}{name, err}
+		}),
 	)
 	_ = o.Register(&errSvc{err: errors.New("persistent boom")}, WithName("p"))
 	_ = o.Start()
 	defer o.Stop(time.Second)
 
-	waitForStatus(t, o, "p", StatusCrashed)
+	// Receiving implies the status already transitioned to Crashed (OnCrash
+	// fires only on that transition) and gives a happens-before edge.
+	crash := <-crashCh
 
-	if crashName != "p" {
-		t.Errorf("expected OnCrash for 'p', got %q", crashName)
+	if crash.name != "p" {
+		t.Errorf("expected OnCrash for 'p', got %q", crash.name)
 	}
-	if !strings.Contains(crashErr.Error(), "persistent boom") {
-		t.Errorf("expected real error in OnCrash, got %v", crashErr)
+	if !strings.Contains(crash.err.Error(), "persistent boom") {
+		t.Errorf("expected real error in OnCrash, got %v", crash.err)
 	}
 	if o.Metrics().Crashes < 1 {
 		t.Error("expected Crashes metric to increment")
@@ -4651,16 +4689,16 @@ func TestCrashSemantics_PersistentError(t *testing.T) {
 }
 
 func TestCrashSemantics_Panic(t *testing.T) {
-	var crashErr error
+	crashCh := make(chan error, 1)
 	o := New(
 		WithLogLevel(LogLevelWarn),
-		WithOnCrash(func(name string, err error) { crashErr = err }),
+		WithOnCrash(func(name string, err error) { crashCh <- err }),
 	)
 	_ = o.Register(&panicSvc{msg: "kaboom"}, WithName("p"))
 	_ = o.Start()
 	defer o.Stop(time.Second)
 
-	waitForStatus(t, o, "p", StatusCrashed)
+	crashErr := <-crashCh
 
 	if crashErr == nil {
 		t.Fatal("expected OnCrash error from panic")

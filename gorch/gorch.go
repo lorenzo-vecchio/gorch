@@ -329,7 +329,10 @@ func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bo
 
 // Start begins the orchestrator lifecycle. Returns ErrAlreadyStarted if already started.
 // If Start fails, the orchestrator is reset and may be started again (e.g. to retry
-// after a transient dependency failure). Thread-safe.
+// after a transient dependency failure).
+// A persistent service that returns an error synchronously aborts Start only when a
+// start timeout is set; without one its launch is fire-and-forget by construction.
+// Thread-safe.
 func (o *Orchestrator) Start() error {
 	o.mu.Lock()
 	if o.started {

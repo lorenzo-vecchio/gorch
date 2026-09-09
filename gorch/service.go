@@ -102,6 +102,10 @@ func DependsOn(names ...string) RegisterOption {
 // WithStartTimeout sets the maximum time to wait for this service's Start
 // to return. Overrides Config.DefaultStartTimeout. A zero duration means no
 // timeout (use with caution).
+// With a timeout, a synchronous error from a persistent service's Start aborts
+// the whole orchestrator Start (deterministic failure); without one the launch
+// is fire-and-forget. Self-heal services are never aborted this way: an exit is
+// handled by their restart policy.
 func WithStartTimeout(d time.Duration) RegisterOption {
 	return func(cfg *registerConfig) {
 		cfg.startTimeout = d
