@@ -2505,6 +2505,26 @@ func TestStopStartedServices_UsedDuringStartupFailure(t *testing.T) {
 	}
 }
 
+// TestStopStartedServices_StopsRunningService deterministically exercises the
+// safeStop branch of stopStartedServices: a running level-0 service is stopped
+// when a later level fails to start.
+func TestStopStartedServices_StopsRunningService(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	a := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	_ = o.Register(a, WithName("a"))
+	_ = o.Register(&testSvc{}, WithName("b"), DependsOn("a"),
+		WithOnBeforeStart(func(name string) error { return errors.New("b cannot start") }))
+
+	err := o.Start()
+	if err == nil {
+		o.Stop(time.Second)
+		t.Fatal("expected Start to fail")
+	}
+	if a.stopCalls.Load() < 1 {
+		t.Error("running service 'a' should be stopped during startup failure")
+	}
+}
+
 // ── Health ──
 
 func TestHealth_NonHealthChecker_ReportsNil(t *testing.T) {
