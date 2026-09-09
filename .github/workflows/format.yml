@@ -12,5 +12,6 @@ jobs:
           go-version: '1.25'
       - run: gofmt -w .
       - uses: stefanzweifel/git-auto-commit-action@v7
+        if: github.event_name != 'pull_request'
         with:
           commit_message: "chore: gofmt"

@@ -1,11 +1,21 @@
 # gorch — Go Orchestrator Library
 
 ## Structure rules
-- **One concept per file.** `service.go` for types/interfaces, `gorch.go` for the orchestrator implementation. If a file passes ~400 lines, split by concern.
+- **One concept per file.** If a file passes ~400 lines, split by concern. Current layout:
+  - `gorch.go` — `Orchestrator` struct, `New`, `Register`, `Start`, `Stop`, `Run`
+  - `config.go` — orchestrator `config` + `Option` functions
+  - `service.go` — `Service`, `ServiceContext`, `registerConfig` + options, sentinel errors, `funcService`
+  - `lifecycle.go` — start/stop/hooks/self-heal internals
+  - `cron.go` — `CronMode`, cron setup, `invokeCron`
+  - `health.go` — checker interfaces, health loop
+  - `status.go` — status introspection, `WaitFor`, `Metrics`, `topoSort`
+  - `log.go` — `LogLevel`, `ServiceLogger`, log-pump
+  - `messenger.go` — pub-sub / request-reply
+  - `typed.go` — typed messaging; `backoff.go` — backoff strategies
 - **Tests alongside code.** `service_test.go` and `gorch_test.go` in the same `gorch/` package.
 - **No package-level globals** except sentinel errors. Everything lives on structs.
 - **Exported API first**, unexported helpers at the bottom of each file.
-- **Functional options pattern** for configuration — never a config struct with 12 fields.
+- **Functional options pattern** for configuration — `New(opts ...Option)`, never a config struct with 12 fields.
 - **Interfaces are small.** The `Service` interface has exactly 2 methods (`Start`, `Stop`). Don't bloat it.
 
 ## Code quality

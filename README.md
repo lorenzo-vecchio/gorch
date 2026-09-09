@@ -63,7 +63,7 @@ import (
 
 type MyService struct{}
 
-func (s *MyService) Start(ctx context.Context) error {
+func (s *MyService) Start(ctx gorch.ServiceContext) error {
     <-ctx.Done()
     return nil
 }
@@ -71,7 +71,7 @@ func (s *MyService) Start(ctx context.Context) error {
 func (s *MyService) Stop() error { return nil }
 
 func main() {
-    orch := gorch.New(gorch.Config{LogLevel: gorch.LogLevelInfo})
+    orch := gorch.New(gorch.WithLogLevel(gorch.LogLevelInfo))
     orch.Register(&MyService{})
 
     // Blocks until SIGINT/SIGTERM, then stops gracefully.
@@ -87,32 +87,34 @@ func main() {
 
 ```go
 type Service interface {
-    Start(ctx context.Context) error
+    Start(ctx gorch.ServiceContext) error
     Stop() error
 }
 ```
 
-`ServiceContext` (the `ctx` passed to `Start`) embeds `context.Context` and carries a `*ServiceLogger` and `*Messenger`.
+`ServiceContext` (the `ctx` passed to `Start`) embeds `context.Context` and carries a `*ServiceLogger` and `*Messenger`. Existing `<-ctx.Done()` / `ctx.Err()` bodies keep working unchanged.
 
 ### Orchestrator
 
 ```go
-orch := gorch.New(gorch.Config{
-    LogLevel:            gorch.LogLevelInfo,
-    DefaultStartTimeout: 5 * time.Second,
-})
+orch := gorch.New(
+    gorch.WithLogLevel(gorch.LogLevelInfo),
+    gorch.WithDefaultStartTimeout(5 * time.Second),
+)
 orch.Register(svc, gorch.WithCron("@every 5s", gorch.CronSkip))
 orch.Register(svc, gorch.WithSelfHeal(func() gorch.Service { return &MyService{} }))
 orch.Start()
 orch.Stop(10 * time.Second)
 ```
 
+Configuration uses functional options. `New()` with no options uses the defaults (Info log level, health checks every 30s with a 5s probe timeout).
+
 ### Run() convenience
 
-`Run` starts the orchestrator, blocks until a signal is received (SIGINT by default, configurable via variadic signals), then stops.
+`Run` starts the orchestrator, blocks until a signal is received (SIGINT and SIGTERM by default, configurable via variadic signals), then stops.
 
 ```go
-// Default: waits for SIGINT.
+// Default: waits for SIGINT or SIGTERM.
 orch.Run(10 * time.Second)
 
 // Custom signals.
@@ -135,7 +137,7 @@ orch.Register(apiSvc,  gorch.WithName("api"), gorch.DependsOn("db", "cache"))
 Per-service start deadline, with a config-level default.
 
 ```go
-orch := gorch.New(gorch.Config{DefaultStartTimeout: 5 * time.Second})
+orch := gorch.New(gorch.WithDefaultStartTimeout(5 * time.Second))
 orch.Register(svc, gorch.WithStartTimeout(30 * time.Second)) // per-service override
 ```
 
@@ -168,18 +170,18 @@ orch.Register(migrator, gorch.WithRunOnce())
 
 ### Lifecycle hooks
 
-Global hooks on `Config`, or per-service overrides via `RegisterOption`.
+Global hooks are set via functional options, or per-service via `RegisterOption`.
 
 ```go
-orch := gorch.New(gorch.Config{
-    OnBeforeStart: func(name string) error {
+orch := gorch.New(
+    gorch.WithGlobalOnBeforeStart(func(name string) error {
         log.Printf("starting %s", name)
         return nil
-    },
-    OnAfterStop: func(name string, err error) {
+    }),
+    gorch.WithGlobalOnAfterStop(func(name string, err error) {
         log.Printf("stopped %s, err=%v", name, err)
-    },
-})
+    }),
+)
 
 // Per-service override:
 orch.Register(svc, gorch.WithOnBeforeStart(func(name string) error {
@@ -219,12 +221,16 @@ type HealthChecker interface {
     Health(ctx context.Context) error
 }
 
-orch := gorch.New(gorch.Config{
-    HealthInterval:  30 * time.Second,  // how often to probe (0 disables)
-    HealthTimeout:   5 * time.Second,   // per-probe deadline
-    HealthThreshold: 3,                // consecutive failures before restart
-})
+orch := gorch.New(
+    gorch.WithHealthChecks(30*time.Second, 5*time.Second, 3),
+    // interval, per-probe timeout, consecutive failures before restart
+)
+
+// Or disable the health-check loop entirely:
+orch := gorch.New(gorch.WithHealthChecksDisabled())
 ```
+
+> **Note:** automatic restart on health failure requires `WithSelfHeal` (a factory to create a fresh instance). Without a factory, health failures are only logged and counted in `Metrics().HealthFails`.
 
 Manual health check:
 
@@ -294,17 +300,15 @@ The built-in log-pump writes to `os.Stderr`. Log level filters entries: `Debug <
 
 #### Custom logger
 
-Inject any logger that satisfies the `Logger` interface via `Config.Logger`. `*slog.Logger` from the standard library satisfies this interface directly.
+Inject any logger that satisfies the `Logger` interface via `WithLogger`. `*slog.Logger` from the standard library satisfies this interface directly.
 
 ```go
 import "log/slog"
 
-orch := gorch.New(gorch.Config{
-    Logger: slog.Default(),
-})
+orch := gorch.New(gorch.WithLogger(slog.Default()))
 ```
 
-When a custom logger is set, the built-in log-pump is disabled entirely. The service name is prepended as `"service"=<name>` to every log call so the custom logger can include or exclude it as needed. `Config.LogLevel` is ignored — the custom logger manages its own level filtering.
+When a custom logger is set, the built-in log-pump is disabled entirely. The service name is prepended as `"service"=<name>` to every log call so the custom logger can include or exclude it as needed. `WithLogLevel` is ignored — the custom logger manages its own level filtering.
 
 ```go
 // With slog, the service name appears as a structured key-value pair:
@@ -385,14 +389,14 @@ if orch.IsReady("api") {
 `OnStateChange` fires on every status transition. `OnCrash` fires specifically on `Running -> Crashed`. Wire these to Prometheus counters, Slack webhooks, or a status page instead of polling.
 
 ```go
-orch := gorch.New(gorch.Config{
-    OnStateChange: func(name string, from, to gorch.ServiceStatus) {
+orch := gorch.New(
+    gorch.WithOnStateChange(func(name string, from, to gorch.ServiceStatus) {
         log.Printf("%s: %s -> %s", name, from, to)
-    },
-    OnCrash: func(name string, err error) {
+    }),
+    gorch.WithOnCrash(func(name string, err error) {
         notifications.Send(name + " crashed")
-    },
-})
+    }),
+)
 ```
 
 ### WaitFor
@@ -405,7 +409,7 @@ err := orch.WaitFor("db", gorch.StatusRunning, 10*time.Second)
 
 ### Typed Request-Reply
 
-`TypedRequest` provides type-safe request-reply without falling back to the untyped `Message` API.
+`TypedRequest` provides type-safe request-reply without falling back to the untyped `Message` API. Pair it with `TypedSubscribeRequest` (decodes requests into a `TypedEnvelope` carrying the value and `ReplyTopic`) and `TypedRespond` (encodes and publishes the reply).
 
 ```go
 type CreateOrderReq struct {
@@ -417,18 +421,23 @@ type CreateOrderResp struct {
     Status  string
 }
 
+// Responder (inside a service goroutine):
+reqCh, unsub := gorch.TypedSubscribeRequest[CreateOrderReq](messenger, "orders.create")
+defer unsub()
+go func() {
+    for env := range reqCh {
+        result := processOrder(env.Value)
+        gorch.TypedRespond(messenger, result, env.ReplyTopic)
+    }
+}()
+
 // Requestor:
 resp, err := gorch.TypedRequest[CreateOrderReq, CreateOrderResp](
     messenger, ctx, req, "orders.create",
 )
-
-// Responder (inside a service goroutine via TypedSubscribe):
-ch, _ := gorch.TypedSubscribe[CreateOrderReq](messenger, "orders.create")
-for msg := range ch {
-    result := processOrder(msg)
-    gorch.TypedPublish(messenger, result, "orders.results")
-}
 ```
+
+No manual gob encoding is required anywhere in user code.
 
 ### Metrics
 
@@ -491,18 +500,18 @@ ch, unsub := messenger.SubscribeWithBuffer("high-throughput", 256)
 `BeforeHealthCheck` and `AfterHealthCheck` provide instrumentation points around every health probe without wrapping every `HealthChecker`.
 
 ```go
-orch := gorch.New(gorch.Config{
-    HealthInterval:  30 * time.Second,
-    BeforeHealthCheck: func(name string) error {
+orch := gorch.New(
+    gorch.WithHealthChecks(30*time.Second, 5*time.Second, 3),
+    gorch.WithBeforeHealthCheck(func(name string) error {
         metrics.Inc("health_checks_total")
         return nil
-    },
-    AfterHealthCheck: func(name string, err error) {
+    }),
+    gorch.WithAfterHealthCheck(func(name string, err error) {
         if err != nil {
             metrics.Inc("health_checks_failed")
         }
-    },
-})
+    }),
+)
 ```
 
 ### Drain and Done
