@@ -533,6 +533,8 @@ case <-time.After(10 * time.Second):
 
 - [`examples/basic/`](examples/basic/) — Service lifecycle, cron scheduling, graceful shutdown.
 - [`examples/pubsub/`](examples/pubsub/) — Inter-service messaging with topics.
+- [`examples/typedreq/`](examples/typedreq/) — Typed request-reply via `TypedRequest`/`TypedRespond`.
+- [`examples/advanced/`](examples/advanced/) — Groups, labels, hooks, health checks, and more.
 
 ## Development
 
