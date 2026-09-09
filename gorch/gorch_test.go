@@ -1813,10 +1813,10 @@ func TestRunService_Normal(t *testing.T) {
 	})
 }
 
-// ── Service type name in log output ──
+// ── Service name in log output ──
 
 func TestServiceNameInLogger(t *testing.T) {
-	t.Run("service_type_is_used_as_logger_name", func(t *testing.T) {
+	t.Run("auto_name_matches_status_name", func(t *testing.T) {
 		r, w, _ := os.Pipe()
 		old := os.Stderr
 		os.Stderr = w
@@ -1833,8 +1833,10 @@ func TestServiceNameInLogger(t *testing.T) {
 		os.Stderr = old
 
 		output := buf.String()
-		if !strings.Contains(output, "*gorch.panicSvc") {
-			t.Errorf("expected '*gorch.panicSvc' in log, got: %s", output)
+		// An unnamed service logs under its auto-assigned "$N" name, the same
+		// name Status()/Names() report, not its reflect type.
+		if !strings.Contains(output, "$1 ---") {
+			t.Errorf("expected '$1' log prefix matching the status name, got: %s", output)
 		}
 	})
 }

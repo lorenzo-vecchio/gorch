@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"time"
 )
 
@@ -437,15 +436,11 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	newSvc := entry.cfg.factory()
 	entry.setSvc(newSvc)
 
-	// Update logger for the new instance.
-	svcName := entry.name
-	if svcName == "" || svcName[0] == '$' {
-		svcName = reflect.TypeOf(newSvc).String()
-	}
+	// Update logger for the new instance (same name as at registration).
 	if o.cfg.Logger != nil {
-		entry.setLogger(newServiceLoggerWith(svcName, o.cfg.Logger))
+		entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
 	} else {
-		entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit, o.cfg.LogLevel))
+		entry.setLogger(newServiceLogger(entry.name, o.logCh, o.logQuit, o.cfg.LogLevel))
 	}
 	entry.setStableSince(time.Now())
 

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -362,18 +361,13 @@ func (o *Orchestrator) Start() error {
 			o.logPumpDone = make(chan struct{})
 		}
 
-		// Assign loggers: use cfg.name if WithName was set, else reflect type.
+		// Assign loggers keyed by the service name (WithName or auto "$N"), so
+		// log output correlates with Status/name lookups.
 		for _, entry := range o.entries {
-			svcName := entry.name
-			// ponytail: if user didn't set WithName, the name is auto "$N".
-			// Use reflect type for logging to keep backward compat.
-			if svcName == "" || svcName[0] == '$' {
-				svcName = reflect.TypeOf(entry.getSvc()).String()
-			}
 			if o.cfg.Logger != nil {
-				entry.setLogger(newServiceLoggerWith(svcName, o.cfg.Logger))
+				entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
 			} else {
-				entry.setLogger(newServiceLogger(svcName, o.logCh, o.logQuit, o.cfg.LogLevel))
+				entry.setLogger(newServiceLogger(entry.name, o.logCh, o.logQuit, o.cfg.LogLevel))
 			}
 		}
 
