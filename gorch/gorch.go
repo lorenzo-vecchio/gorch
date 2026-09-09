@@ -654,5 +654,3 @@ func (o *Orchestrator) RegisterFunc(name string, startFn func(ctx ServiceContext
 	allOpts = append(allOpts, opts...)
 	return o.Register(svc, allOpts...)
 }
-
-// IsReady reports whether a named service is running and ready to serve.

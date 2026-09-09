@@ -379,7 +379,7 @@ type ReadinessChecker interface {
 }
 
 // On the orchestrator:
-if orch.IsReady("api") {
+if orch.IsReady(ctx, "api") {
     // route traffic
 }
 ```

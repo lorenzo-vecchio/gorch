@@ -71,7 +71,11 @@ func (o *Orchestrator) Count() int {
 // Returns a map of service name to error (nil = healthy).
 // Services that don't implement HealthChecker are reported as nil.
 // Thread-safe.
-func (o *Orchestrator) IsReady(name string) bool {
+// IsReady reports whether a named service is running and ready to serve.
+// The ReadinessChecker probe (if any) runs with the given ctx, so callers can
+// bound how long they wait (e.g. IsReady(ctx, name) with a deadline context).
+// Thread-safe.
+func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
 	o.mu.RLock()
 	entry, ok := o.nameIndex[name]
 	o.mu.RUnlock()
@@ -88,7 +92,7 @@ func (o *Orchestrator) IsReady(name string) bool {
 	if !ok {
 		return true
 	}
-	return rc.Ready(context.Background()) == nil
+	return rc.Ready(ctx) == nil
 }
 
 // StartGroup starts all services in the named group in topological order.

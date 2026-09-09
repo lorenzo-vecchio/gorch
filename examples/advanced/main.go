@@ -246,7 +246,7 @@ func main() {
 	// Readiness is separate from running status: a service can be Running
 	// but still warming up. Poll IsReady until it reports ready.
 	fmt.Println("=== waiting for api-server readiness ===")
-	for !orch.IsReady("api-server") {
+	for !orch.IsReady(context.Background(), "api-server") {
 		time.Sleep(50 * time.Millisecond)
 	}
 	fmt.Println("api-server reports ready")
