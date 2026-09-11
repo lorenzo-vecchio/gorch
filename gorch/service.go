@@ -214,12 +214,13 @@ func WithStartCondition(fn func() bool) RegisterOption {
 
 // Sentinel errors
 var (
-	ErrAlreadyStarted  = errors.New("gorch: orchestrator already started")
-	ErrInvalidCron     = errors.New("gorch: invalid cron expression")
-	ErrStopTimeout     = errors.New("gorch: stop timed out waiting for services")
-	ErrDuplicateName   = errors.New("gorch: duplicate service name")
-	ErrDependencyCycle = errors.New("gorch: dependency cycle detected")
-	ErrStartAborted    = errors.New("gorch: start aborted due to dependency failure")
+	ErrAlreadyStarted    = errors.New("gorch: orchestrator already started")
+	ErrInvalidCron       = errors.New("gorch: invalid cron expression")
+	ErrStopTimeout       = errors.New("gorch: stop timed out waiting for services")
+	ErrDuplicateName     = errors.New("gorch: duplicate service name")
+	ErrDependencyCycle   = errors.New("gorch: dependency cycle detected")
+	ErrStartAborted      = errors.New("gorch: start aborted due to dependency failure")
+	ErrUnsupportedOption = errors.New("gorch: unsupported option combination")
 )
 
 // funcService wraps closures as a Service. Used by RegisterFunc.

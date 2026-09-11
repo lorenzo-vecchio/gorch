@@ -231,6 +231,32 @@ func TestRegister(t *testing.T) {
 	})
 }
 
+func TestRegister_UnsupportedSelfHealCombination(t *testing.T) {
+	factory := func() Service { return &namedSvc{name: "healed"} }
+
+	t.Run("cron", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		err := o.Register(&namedSvc{name: "a"}, WithCron("* * * * * *", CronParallel), WithSelfHeal(factory))
+		if !errors.Is(err, ErrUnsupportedOption) {
+			t.Fatalf("expected ErrUnsupportedOption, got %v", err)
+		}
+		if o.Count() != 0 {
+			t.Errorf("rejected service must not be registered, got count %d", o.Count())
+		}
+	})
+
+	t.Run("runOnce", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		err := o.Register(&namedSvc{name: "a"}, WithRunOnce(), WithSelfHeal(factory))
+		if !errors.Is(err, ErrUnsupportedOption) {
+			t.Fatalf("expected ErrUnsupportedOption, got %v", err)
+		}
+		if o.Count() != 0 {
+			t.Errorf("rejected service must not be registered, got count %d", o.Count())
+		}
+	})
+}
+
 // ── Register edge cases ──
 
 func TestRegister_DuplicateName(t *testing.T) {

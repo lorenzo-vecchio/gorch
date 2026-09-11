@@ -233,6 +233,13 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 		opt(&cfg)
 	}
 
+	// Self-heal is only wired into the persistent-service path. A cron tick and a
+	// runOnce gate never consume the factory, so reject the combination instead
+	// of silently ignoring it.
+	if cfg.factory != nil && (cfg.cronSpec != "" || cfg.runOnce) {
+		return fmt.Errorf("%w: WithSelfHeal cannot be combined with WithCron or WithRunOnce", ErrUnsupportedOption)
+	}
+
 	// Auto-name if no WithName set.
 	o.autoSeq++
 	if cfg.name == "" {
