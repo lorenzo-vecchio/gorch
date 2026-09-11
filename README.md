@@ -68,6 +68,36 @@ Service implementations are responsible for their own internal concurrency:
 `Start` runs in its own goroutine and `Stop` may be called from another after
 context cancellation.
 
+## Contract
+
+These guarantees are part of the public API and are relied upon by callers.
+
+- **Wire format is gob.** `encoding/gob` is the serialization format for typed
+  messages and request-reply payloads. It is public contract: types passed
+  through `TypedPublish`/`TypedSubscribe`/`TypedRequest`/`TypedRespond` must be
+  gob-compatible, and changing a field layout is a breaking change.
+- **`Publish` is drop-only.** Delivery is best-effort. When a subscriber's
+  channel is full the message is dropped for that subscriber; gorch never blocks
+  the publisher and never replays dropped messages.
+- **Lifecycle is single-shot.** After a successful `Stop`, neither `Start` nor
+  `Register` can be used again; both return `ErrAlreadyStarted`. A failed
+  `Start` does not consume the lifecycle and may be retried.
+- **Errors are aggregated.** `Start` and `Stop` join every failure with
+  `errors.Join`, so a single call reports all causes, not just the first. Use
+  `errors.Is`/`errors.As` to inspect them.
+
+Sentinel errors returned by the orchestrator:
+
+| Error | Returned by | Meaning |
+|-------|-------------|---------|
+| `ErrAlreadyStarted` | `Register`, `Start` | Called after the orchestrator already started (or was stopped). |
+| `ErrDuplicateName` | `Register` | Two services share a `WithName`. |
+| `ErrDependencyCycle` | `Register`, `Start` | A hard or soft dependency chain loops. |
+| `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
+| `ErrInvalidCron` | `Start` | A `WithCron` spec is invalid. |
+| `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
+| `ErrStopTimeout` | `Stop` | Services did not stop within the caller's timeout. |
+
 ## Quick start
 
 ```go
