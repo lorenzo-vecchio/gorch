@@ -1098,7 +1098,7 @@ func TestSelfHeal_CustomBackoff(t *testing.T) {
 func TestSelfHeal_ConcurrentHealthProbe(t *testing.T) {
 	o := New(
 		WithLogLevel(LogLevelWarn),
-		WithHealthChecks(5*time.Millisecond, 100*time.Millisecond, 3),
+		WithHealthChecks(5*time.Millisecond, WithProbeTimeout(100*time.Millisecond), WithFailureThreshold(3)),
 	)
 
 	mk := func() Service {
@@ -2642,7 +2642,7 @@ func TestHealth_NoEntries(t *testing.T) {
 
 func TestRunHealthChecks_FailuresTracked(t *testing.T) {
 	// ponytail: set up entry manually to avoid the health-check loop.
-	o := New(WithHealthChecks(0, 0, 3))
+	o := New(WithHealthChecks(0, WithFailureThreshold(3)))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "sick",
@@ -2663,7 +2663,7 @@ func TestRunHealthChecks_FailuresTracked(t *testing.T) {
 }
 
 func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
-	o := New(WithHealthChecks(0, 0, 3))
+	o := New(WithHealthChecks(0, WithFailureThreshold(3)))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "healthy",
@@ -2685,7 +2685,7 @@ func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
 func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
 	// A slow checker that consumes its whole deadline must not fail a later
 	// instant checker: each probe gets a fresh per-service timeout.
-	o := New(WithHealthChecks(0, 50*time.Millisecond, 0))
+	o := New(WithHealthChecks(0, WithProbeTimeout(50*time.Millisecond)))
 	logCh := make(chan logEntry, 1)
 	slow := &serviceEntry{
 		name: "slow",
@@ -2726,7 +2726,7 @@ func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
 }
 
 func TestHealth_PerProbeTimeout(t *testing.T) {
-	o := New(WithLogLevel(LogLevelWarn), WithHealthChecks(0, 50*time.Millisecond, 0))
+	o := New(WithLogLevel(LogLevelWarn), WithHealthChecks(0, WithProbeTimeout(50*time.Millisecond)))
 	slow := &healthSvc{healthFn: func(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
@@ -2755,7 +2755,7 @@ func TestHealth_PerProbeTimeout(t *testing.T) {
 }
 
 func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
-	o := New(WithHealthChecks(0, 0, 3))
+	o := New(WithHealthChecks(0, WithFailureThreshold(3)))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "registered",
@@ -2776,7 +2776,7 @@ func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
 func TestRunHealthChecks_ThresholdTriggersRestart(t *testing.T) {
 	o := New(
 		WithLogLevel(LogLevelWarn),
-		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 2),
+		WithHealthChecks(50*time.Millisecond, WithProbeTimeout(500*time.Millisecond), WithFailureThreshold(2)),
 	)
 	var factoryCalls atomic.Int32
 
@@ -2813,7 +2813,7 @@ func TestRunHealthChecks_ThresholdTriggersRestart(t *testing.T) {
 }
 
 func TestRunHealthChecks_ThresholdWithoutSelfHeal(t *testing.T) {
-	o := New(WithHealthChecks(0, 0, 2))
+	o := New(WithHealthChecks(0, WithFailureThreshold(2)))
 	logCh := make(chan logEntry, 1)
 	entry := &serviceEntry{
 		name:   "sick",
@@ -3261,7 +3261,7 @@ func TestStop_CronAndRunOnceStopErrors(t *testing.T) {
 }
 
 func TestRunHealthChecks_NonHealthCheckerSkipped(t *testing.T) {
-	o := New(WithHealthChecks(0, 0, 3))
+	o := New(WithHealthChecks(0, WithFailureThreshold(3)))
 	logCh := make(chan logEntry, 1)
 	// Add a non-HealthChecker entry alongside a HealthChecker entry.
 	e1 := &serviceEntry{
@@ -4440,7 +4440,7 @@ func TestMetrics_Restarts(t *testing.T) {
 func TestMetrics_HealthFails(t *testing.T) {
 	o := New(
 		WithLogLevel(LogLevelWarn),
-		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 10), // high threshold to avoid restart
+		WithHealthChecks(50*time.Millisecond, WithProbeTimeout(500*time.Millisecond), WithFailureThreshold(10)), // high threshold to avoid restart
 	)
 	svc := &healthSvc{
 		testSvc: testSvc{
@@ -4522,7 +4522,7 @@ func TestValidate(t *testing.T) {
 
 func TestHealthCheckHooks(t *testing.T) {
 	o := New(
-		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 3),
+		WithHealthChecks(50*time.Millisecond, WithProbeTimeout(500*time.Millisecond), WithFailureThreshold(3)),
 		WithBeforeHealthCheck(func(name string) error {
 			return nil
 		}),
@@ -4553,7 +4553,7 @@ func TestBeforeHealthCheckHookError(t *testing.T) {
 	os.Stderr = w
 
 	o := New(
-		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 3),
+		WithHealthChecks(50*time.Millisecond, WithProbeTimeout(500*time.Millisecond), WithFailureThreshold(3)),
 		WithBeforeHealthCheck(func(name string) error {
 			return errors.New("before-health error")
 		}),
@@ -4584,7 +4584,7 @@ func TestBeforeHealthCheckHookError(t *testing.T) {
 func TestAfterHealthCheckHook(t *testing.T) {
 	var lastErr error
 	o := New(
-		WithHealthChecks(50*time.Millisecond, 500*time.Millisecond, 3),
+		WithHealthChecks(50*time.Millisecond, WithProbeTimeout(500*time.Millisecond), WithFailureThreshold(3)),
 		WithAfterHealthCheck(func(name string, err error) {
 			lastErr = err
 		}),

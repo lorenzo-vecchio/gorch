@@ -222,7 +222,9 @@ type HealthChecker interface {
 }
 
 orch := gorch.New(
-    gorch.WithHealthChecks(30*time.Second, 5*time.Second, 3),
+    gorch.WithHealthChecks(30*time.Second,
+        gorch.WithProbeTimeout(5*time.Second),
+        gorch.WithFailureThreshold(3)),
     // interval, per-probe timeout, consecutive failures before restart
 )
 
@@ -501,7 +503,9 @@ ch, unsub := messenger.SubscribeWithBuffer("high-throughput", 256)
 
 ```go
 orch := gorch.New(
-    gorch.WithHealthChecks(30*time.Second, 5*time.Second, 3),
+    gorch.WithHealthChecks(30*time.Second,
+        gorch.WithProbeTimeout(5*time.Second),
+        gorch.WithFailureThreshold(3)),
     gorch.WithBeforeHealthCheck(func(name string) error {
         metrics.Inc("health_checks_total")
         return nil

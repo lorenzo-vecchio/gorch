@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `Register` now returns `ErrUnsupportedOption` when `WithSelfHeal`
   is combined with `WithCron` or `WithRunOnce`. Both paths never consumed the
   factory, so the option was silently ignored before.
+- **Breaking:** `WithHealthChecks(interval, timeout, threshold)` is now
+  `WithHealthChecks(interval time.Duration, opts ...HealthCheckOption)`; set the
+  probe timeout and failure threshold with `WithProbeTimeout` and
+  `WithFailureThreshold`. The two adjacent durations could be swapped silently.
 
 ## [0.5.0] — 2026-09-09
 

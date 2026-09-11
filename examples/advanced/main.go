@@ -142,7 +142,7 @@ func main() {
 	// Orchestrator with hooks. Health checks run every 2s (demo pace).
 	orch := gorch.New(
 		gorch.WithLogLevel(gorch.LogLevelDebug),
-		gorch.WithHealthChecks(2*time.Second, time.Second, 2),
+		gorch.WithHealthChecks(2*time.Second, gorch.WithProbeTimeout(time.Second), gorch.WithFailureThreshold(2)),
 		// No global start timeout — persistent services block in Start().
 		// Use WithStartTimeout per-service for one-shot init tasks.
 

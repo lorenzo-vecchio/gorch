@@ -62,14 +62,33 @@ func WithDefaultStartTimeout(d time.Duration) Option {
 	return func(c *config) { c.DefaultStartTimeout = d }
 }
 
-// WithHealthChecks enables periodic health checks with the given interval,
-// per-probe timeout, and consecutive-failure threshold. Zero values fall back
-// to the defaults (30s interval, 5s timeout, threshold 3).
-func WithHealthChecks(interval, timeout time.Duration, threshold int) Option {
+// HealthCheckOption refines the periodic health-check loop configured by
+// WithHealthChecks. It exists so the probe timeout and failure threshold cannot
+// be swapped by position at the call site.
+type HealthCheckOption func(*config)
+
+// WithProbeTimeout sets the per-probe deadline for each health check.
+// Zero falls back to the default (5s).
+func WithProbeTimeout(d time.Duration) HealthCheckOption {
+	return func(c *config) { c.HealthTimeout = d }
+}
+
+// WithFailureThreshold sets how many consecutive probe failures are tolerated
+// before a self-healing service is restarted. Zero falls back to the default (3).
+func WithFailureThreshold(n int) HealthCheckOption {
+	return func(c *config) { c.HealthThreshold = n }
+}
+
+// WithHealthChecks enables periodic health checks at the given interval.
+// The probe timeout and failure threshold default to 5s and 3; override them
+// with WithProbeTimeout and WithFailureThreshold. An interval of zero enables
+// the loop at the default 30s. Use WithHealthChecksDisabled to turn it off.
+func WithHealthChecks(interval time.Duration, opts ...HealthCheckOption) Option {
 	return func(c *config) {
 		c.HealthInterval = interval
-		c.HealthTimeout = timeout
-		c.HealthThreshold = threshold
+		for _, opt := range opts {
+			opt(c)
+		}
 	}
 }
 
