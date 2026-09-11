@@ -1,130 +1,104 @@
 # gorch — Roadmap verso la v1.0
 
-Checklist operativa derivata dalla revisione post-v0.5.0.
+Checklist operativa derivata dalla revisione post-v0.5.0, con stato al 2026-09-11.
 
 Convenzioni:
-- **1 task = 1 commit**, messaggio conventional in italiano (`docs(...)`, `feat(...)`, `test(...)`, `ci(...)`, `refactor(...)`).
-- Niente nuove feature prima della 1.0. Le idee nuove finiscono in `IDEAS.md`, non in codice.
+- **1 task = 1 commit**, messaggio conventional in italiano.
+- Niente nuove feature prima della 1.0. Le idee nuove finiscono in `IDEAS.md`.
 - Ogni task dichiara: file toccati, criterio di done, comando di verifica.
+
+## Decisioni prese
+
+- **3.2 Potatura API — keep per tutte e tre.** `WithLabel`/`StatusesByLabel`
+  (labels), `WithGroup`/`StartGroup`/`StopGroup`/`StatusesByGroup`, e l'untyped
+  `Request`/`RequestAsync` restano: sono testati al 100%, documentati e non hanno
+  costo di manutenzione misurabile. Tagliarli romperebbe i consumatori esistenti
+  senza un guadagno concreto. Nessuna deprecazione da scrivere.
+- **2.5 Gate coverage — resta al 100%, solo sui tag.** `test-and-publish.yml`
+  gira su `v*`/`workflow_dispatch`, non su ogni push, come da indicazione.
+- **2.4 Fire-and-forget senza timeout — rinviata al dogfooding.** Il fix (wait su
+  `Starting` nel check delle dipendenze) è pronto ma non applicato senza prova.
 
 ## Stato verificato (2026-09-11)
 
-- Modulo `github.com/lorenzo-vecchio/gorch`, package in `gorch/` → import path effettivo `github.com/lorenzo-vecchio/gorch/gorch`.
-- `format.yml`: `gofmt -w .` + auto-commit su ogni push.
-- `test-and-publish.yml`: build + `go test ./gorch/ -race -coverprofile` + gate coverage 100% + `go vet`, ma **solo su tag `v*` o `workflow_dispatch`** (il gate è già "solo sui tag").
-- `WithSelfHeal` su servizio cron: la factory è salvata in `registerConfig` ma letta solo in `lifecycle.go` e `health.go`; `cron.go` non la usa e `Register` non la valida → **silenziosamente ignorata** (confermato).
-- `doc.go`: assente.
-- Feature candidate alla potatura: labels, `StartGroup`/`StopGroup` (`status.go:101`, `status.go:126`), untyped `Request`/`RequestAsync` (`messenger.go:93`, `messenger.go:122`).
-- `WithHealthChecks(interval, timeout, threshold)` con 3 parametri posizionali (`config.go:68`).
+- Import path **appiattito**: `github.com/lorenzo-vecchio/gorch` (il package non
+  è più in `gorch/`). Modulo e package coincidono.
+- CI: `format.yml` (gofmt + auto-commit), `lint.yml` (golangci-lint v2 su ogni
+  push/PR), `test-and-publish.yml` (build + `go test . -race` + gate coverage
+  100% + vet, solo su tag `v*`).
+- `WithSelfHeal` su cron o runOnce non è più ignorato: `Register` ritorna
+  `ErrUnsupportedOption`.
+- `doc.go` presente; README ha Concurrency, Contract, Compatibility & versioning.
 
 ---
 
-## Fase 1 — Adesso (alto valore, poco sforzo)
+## Fase 1 — Adesso
 
-### 1.1 Dogfooding strutturato
-- [ ] Usare la libreria nel monitoring project come oggi.
-- [ ] Ogni workaround imposto dalla libreria → una voce in un file privato/issue (non in repo pubblico).
+### 1.1 Dogfooding strutturato — **in corso (time-based)**
+- [ ] Usare la libreria nel monitoring project.
+- [ ] Ogni workaround imposto dalla libreria → una voce in un file privato/issue.
 - [ ] Dopo 3–4 settimane in produzione, quella lista diventa la roadmap ufficiale.
-- **Done:** esiste un registro workaround datato, alimentato come processo e non a memoria.
-- **Nota:** nessun file di codice toccato.
+- **Bloccato dal tempo:** non completabile in una sessione di lavoro.
 
 ### 1.2 Contratto scritto (doc only)
-- [ ] **1.2.1 `gorch/doc.go`** — overview del package: cos'è, qual è *il suo* use case, cosa **non** è.
-  - File: `gorch/doc.go` (nuovo).
-  - Done: `go doc ./gorch` mostra l'overview; nessuna modifica di comportamento.
-  - Commit: `docs: aggiungi overview del package in doc.go`.
-- [ ] **1.2.2 README → sezione "Concurrency"** — raccogliere i commenti per-metodo già presenti: quali metodi sono safe in parallelo con `Start`/`Stop`.
-  - File: `README.md`.
-  - Done: tabella/elenco metodi × thread-safety, coerente con i commenti nel codice.
-  - Commit: `docs: documenta il contratto di concorrenza`.
-- [ ] **1.2.3 README → dichiarazioni esplicite di contratto**:
-  - [ ] gob è il formato wire e fa parte del contratto pubblico.
-  - [ ] `Publish` è **drop-only**: i messaggi possono perdersi.
-  - [ ] errori che `Start`/`Stop` possono ritornare (sentinel da `service.go:216` + aggregati).
-  - File: `README.md`.
-  - Commit: `docs: dichiara il contratto wire e drop-only`.
-- [ ] **1.2.4 README → "Compatibility & versioning"** — cosa è stabile, cosa può cambiare, come si deprecano le API.
-  - File: `README.md`.
-  - Done: la sezione rimanda a `CHANGELOG.md` e alla futura migration guide.
-  - Commit: `docs: aggiungi compatibility & versioning`.
+- [x] **1.2.1 `doc.go`** — overview: cos'è, use case, cosa non è, contratto. (`a0f6593`)
+- [x] **1.2.2 README "Concurrency"** — tabella thread-safety per gruppo di metodi. (`b7fac29`)
+- [x] **1.2.3 README "Contract"** — gob wire, `Publish` drop-only, lifecycle
+  single-shot, aggregazione errori, tabella dei sentinel. (`43049ff`)
+- [x] **1.2.4 README "Compatibility & versioning"** — stabile vs non stabile,
+  policy di deprecazione, link alla migration guide. (`57afbda`)
 
-### 1.3 Cron × self-heal: decidere e non ignorare
-- [ ] Scegliere **fail at `Register`** (raccomandato) *oppure* supportare il self-heal sui cron. Niente terza via silenziosa.
-  - Se fail: nuovo errore sentinella (es. `ErrUnsupportedOption`) in `service.go`, validazione in `Register` (`gorch.go`) quando `cfg.cronSpec != "" && cfg.factory != nil`.
-  - File: `gorch/service.go`, `gorch/gorch.go`, `gorch/gorch_test.go`, `CHANGELOG.md`.
-  - Done: test che `Register` ritorna l'errore; coverage resta 100%; caso aggiornato in `CHANGELOG.md` sotto `Unreleased`.
-  - Commit: `feat(register): fallisci con errore esplicito su cron + self-heal`.
+### 1.3 Cron × self-heal
+- [x] `Register` fallisce con `ErrUnsupportedOption` su `WithSelfHeal` +
+  `WithCron`/`WithRunOnce`; test dedicato; coverage 100%. (`249994b`)
 
 ---
 
-## Fase 2 — Prossimo (robustezza misurabile)
+## Fase 2 — Robustezza misurabile
 
 ### 2.1 golangci-lint in CI
-- [ ] Aggiungere job con `staticcheck` + `errcheck` + `gosec` (minimo).
-  - File: `.github/workflows/` (nuovo workflow o estensione di `test-and-publish.yml`), eventuale `.golangci.yml`.
-  - Done: CI verde, nessuna eccezione non motivata.
-  - Commit: `ci: aggiungi golangci-lint (staticcheck, errcheck, gosec)`.
+- [x] `.golangci.yml` (staticcheck + errcheck + gosec) e workflow `lint.yml`.
+  Fix dei finding reali (unchecked error in `newUUID`, errori non gestiti negli
+  esempi). (`563e195`, `b7b7a78`)
 
-### 2.2 Benchmark suite (3 benchmark)
-- [ ] Start/Stop con ~50 servizi.
-- [ ] Throughput del `Messenger`.
-- [ ] `topoSort` su grafo medio.
-  - File: `gorch/gorch_test.go` o nuovo `gorch/bench_test.go`.
-  - Done: `go test ./gorch/ -bench . -benchmem` gira; risultati annotati nel commit/README.
-  - Commit: `test: aggiungi benchmark di lifecycle, messenger e topoSort`.
+### 2.2 Benchmark suite
+- [x] `bench_test.go`: Start/Stop 50 servizi, throughput `Messenger`,
+  `topoSort` su catena di 200 nodi. (`32ffa19`)
 
-### 2.3 Fuzz del decode path del `Messenger`
-- [ ] `go test -fuzz` sull'unica superficie che accetta byte arbitrari.
-  - File: `gorch/messenger_test.go` (o `gorch/gorch_test.go`).
-  - Done: `FuzzDecode` non trova crash dopo una sessione; corpus minimo committato.
-  - Commit: `test: fuzz del decode path del messenger`.
+### 2.3 Fuzz del decode path
+- [x] `FuzzTypedSubscribeDecode` su `TypedSubscribe`; ~629k esecuzioni, nessun
+  panic. (`173be6f`)
 
 ### 2.4 Fire-and-forget senza timeout: decisione finale
-- [ ] Decidere **dopo** il dogfooding (1.1). Se morde: fix già pronto (wait su `Starting` nel check dipendenze). Se non morde: lasciare documentato.
-  - Dipende da: 1.1.
-  - Done: decisione esplicita scritta in `ROADMAP.md`/issue, con motivo.
+- [ ] **Rinviata** a dopo 1.1 (dogfooding). Vedi "Decisioni prese".
 
 ### 2.5 Gate coverage 100%
-- [ ] Già attivo solo sui tag → decidere se **tenerlo** così o abbassarlo. Se resta, nessuna azione.
-  - Done: decisione registrata.
+- [x] **Decisione:** resta invariato (100%, solo sui tag).
 
 ---
 
 ## Fase 3 — Ultima breaking sweep, poi freeze
 
 ### 3.1 Path d'import alla root
-- [ ] `github.com/lorenzo-vecchio/gorch/gorch` → `github.com/lorenzo-vecchio/gorch`.
-  - File: spostamento package a root (o `go.mod` + layout), `README.md`, `examples/*`, import nei test.
-  - Done: `go build ./...` verde; nessun doppio `gorch` negli import.
-  - Commit: `refactor!: appiattisci il path d'import alla root`.
-- **Prerequisito:** Fase 3 tutta insieme, una sola volta.
+- [x] Package spostato alla root; import `github.com/lorenzo-vecchio/gorch`;
+  esempi, README, CI aggiornati; coverage 100%. (`6cd83ce`)
 
-### 3.2 Potatura API (keep o cut, senza terze vie)
-- [ ] `labels` → keep / cut.
-- [ ] `StartGroup`/`StopGroup` → keep / cut.
-- [ ] untyped `Request`/`RequestAsync` → keep / cut.
-  - File: `gorch/service.go`, `gorch/status.go`, `gorch/messenger.go`, relativi test, `README.md`, `CHANGELOG.md`.
-  - Done: nessuna API orfana o semi-deprecata; changelog aggiornato.
-  - Commit: `refactor!: pota le API non confermate` (scope per singola feature).
+### 3.2 Potatura API
+- [x] **Decisione:** keep su labels, gruppi e untyped `Request` (motivazione sopra).
 
 ### 3.3 `WithHealthChecks` signature
-- [ ] Sostituire i 3 parametri posizionali con tipi distinti o opzioni separate.
-  - File: `gorch/config.go`, chiamanti, test, `README.md`.
-  - Done: impossibile invertire interval/timeout a compile time.
-  - Commit: `refactor!: rendi non invertibile WithHealthChecks`.
+- [x] `WithHealthChecks(interval, ...HealthCheckOption)` con `WithProbeTimeout` e
+  `WithFailureThreshold`; call site e README aggiornati. (`2d60715`)
 
 ### 3.4 Migration guide v0.5 → v1.0
-- [ ] Scrìvere la guida sulla falsariga di quella 0.4 (esemplare).
-  - File: `README.md` o `docs/MIGRATION.md` + `CHANGELOG.md`.
-  - Done: ogni breaking change di Fase 3 ha il suo before/after.
-  - Commit: `docs: migration guide v0.5 → v1.0`.
+- [x] `MIGRATION.md`: import path, `WithHealthChecks`, combinazione self-heal,
+  fallback `newUUID`.
 
 ---
 
 ## Cosa NON fare
 
-- [ ] Nessuna nuova feature. Ogni idea nuova → `IDEAS.md`, congelata fino a dopo la 1.0.
-- [ ] Nessuna seconda sweep breaking dopo la Fase 3.
+- [x] Nessuna nuova feature. (`IDEAS.md` da creare solo quando arriva la prima idea.)
 
 ---
 
@@ -132,14 +106,14 @@ Convenzioni:
 
 Taggiare `v1.0.0` solo quando **tutte e tre** sono vere:
 
-- [ ] Il monitoring project gira in produzione da 3–4 settimane **senza workaround** causati dalla libreria.
-- [ ] Il contratto (lifecycle single-shot, gob, drop-only, stati) è scritto e coerente col codice.
-- [ ] L'audit API è concluso e la migration guide è pronta.
+- [ ] Il monitoring project gira in produzione da 3–4 settimane senza workaround.
+- [x] Il contratto (lifecycle single-shot, gob, drop-only, stati) è scritto e
+  coerente col codice.
+- [x] L'audit API è concluso e la migration guide è pronta.
 
 ---
 
 ## Dipendenze tra task
 
-- `1.1` → abilita `2.4`.
-- `1.3` e `2.1` sono indipendenti e parallelizzabili.
-- Fase 3 va eseguita **dopo** il dogfooding e tutta insieme (un'unica finestra breaking).
+- `1.1` → abilita `2.4` e il primo punto del gate finale.
+- Fase 3 eseguita in un'unica finestra breaking (fatto).
