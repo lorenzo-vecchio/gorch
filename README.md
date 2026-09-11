@@ -545,6 +545,7 @@ case <-time.After(10 * time.Second):
 ```bash
 go test ./... -coverprofile=coverage.out
 go tool cover -func=coverage.out | grep total  # must be 100.0%
+go test ./gorch/ -bench . -benchmem
 go vet ./...
 gofmt -w .
 ```
