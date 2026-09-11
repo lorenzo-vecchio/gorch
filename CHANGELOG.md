@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe timeout and failure threshold with `WithProbeTimeout` and
   `WithFailureThreshold`. The two adjacent durations could be swapped silently.
 
+### Fixed
+
+- Reply-topic generation (`newUUID`) no longer ignores a `crypto/rand` read
+  error; it falls back to a process-unique counter instead of emitting an empty
+  topic.
+
 ## [0.5.0] — 2026-09-09
 
 ### Changed

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/gob"
 	"errors"
+	"io"
 	"runtime"
 	"strings"
 	"testing"
@@ -874,6 +875,20 @@ func TestTypedSubscribe_NonMessageDropped(t *testing.T) {
 }
 
 // ── Request / RequestAsync ──
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestNewUUID_FallbackOnReaderError(t *testing.T) {
+	got := newUUID(failingReader{})
+	if !strings.HasPrefix(got, "fallback-") {
+		t.Errorf("expected fallback id on reader error, got %q", got)
+	}
+	if got == newUUID(failingReader{}) {
+		t.Error("fallback ids must be unique across calls")
+	}
+}
 
 func TestMessenger_Request(t *testing.T) {
 	m := newMessenger()

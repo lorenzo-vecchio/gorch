@@ -9,6 +9,7 @@ import (
 	"io"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 type Messenger struct {
@@ -166,9 +167,15 @@ func (m *Messenger) Drain() {
 }
 
 // newUUID generates a short random ID for reply topics.
-// ponytail: crypto/rand hex, error path removed — rand.Read never fails on Linux.
+// ponytail: crypto/rand hex. It does not fail in practice, but if the reader
+// errors we fall back to a process-unique counter so the reply topic stays
+// unique instead of panicking or returning an empty topic.
 func newUUID(r io.Reader) string {
 	b := make([]byte, 8)
-	io.ReadFull(r, b) // never fails with crypto/rand.Reader
+	if _, err := io.ReadFull(r, b); err != nil {
+		return fmt.Sprintf("fallback-%d", fallbackUUIDSeq.Add(1))
+	}
 	return fmt.Sprintf("%x", b)
 }
+
+var fallbackUUIDSeq atomic.Uint64
