@@ -13,6 +13,13 @@ import (
 	"github.com/lorenzo-vecchio/gorch/gorch"
 )
 
+func must(err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gorch: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // ── Config holder (implements Validator) ──────────────────────────────────
 
 type Config struct {
@@ -172,24 +179,24 @@ func main() {
 
 	// ── Register infra-group services ──
 
-	orch.Register(&ConfigLoader{config: cfg},
+	must(orch.Register(&ConfigLoader{config: cfg},
 		gorch.WithName("config-loader"),
 		gorch.WithGroup("infra"),
 		gorch.WithRunOnce(),                   // one-shot init: runs before persistent services
 		gorch.WithStartTimeout(2*time.Second), // guard against stuck init
-	)
+	))
 
-	orch.Register(&MetricsCollector{},
+	must(orch.Register(&MetricsCollector{},
 		gorch.WithName("metrics-collector"),
 		gorch.WithGroup("infra"),
 		gorch.WithLabel("tier", "infrastructure"),
-	)
+	))
 
 	// ── Register app-group services ──
 
 	// api-server soft-depends on "cache": starts after it if registered,
 	// but tolerates its absence.
-	orch.Register(&APIServer{},
+	must(orch.Register(&APIServer{},
 		gorch.WithName("api-server"),
 		gorch.WithGroup("app"),
 		gorch.WithLabel("tier", "frontend"),
@@ -198,11 +205,11 @@ func main() {
 		gorch.DependsOn("metrics-collector"),
 		// Note: config-loader is runOnce, so it's already guaranteed to
 		// finish before any persistent service starts — no DependsOn needed.
-	)
+	))
 
 	// RegisterFunc: closure-based service without a dedicated struct.
 	// Validates that we have the required env var; skips itself if missing.
-	orch.RegisterFunc("env-check",
+	must(orch.RegisterFunc("env-check",
 		func(ctx gorch.ServiceContext) error {
 			ctx.Logger.Info("env-check running")
 			time.Sleep(50 * time.Millisecond)
@@ -219,15 +226,15 @@ func main() {
 			// to see start conditions in action.
 			return os.Getenv("SKIP_ENV_CHECK") != "1"
 		}),
-	)
+	))
 
 	// BackgroundWorker with label filtering demo.
-	orch.Register(&BackgroundWorker{},
+	must(orch.Register(&BackgroundWorker{},
 		gorch.WithName("bg-worker"),
 		gorch.WithGroup("app"),
 		gorch.WithLabel("tier", "backend"),
 		gorch.DependsOn("api-server"),
-	)
+	))
 
 	// ── Start ──
 

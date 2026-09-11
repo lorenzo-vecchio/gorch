@@ -1,0 +1,13 @@
+version: "2"
+
+linters:
+  enable:
+    - gosec
+  exclusions:
+    rules:
+      # Tests deliberately ignore errors from plumbing calls (io.Copy, w.Close,
+      # signals); production code is still held to errcheck and gosec.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec

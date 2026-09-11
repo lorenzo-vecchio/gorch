@@ -1882,9 +1882,10 @@ func TestDependencyOrdering_StartOrder(t *testing.T) {
 			startFn: func(ctx context.Context) error {
 				// Barriers ensure deterministic ordering:
 				// b waits for a, c waits for b.
-				if name == "b" {
+				switch name {
+				case "b":
 					<-readyB
-				} else if name == "c" {
+				case "c":
 					<-readyC
 				}
 				mu.Lock()

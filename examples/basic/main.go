@@ -32,16 +32,23 @@ func (w *Worker) Stop() error {
 	return nil
 }
 
+func must(err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gorch: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	orch := gorch.New()
 
 	// Register a long-running service.
-	orch.Register(&Worker{name: "worker-1"})
+	must(orch.Register(&Worker{name: "worker-1"}))
 
 	// Register a cron service that runs every 3 seconds, skipping overlapping ticks.
-	orch.Register(&Worker{name: "cron-worker"},
+	must(orch.Register(&Worker{name: "cron-worker"},
 		gorch.WithCron("@every 3s", gorch.CronSkip),
-	)
+	))
 
 	if err := orch.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "start: %v\n", err)

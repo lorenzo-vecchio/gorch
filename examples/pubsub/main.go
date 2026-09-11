@@ -50,12 +50,19 @@ func (s *Subscriber) Start(ctx gorch.ServiceContext) error {
 
 func (s *Subscriber) Stop() error { return nil }
 
+func must(err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gorch: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	orch := gorch.New(gorch.WithLogLevel(gorch.LogLevelDebug))
 
-	orch.Register(&Publisher{})
-	orch.Register(&Subscriber{name: "sub-1"})
-	orch.Register(&Subscriber{name: "sub-2"})
+	must(orch.Register(&Publisher{}))
+	must(orch.Register(&Subscriber{name: "sub-1"}))
+	must(orch.Register(&Subscriber{name: "sub-2"}))
 
 	if err := orch.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "start: %v\n", err)
