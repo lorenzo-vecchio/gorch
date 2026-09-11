@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WithHealthChecks(interval time.Duration, opts ...HealthCheckOption)`; set the
   probe timeout and failure threshold with `WithProbeTimeout` and
   `WithFailureThreshold`. The two adjacent durations could be swapped silently.
+- **Breaking:** the import path is flattened to the module root: use
+  `github.com/lorenzo-vecchio/gorch` instead of
+  `github.com/lorenzo-vecchio/gorch/gorch`.
 
 ### Fixed
 

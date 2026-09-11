@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lorenzo-vecchio/gorch/gorch"
+	"github.com/lorenzo-vecchio/gorch"
 )
 
 func must(err error) {

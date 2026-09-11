@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/lorenzo-vecchio/gorch/gorch"
+	"github.com/lorenzo-vecchio/gorch"
 )
 
 // Publisher emits events on the "events" topic every second.

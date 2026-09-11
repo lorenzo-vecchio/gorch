@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/lorenzo-vecchio/gorch/gorch"
+	"github.com/lorenzo-vecchio/gorch"
 )
 
 type Worker struct {

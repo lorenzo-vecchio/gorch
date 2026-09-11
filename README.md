@@ -3,7 +3,7 @@
 Manage goroutine lifecycles — start, stop, cron scheduling, pub-sub messaging, dependency ordering, health checks, and self-healing — with a small, composable API.
 
 ```go
-import "github.com/lorenzo-vecchio/gorch/gorch"
+import "github.com/lorenzo-vecchio/gorch"
 ```
 
 ## Install
@@ -58,7 +58,7 @@ import (
     "context"
     "time"
 
-    "github.com/lorenzo-vecchio/gorch/gorch"
+    "github.com/lorenzo-vecchio/gorch"
 )
 
 type MyService struct{}
@@ -543,9 +543,9 @@ case <-time.After(10 * time.Second):
 ## Development
 
 ```bash
-go test ./... -coverprofile=coverage.out
+go test . -coverprofile=coverage.out
 go tool cover -func=coverage.out | grep total  # must be 100.0%
-go test ./gorch/ -bench . -benchmem
+go test . -bench . -benchmem
 go vet ./...
 gofmt -w .
 ```

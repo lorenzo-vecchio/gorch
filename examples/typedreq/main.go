@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/lorenzo-vecchio/gorch/gorch"
+	"github.com/lorenzo-vecchio/gorch"
 )
 
 type CreateOrderReq struct {
