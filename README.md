@@ -49,6 +49,25 @@ Requires Go 1.25+.
 - **Messenger.Drain** — Gracefully close all subscriber channels and clear subscriptions.
 - **Done() channel** — Non-blocking shutdown notification; closes when all goroutines finish.
 
+## Concurrency
+
+All methods are safe to call from multiple goroutines unless noted otherwise. The
+table below summarizes what may run concurrently with a live `Start`/`Stop`.
+
+| Method group | Concurrent with `Start`/`Stop` |
+|--------------|-------------------------------|
+| `Register`, `RegisterFunc` | No — call before `Start`. During or after the lifecycle they return `ErrAlreadyStarted`. |
+| `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the orchestrator is single-shot, so after a successful `Stop` neither can run again. |
+| `Status`, `Statuses`, `Names`, `Count` | Yes — safe to read while services run and during shutdown. |
+| `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
+| `Metrics`, `Done` | Yes — atomic counters and a lazily cached channel. |
+| `StartGroup`, `StopGroup` | Not synchronized with `Start`/`Stop`; drive one lifecycle per orchestrator. |
+| `Messenger` (`Subscribe`, `Publish`, `Request`, `RequestAsync`, `Drain`) and the typed helpers | Yes — all Messenger methods are safe for concurrent use. |
+
+Service implementations are responsible for their own internal concurrency:
+`Start` runs in its own goroutine and `Stop` may be called from another after
+context cancellation.
+
 ## Quick start
 
 ```go
