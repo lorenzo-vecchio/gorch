@@ -88,8 +88,9 @@ These guarantees are part of the public API and are relied upon by callers.
   `StopService`, and `Unregister` start, stop, and remove services while the
   orchestrator runs. `StopService` keeps the entry registered so it can be
   started again; `Unregister` removes it from the graph. Both cancel the
-  service's context, wait for its instance to exit, and release its Messenger
-  subscriptions; `Unregister` also drops its cron schedule. A stop is refused
+  service's context and release its Messenger subscriptions; a persistent
+  service's instance is then waited for until it exits, whereas a cron tick is
+  only cancelled. `Unregister` also drops the cron schedule. A stop is refused
   with `ErrHasDependents` while a hard dependent is running, unless `WithCascadeStop`
   is passed; soft dependencies never block and are never cascaded.
 - **Whole-orchestrator lifecycle is single-shot.** After a successful `Stop`,
@@ -235,11 +236,15 @@ err := orch.StopService("db", 5*time.Second)
 err = orch.StopService("db", 5*time.Second, gorch.WithCascadeStop())
 ```
 
-`timeout` bounds the whole operation (a single budget shared by a cascade); a
-non-positive timeout waits indefinitely. Soft dependencies never block a stop
+`timeout` bounds how long the stop waits for each affected instance's current
+run to exit, and is shared across a cascade (one budget, not one per service).
+A service's own `Stop()` is bounded separately by its `WithStopTimeout`; a
+non-positive `timeout` waits indefinitely. Soft dependencies never block a stop
 and are never cascaded. On a running orchestrator, `Register` and every
 membership method return `ErrOrchestratorStopping` during `Stop` and
-`ErrOrchestratorStopped` afterwards.
+`ErrOrchestratorStopped` afterwards. For a cron service the in-flight tick is
+cancelled and the schedule removed, but the stop does not wait for that tick to
+return.
 
 #### Naming policy
 
