@@ -84,7 +84,8 @@ func (o *Orchestrator) StartService(name string) error {
 }
 
 // StopService stops a registered service without removing it. The entry stays
-// in Names()/Statuses() and can be started again with StartService.
+// in Names()/Statuses(), can be started again with StartService, and its
+// Messenger subscriptions are released on stop.
 //
 // A running hard dependent blocks the stop with ErrHasDependents unless
 // WithCascadeStop() is passed, in which case the target and its transitive hard

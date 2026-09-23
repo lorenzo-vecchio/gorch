@@ -103,7 +103,7 @@ func churnOrchestrator(b *testing.B, n int) (*Orchestrator, func()) {
 }
 
 // BenchmarkStatusesChurn measures Statuses throughput while background
-// membership operations stop and restart services concurrently (C20).
+// membership operations stop and restart services concurrently.
 func BenchmarkStatusesChurn(b *testing.B) {
 	o, cleanup := churnOrchestrator(b, 8)
 	defer cleanup()
@@ -114,7 +114,7 @@ func BenchmarkStatusesChurn(b *testing.B) {
 }
 
 // BenchmarkNamesChurn measures Names throughput while background membership
-// operations stop and restart services concurrently (C20).
+// operations stop and restart services concurrently.
 func BenchmarkNamesChurn(b *testing.B) {
 	o, cleanup := churnOrchestrator(b, 8)
 	defer cleanup()
