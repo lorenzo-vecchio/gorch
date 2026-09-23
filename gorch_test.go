@@ -193,14 +193,28 @@ func TestRegister(t *testing.T) {
 		}
 	})
 
-	t.Run("register_after_start_returns_ErrAlreadyStarted", func(t *testing.T) {
+	t.Run("register_after_start_hot_adds_without_starting", func(t *testing.T) {
 		o := New()
-		_ = o.Register(&namedSvc{name: "a"})
-		_ = o.Start()
+		_ = o.Register(&namedSvc{name: "a"}, WithName("a"))
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
 		defer o.Stop(1 * time.Second)
-		err := o.Register(&namedSvc{name: "b"})
-		if !errors.Is(err, ErrAlreadyStarted) {
-			t.Errorf("expected ErrAlreadyStarted, got %v", err)
+		svc := &testSvc{}
+		err := o.Register(svc, WithName("b"))
+		if err != nil {
+			t.Fatalf("hot Register returned %v", err)
+		}
+		s, ok := o.Status("b")
+		if !ok || s != StatusRegistered {
+			t.Errorf("hot-added service status = %v, want StatusRegistered", s)
+		}
+		names := o.Names()
+		if len(names) != 2 {
+			t.Errorf("Names() = %v, want 2 entries", names)
+		}
+		if got := svc.startCalls.Load(); got != 0 {
+			t.Errorf("hot Register must not start the service, Start called %d times", got)
 		}
 	})
 

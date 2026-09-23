@@ -50,6 +50,20 @@ const (
 	CronSkip // drop this tick entirely
 )
 
+// scheduleEntry registers entry's cron spec with the live scheduler and stores
+// the resulting entry ID. It is shared by setupCron (static registration) and
+// dynamic Register/StartService. Returns ErrInvalidCron on a bad spec.
+func (o *Orchestrator) scheduleEntry(entry *serviceEntry) error {
+	id, err := o.cronSched.AddFunc(entry.cfg.cronSpec, func() {
+		o.invokeCron(entry)
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidCron, err)
+	}
+	entry.cronID = id
+	return nil
+}
+
 // setupCron creates and starts the cron scheduler, registering every cron
 // service and marking them running. Returns ErrInvalidCron on a bad spec.
 func (o *Orchestrator) setupCron() error {
@@ -58,13 +72,9 @@ func (o *Orchestrator) setupCron() error {
 		if entry.cfg.cronSpec == "" {
 			continue
 		}
-		id, err := o.cronSched.AddFunc(entry.cfg.cronSpec, func() {
-			o.invokeCron(entry)
-		})
-		if err != nil {
-			return fmt.Errorf("%w: %w", ErrInvalidCron, err)
+		if err := o.scheduleEntry(entry); err != nil {
+			return err
 		}
-		entry.cronID = id
 	}
 
 	o.cronSched.Start()

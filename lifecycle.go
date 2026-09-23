@@ -8,6 +8,11 @@ import (
 )
 
 func (o *Orchestrator) startOneService(entry *serviceEntry) error {
+	// Guard against reentrant membership ops from this service's own Start: a
+	// nested StartService on this entry is rejected rather than recursing (C17).
+	entry.starting.Store(true)
+	defer entry.starting.Store(false)
+
 	// --- before-start hook ---
 	hook := entry.cfg.onBeforeStart
 	if hook == nil {

@@ -41,6 +41,11 @@ type serviceEntry struct {
 	cronID cron.EntryID
 	// self-heal state for non-cron services
 	wgDone bool // true once wg.Done() has been called for this entry
+	// starting is true while startOneService is invoking this entry's user code
+	// synchronously on the caller's goroutine. It lets a reentrant membership
+	// op (a service starting itself from its own Start) be rejected instead of
+	// recursing (C17).
+	starting atomic.Bool
 	// CronSkip / CronQueue gate
 	running atomic.Bool
 	// CronQueue serialization lock (serialize ticks mode)
@@ -135,7 +140,12 @@ func (e *serviceEntry) setHealthFailures(n int) {
 type Orchestrator struct {
 	cfg     config
 	started bool
-	mu      sync.RWMutex // protects started, entries slice, nameIndex
+	// stopping is true from the moment Stop begins until it returns; stopped is
+	// true once Stop has completed. Both are guarded by mu and gate dynamic
+	// membership ops (C6, D10).
+	stopping bool
+	stopped  bool
+	mu       sync.RWMutex // protects started, stopping, stopped, entries slice, nameIndex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -216,18 +226,55 @@ func New(opts ...Option) *Orchestrator {
 	return o
 }
 
-// Register adds a service to the orchestrator. Must be called before Start().
-// Returns ErrAlreadyStarted if the orchestrator has already been started.
+// Register adds a service to the orchestrator.
+//
+// Before Start the registry is static: any service may be added, and the whole
+// graph is validated at once. After Start (a "hot add") the service is accepted
+// into the live graph as StatusRegistered but is NOT auto-started; use
+// StartService to start it. While Stop is in progress Register returns
+// ErrOrchestratorStopping, and after Stop it returns ErrOrchestratorStopped.
+//
 // Returns ErrDuplicateName if WithName conflicts with another service.
 // Returns ErrDependencyCycle if DependsOn introduces a cycle.
+// Returns ErrDependencyNotFound if a dynamic Register names an unknown hard
+// dependency.
 // Thread-safe.
 func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.started {
-		return ErrAlreadyStarted
+		o.mu.Unlock()
+		return o.registerDynamic(svc, opts)
+	}
+	cfg, err := o.parseRegisterOptions(opts, false)
+	if err != nil {
+		o.mu.Unlock()
+		return err
 	}
 
+	// Static registration happens under the lock (historical behavior); the
+	// dynamic path deliberately moves Validate outside it.
+	if v, ok := svc.(Validator); ok {
+		if err := v.Validate(); err != nil {
+			o.mu.Unlock()
+			return fmt.Errorf("gorch: service %s validation failed: %w", cfg.name, err)
+		}
+	}
+
+	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
+	o.entries = append(o.entries, entry)
+	o.nameIndex[cfg.name] = entry
+	o.mu.Unlock()
+	return nil
+}
+
+// parseRegisterOptions applies opts and performs the structural validation that
+// does not call user code: the self-heal combination check, auto-naming,
+// duplicate-name detection, hard-dependency existence and cycle detection, and
+// soft-dependency cycle detection. The caller must hold o.mu, because the graph
+// is inspected via lookupEntry/dependsOnRecursive. dynamic selects the
+// ErrDependencyNotFound sentinel for a missing hard dependency (static
+// registration keeps its historical message).
+func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption, dynamic bool) (registerConfig, error) {
 	cfg := registerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -237,7 +284,7 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	// runOnce gate never consume the factory, so reject the combination instead
 	// of silently ignoring it.
 	if cfg.factory != nil && (cfg.cronSpec != "" || cfg.runOnce) {
-		return fmt.Errorf("%w: WithSelfHeal cannot be combined with WithCron or WithRunOnce", ErrUnsupportedOption)
+		return cfg, fmt.Errorf("%w: WithSelfHeal cannot be combined with WithCron or WithRunOnce", ErrUnsupportedOption)
 	}
 
 	// Auto-name if no WithName set.
@@ -248,21 +295,24 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 
 	// Validate uniqueness.
 	if _, exists := o.nameIndex[cfg.name]; exists {
-		return fmt.Errorf("%w: %s", ErrDuplicateName, cfg.name)
+		return cfg, fmt.Errorf("%w: %s", ErrDuplicateName, cfg.name)
 	}
 
 	// Validate all dependencies exist and detect cycles.
 	for _, dep := range cfg.dependsOn {
 		if dep == cfg.name {
-			return fmt.Errorf("%w: service %s depends on itself", ErrDependencyCycle, cfg.name)
+			return cfg, fmt.Errorf("%w: service %s depends on itself", ErrDependencyCycle, cfg.name)
 		}
 		depEntry := o.lookupEntry(dep)
 		if depEntry == nil {
-			return fmt.Errorf("gorch: dependency %q not found for service %s", dep, cfg.name)
+			if dynamic {
+				return cfg, fmt.Errorf("%w: dependency %q not found for service %s", ErrDependencyNotFound, dep, cfg.name)
+			}
+			return cfg, fmt.Errorf("gorch: dependency %q not found for service %s", dep, cfg.name)
 		}
 		// Check if dep transitively depends on cfg.name (would create a cycle).
 		if o.dependsOnRecursive(depEntry, cfg.name) {
-			return fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
+			return cfg, fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
 		}
 	}
 
@@ -270,18 +320,41 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	// registered; missing targets are tolerated by design.
 	for _, dep := range cfg.softDependsOn {
 		if dep == cfg.name {
-			return fmt.Errorf("%w: service %s soft-depends on itself", ErrDependencyCycle, cfg.name)
+			return cfg, fmt.Errorf("%w: service %s soft-depends on itself", ErrDependencyCycle, cfg.name)
 		}
 		depEntry := o.lookupEntry(dep)
 		if depEntry == nil {
 			continue
 		}
 		if o.dependsOnRecursive(depEntry, cfg.name) {
-			return fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
+			return cfg, fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
 		}
 	}
 
-	// Check Validator interface.
+	return cfg, nil
+}
+
+// registerDynamic adds a service to a running orchestrator. The entry is
+// appended as StatusRegistered and is never auto-started (D1); persistent and
+// runOnce services wait for StartService. A cron entry is added to the live
+// scheduler immediately (so the schedule is live) but still reports
+// StatusRegistered until StartService marks it running. Validate runs without
+// the orchestrator lock held, so user code can never deadlock against a
+// membership op (the structural graph checks above it run under the lock).
+func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error {
+	o.mu.Lock()
+	if err := o.membershipGateLocked(); err != nil {
+		o.mu.Unlock()
+		return err
+	}
+	cfg, err := o.parseRegisterOptions(opts, true)
+	if err != nil {
+		o.mu.Unlock()
+		return err
+	}
+	o.mu.Unlock()
+
+	// Validate is user code: never invoke it while holding the orchestrator lock.
 	if v, ok := svc.(Validator); ok {
 		if err := v.Validate(); err != nil {
 			return fmt.Errorf("gorch: service %s validation failed: %w", cfg.name, err)
@@ -289,8 +362,38 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	}
 
 	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
+	if o.cfg.Logger != nil {
+		entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
+	} else {
+		entry.setLogger(newServiceLogger(entry.name, o.logCh, o.logQuit, o.cfg.LogLevel))
+	}
+
+	o.mu.Lock()
+	if _, exists := o.nameIndex[cfg.name]; exists {
+		o.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrDuplicateName, cfg.name)
+	}
+	if cfg.cronSpec != "" {
+		if err := o.scheduleEntry(entry); err != nil {
+			o.mu.Unlock()
+			return err
+		}
+	}
 	o.entries = append(o.entries, entry)
 	o.nameIndex[cfg.name] = entry
+	o.mu.Unlock()
+	return nil
+}
+
+// membershipGateLocked rejects dynamic membership once whole-orchestrator
+// shutdown has begun. The caller must hold o.mu.
+func (o *Orchestrator) membershipGateLocked() error {
+	if o.stopping {
+		return ErrOrchestratorStopping
+	}
+	if o.stopped {
+		return ErrOrchestratorStopped
+	}
 	return nil
 }
 
@@ -525,6 +628,8 @@ func (o *Orchestrator) resetAfterStartFailure() {
 
 	o.mu.Lock()
 	o.started = false
+	o.stopping = false
+	o.stopped = false
 	o.mu.Unlock()
 	o.startOnce = sync.Once{}
 	o.stopOnce = sync.Once{}
@@ -564,6 +669,12 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 			return
 		}
 		o.mu.RUnlock()
+
+		// Mark shutdown as in progress so dynamic membership ops are rejected
+		// while Stop tears the graph down (C6).
+		o.mu.Lock()
+		o.stopping = true
+		o.mu.Unlock()
 
 		// Stop health-check loop.
 		if o.healthCancel != nil {
@@ -622,6 +733,13 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		case <-time.After(timeout):
 			stopErr = errors.Join(stopErr, ErrStopTimeout)
 		}
+
+		// Shutdown is complete: persist the terminal flag so later membership
+		// ops report ErrOrchestratorStopped rather than ErrOrchestratorStopping.
+		o.mu.Lock()
+		o.stopping = false
+		o.stopped = true
+		o.mu.Unlock()
 	})
 	return stopErr
 }

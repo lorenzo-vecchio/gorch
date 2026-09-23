@@ -221,6 +221,13 @@ var (
 	ErrDependencyCycle   = errors.New("gorch: dependency cycle detected")
 	ErrStartAborted      = errors.New("gorch: start aborted due to dependency failure")
 	ErrUnsupportedOption = errors.New("gorch: unsupported option combination")
+
+	// Dynamic membership sentinels. See the Contract section of README.md.
+	ErrServiceNotFound      = errors.New("gorch: service not found")
+	ErrOrchestratorStopping = errors.New("gorch: orchestrator is stopping")
+	ErrOrchestratorStopped  = errors.New("gorch: orchestrator already stopped")
+	ErrDependencyNotRunning = errors.New("gorch: dependency not running")
+	ErrDependencyNotFound   = errors.New("gorch: dependency not found")
 )
 
 // funcService wraps closures as a Service. Used by RegisterFunc.
