@@ -42,7 +42,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	sc := ServiceContext{
 		Context:   svcCtx,
 		Logger:    entry.getLogger(),
-		Messenger: o.messenger,
+		Messenger: o.messenger.scoped(entry.owner),
 	}
 
 	// Determine timeout.
@@ -450,7 +450,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	// New per-service context.
 	svcCtx, svcCancel := context.WithCancel(o.ctx)
 	entry.setCancel(svcCancel)
-	newSc := ServiceContext{Context: svcCtx, Logger: entry.getLogger(), Messenger: o.messenger}
+	newSc := ServiceContext{Context: svcCtx, Logger: entry.getLogger(), Messenger: o.messenger.scoped(entry.owner)}
 
 	go o.runService(entry, newSc)
 	o.metricsRestarts.Add(1)

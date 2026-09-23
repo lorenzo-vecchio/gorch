@@ -26,18 +26,19 @@ type Message struct {
 // ponytail: standalone func (not method) because Go does not support
 // generic methods on non-generic types.
 func RegisterType[T any](m *Messenger) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	r := m.root()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	var zero T
 	// ponytail: gob.Register no longer panics in Go 1.25+; recover removed.
 	gob.Register(zero)
-	if m.types == nil {
-		m.types = make(map[string]reflect.Type)
+	if r.types == nil {
+		r.types = make(map[string]reflect.Type)
 	}
 	t := reflect.TypeOf(zero)
 	name := t.String()
-	m.types[name] = t
+	r.types[name] = t
 	return nil
 }
 
@@ -48,9 +49,10 @@ func TypedPublish[T any](m *Messenger, msg T, topics ...string) {
 	t := reflect.TypeOf(msg)
 	name := t.String()
 
-	m.mu.RLock()
-	_, ok := m.types[name]
-	m.mu.RUnlock()
+	r := m.root()
+	r.mu.RLock()
+	_, ok := r.types[name]
+	r.mu.RUnlock()
 	if !ok {
 		return
 	}

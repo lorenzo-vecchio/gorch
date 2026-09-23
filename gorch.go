@@ -26,6 +26,7 @@ type serviceEntry struct {
 
 	// runtime state
 	name      string
+	owner     uint64 // per-instance Messenger ownership id
 	status    ServiceStatus
 	cancel    context.CancelFunc // per-service cancellation (nil until started)
 	startedAt time.Time          // when the current instance started
@@ -159,6 +160,7 @@ type Orchestrator struct {
 	entries   []*serviceEntry
 	nameIndex map[string]*serviceEntry // name -> entry lookup
 	autoSeq   int                      // auto-name sequence counter
+	ownerSeq  atomic.Uint64            // monotonic Messenger owner-id source
 
 	// Status tracking
 	statusMu sync.RWMutex
@@ -260,7 +262,7 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 		}
 	}
 
-	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
+	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, owner: o.ownerSeq.Add(1), status: StatusRegistered}
 	o.entries = append(o.entries, entry)
 	o.nameIndex[cfg.name] = entry
 	o.mu.Unlock()
@@ -361,7 +363,7 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 		}
 	}
 
-	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
+	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, owner: o.ownerSeq.Add(1), status: StatusRegistered}
 	if o.cfg.Logger != nil {
 		entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
 	} else {

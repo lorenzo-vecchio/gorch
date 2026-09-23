@@ -76,6 +76,14 @@ func (o *Orchestrator) StartService(name string) error {
 	}
 }
 
+// drainService releases every Messenger subscription owned by entry. It is the
+// per-service counterpart of the orchestrator-wide Drain and is used when a
+// service leaves the graph. Repeated calls are a no-op; other services keep
+// their subscriptions and continue to receive Publish. Thread-safe.
+func (o *Orchestrator) drainService(entry *serviceEntry) {
+	o.messenger.drainOwner(entry.owner)
+}
+
 // statusOf reads an entry's status under the shared status lock.
 func (o *Orchestrator) statusOf(entry *serviceEntry) ServiceStatus {
 	o.statusMu.RLock()

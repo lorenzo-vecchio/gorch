@@ -24,7 +24,7 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 	sc := ServiceContext{
 		Context:   o.ctx,
 		Logger:    entry.getLogger(),
-		Messenger: o.messenger,
+		Messenger: o.messenger.scoped(entry.owner),
 	}
 
 	defer func() {
