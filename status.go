@@ -98,30 +98,59 @@ func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
 }
 
 // StartGroup starts all services in the named group in topological order.
-// It takes the shared membership lock, so it cannot interleave with
-// StopService/Unregister/StopGroup (C3, D16).
+// The shared membership lock serializes group selection against
+// StopService/Unregister/StopGroup (C3, D16), but is released before any user
+// code runs: a service's Start may call a membership op without self-deadlocking.
+// Each selected entry is reserved via its starting flag, so a concurrent teardown
+// is rejected rather than stopping an entry about to be started.
 func (o *Orchestrator) StartGroup(group string) error {
 	o.membershipMu.Lock()
-	defer o.membershipMu.Unlock()
-
 	o.mu.Lock()
 	if err := o.membershipGateLocked(); err != nil {
 		o.mu.Unlock()
+		o.membershipMu.Unlock()
 		return err
 	}
-	entries := make([]*serviceEntry, 0)
+	// groupEntries keeps every group member so topoSort sees the full
+	// dependency graph even when only a subset is actually started.
+	groupEntries := make([]*serviceEntry, 0)
+	// reserved holds the entries this call will start: not already running,
+	// starting or being torn down. Reserving only those keeps a group start
+	// idempotent and stops two concurrent StartGroups double-starting an entry.
+	reserved := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
-		if e.cfg.group == group {
-			entries = append(entries, e)
+		if e.cfg.group != group {
+			continue
 		}
+		groupEntries = append(groupEntries, e)
+		if e.removing.Load() || e.starting.Load() {
+			continue
+		}
+		if s := o.statusOf(e); s == StatusRunning || s == StatusStarting {
+			continue
+		}
+		e.starting.Store(true)
+		reserved = append(reserved, e)
 	}
 	o.mu.Unlock()
-	levels, err := o.topoSort(entries)
+	o.membershipMu.Unlock()
+	// Release every reservation on the way out, including a panic from a
+	// synchronous user Start/hook: started entries already cleared their own.
+	defer o.clearStarting(reserved)
+
+	levels, err := o.topoSort(groupEntries)
 	if err != nil {
 		return err
 	}
+	startable := make(map[*serviceEntry]bool, len(reserved))
+	for _, e := range reserved {
+		startable[e] = true
+	}
 	for _, level := range levels {
 		for _, entry := range level {
+			if !startable[entry] {
+				continue
+			}
 			if err := o.startOneService(entry); err != nil {
 				return err
 			}
@@ -130,26 +159,52 @@ func (o *Orchestrator) StartGroup(group string) error {
 	return nil
 }
 
+// clearStarting releases the StartGroup reservation on entries whose start never
+// ran (or failed); started entries already cleared their own flag.
+func (o *Orchestrator) clearStarting(entries []*serviceEntry) {
+	for _, e := range entries {
+		e.starting.Store(false)
+	}
+}
+
 // StopGroup stops all non-cron, non-runOnce services in the named group in
-// reverse topological order. Errors are aggregated via errors.Join. It takes the
-// shared membership lock, so it is serialized against other membership
-// operations (C3, D16).
+// reverse topological order. Errors are aggregated via errors.Join. The shared
+// membership lock serializes selection (C3, D16) but is released before the
+// services' Stop hooks run, so a hook may call a membership op without
+// self-deadlocking. Selected entries are reserved via the removing flag so a
+// concurrent group start/stop or teardown sees them mid-operation.
 func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
 	o.membershipMu.Lock()
-	defer o.membershipMu.Unlock()
-
 	o.mu.Lock()
 	if err := o.membershipGateLocked(); err != nil {
 		o.mu.Unlock()
+		o.membershipMu.Unlock()
 		return err
 	}
 	persistent := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
-		if e.cfg.group == group && e.cfg.cronSpec == "" && !e.cfg.runOnce {
-			persistent = append(persistent, e)
+		if e.cfg.group != group || e.cfg.cronSpec != "" || e.cfg.runOnce {
+			continue
 		}
+		// Honour a concurrent StartGroup reservation and skip an entry another
+		// teardown already owns.
+		if e.starting.Load() || e.removing.Load() {
+			continue
+		}
+		e.removing.Store(true)
+		persistent = append(persistent, e)
 	}
 	o.mu.Unlock()
+	o.membershipMu.Unlock()
+	// Release the reservations once the stops (user code) have run.
+	defer func() {
+		o.mu.Lock()
+		for _, e := range persistent {
+			e.removing.Store(false)
+		}
+		o.mu.Unlock()
+	}()
+
 	levels, _ := o.topoSort(persistent)
 	var stopErr error
 	for i := len(levels) - 1; i >= 0; i-- {

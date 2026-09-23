@@ -8,6 +8,11 @@ import (
 )
 
 func (o *Orchestrator) startOneService(entry *serviceEntry) error {
+	// A removed (or mid-teardown) entry was selected before Unregister deleted
+	// it (e.g. a StartGroup reservation): never revive it.
+	if entry.removed.Load() || entry.removing.Load() {
+		return fmt.Errorf("%w: %s", ErrServiceNotFound, entry.name)
+	}
 	// Guard against reentrant membership ops from this service's own Start: a
 	// nested StartService on this entry is rejected rather than recursing (C17).
 	entry.starting.Store(true)
@@ -195,9 +200,11 @@ func (o *Orchestrator) callAfterStartHook(entry *serviceEntry, err error) {
 	}
 }
 
-// stopStartedServices stops all running services (used for cleanup on start failure).
+// stopStartedServices stops all running services (used for cleanup on start
+// failure). It works on the Start snapshot rather than o.entries, so a
+// concurrent hot Register cannot race the cleanup.
 // ponytail: sequential stop; parallel Stop is premature.
-func (o *Orchestrator) stopStartedServices() {
+func (o *Orchestrator) stopStartedServices(entries []*serviceEntry) {
 	// Cancel context.
 	if o.cancel != nil {
 		o.cancel()
@@ -207,8 +214,8 @@ func (o *Orchestrator) stopStartedServices() {
 		<-o.cronSched.Stop().Done()
 	}
 	// Stop services in reverse registration order.
-	for i := len(o.entries) - 1; i >= 0; i-- {
-		entry := o.entries[i]
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
 		o.statusMu.RLock()
 		s := entry.status
 		o.statusMu.RUnlock()
@@ -371,9 +378,15 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 			default:
 			}
 		}
-		if exitErr != nil && !errors.Is(exitErr, context.Canceled) {
+		switch {
+		case entry.teardownActive():
+			// A teardown that began before this exit wins: the entry ends
+			// StatusStopped, not StatusCrashed.
+			o.setStatus(entry, StatusStopped)
+			o.metricsStops.Add(1)
+		case exitErr != nil && !errors.Is(exitErr, context.Canceled):
 			o.setStatusErr(entry, StatusCrashed, exitErr)
-		} else {
+		default:
 			o.setStatus(entry, StatusStopped)
 			o.metricsStops.Add(1)
 		}
@@ -414,7 +427,13 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	// Check maxRetries.
 	if entry.cfg.maxRetries > 0 && entry.getRetryCount() >= entry.cfg.maxRetries {
 		entry.getLogger().Error("max retries reached, giving up", "retries", entry.getRetryCount())
-		o.setStatusErr(entry, StatusCrashed, exitErr)
+		if entry.teardownActive() {
+			// StopService/Unregister cancelled this entry as it reached the
+			// retry limit: the teardown wins, so leave it StatusStopped.
+			o.setStatus(entry, StatusStopped)
+		} else {
+			o.setStatusErr(entry, StatusCrashed, exitErr)
+		}
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true

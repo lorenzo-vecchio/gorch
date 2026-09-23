@@ -2653,6 +2653,46 @@ func TestHealth_NoEntries(t *testing.T) {
 	}
 }
 
+// TestHealth_ConcurrentRemoval covers the matrix row "Health vs removal": an
+// Unregister that removes an entry while a probe is in flight must not leave
+// the removed name in the result.
+func TestHealth_ConcurrentRemoval(t *testing.T) {
+	o := New()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	svc := &healthSvc{healthFn: func(ctx context.Context) error {
+		close(entered)
+		<-release
+		return nil
+	}}
+	if err := o.Register(svc, WithName("h")); err != nil {
+		t.Fatal(err)
+	}
+
+	results := make(chan map[string]error, 1)
+	go func() { results <- o.Health() }()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("health probe never ran")
+	}
+
+	if err := o.Unregister("h", time.Second); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	close(release)
+
+	select {
+	case res := <-results:
+		if _, ok := res["h"]; ok {
+			t.Error("removed entry must not appear in the Health result")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Health did not return")
+	}
+}
+
 // ── runHealthChecks ──
 
 func TestRunHealthChecks_FailuresTracked(t *testing.T) {
