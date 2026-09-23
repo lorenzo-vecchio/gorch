@@ -2048,3 +2048,285 @@ func TestStopService_NonCanceledExitIsStopped(t *testing.T) {
 		t.Errorf("Crashes = %d, want 0", got)
 	}
 }
+
+// overlapCronSvc runs every tick concurrently and records how many started,
+// are live, and have exited, so a test can prove teardown cancels every one of
+// them and that a re-scheduled generation accepts ticks again.
+type overlapCronSvc struct {
+	calls   atomic.Int32
+	running atomic.Int32
+	exited  atomic.Int32
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (s *overlapCronSvc) Start(ctx ServiceContext) error {
+	s.calls.Add(1)
+	s.running.Add(1)
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	s.running.Add(-1)
+	s.exited.Add(1)
+	return ctx.Err()
+}
+
+func (s *overlapCronSvc) Stop() error { return nil }
+
+// TestServiceEntry_CronTracking covers the cron tracking helpers directly: a
+// fresh entry refuses a tick, startCronSchedule installs a context, a stale
+// generation is refused, and cronDrain cancels and waits for in-flight ticks.
+func TestServiceEntry_CronTracking(t *testing.T) {
+	var e serviceEntry
+	if _, ok := e.cronBegin(0); ok {
+		t.Error("cronBegin before any schedule must be refused")
+	}
+	gen := e.startCronSchedule(context.Background())
+	if gen != e.cronGeneration() {
+		t.Error("startCronSchedule must return the current generation")
+	}
+	ctx, ok := e.cronBegin(gen)
+	if !ok || ctx == nil {
+		t.Fatal("cronBegin after a schedule must return the shared context")
+	}
+	if _, ok := e.cronBegin(gen + 1); ok {
+		t.Error("cronBegin for a stale generation must be refused")
+	}
+	e.cronEnd(gen - 1) // stale end must not touch the current accounting
+	drained := e.cronDrain()
+	if drained == nil {
+		t.Fatal("cronDrain with an in-flight tick must return a latch")
+	}
+	select {
+	case <-drained:
+		t.Fatal("drain latch closed before cronEnd")
+	default:
+	}
+	if _, ok := e.cronBegin(gen); ok {
+		t.Error("cronBegin while draining must be refused")
+	}
+	e.cronEnd(gen)
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("drain latch did not close after cronEnd")
+	}
+	if e.cronDrain() != nil {
+		t.Error("a fully drained schedule must return a nil latch")
+	}
+
+	// A scheduler tick with no live schedule is refused before running user code.
+	New().invokeCron(&serviceEntry{}, 0)
+}
+
+// TestServiceEntry_ReleaseTeardownIf covers the identity guard: an exit handler
+// must not cancel a teardown a concurrent restart has installed.
+func TestServiceEntry_ReleaseTeardownIf(t *testing.T) {
+	e := &serviceEntry{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.setTeardown(ctx, cancel)
+
+	other, otherCancel := context.WithCancel(context.Background())
+	defer otherCancel()
+	e.releaseTeardownIf(other) // not ours: must leave it in place
+	if e.getTeardown() == nil {
+		t.Fatal("releaseTeardownIf cleared a teardown it does not own")
+	}
+	e.releaseTeardownIf(ctx)
+	if e.getTeardown() != nil {
+		t.Error("releaseTeardownIf did not clear its own teardown")
+	}
+	if ctx.Err() == nil {
+		t.Error("releaseTeardownIf did not cancel its own teardown")
+	}
+}
+
+// TestStopService_CancelsAllParallelCronTicks covers the "Parallel ticks
+// cancelled" matrix row: with overlapping CronParallel ticks, StopService must
+// cancel and await every one, not only the newest.
+func TestStopService_CancelsAllParallelCronTicks(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(time.Second)
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	svc := &overlapCronSvc{entered: make(chan struct{})}
+	if err := o.Register(svc, WithName("p"), WithCron("0 0 0 1 1 *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("p"); err != nil {
+		t.Fatal(err)
+	}
+	o.mu.RLock()
+	entry := o.nameIndex["p"]
+	o.mu.RUnlock()
+
+	go o.invokeCron(entry, entry.cronGeneration())
+	go o.invokeCron(entry, entry.cronGeneration())
+	select {
+	case <-svc.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cron tick never started")
+	}
+	deadline := time.After(time.Second)
+	for svc.running.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("second parallel tick did not start")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if err := o.StopService("p", time.Second); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+	if got := svc.exited.Load(); got != 2 {
+		t.Errorf("exited ticks = %d, want 2 (all cancelled and awaited)", got)
+	}
+}
+
+// TestStopService_ReschedulesCronAfterDrain covers the "Re-schedule after stop"
+// matrix row: after a stop that drained a running tick, StartService must install
+// a fresh generation that accepts ticks again.
+func TestStopService_ReschedulesCronAfterDrain(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(time.Second)
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	svc := &overlapCronSvc{entered: make(chan struct{})}
+	if err := o.Register(svc, WithName("p"), WithCron("0 0 0 1 1 *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("p"); err != nil {
+		t.Fatal(err)
+	}
+	o.mu.RLock()
+	entry := o.nameIndex["p"]
+	o.mu.RUnlock()
+
+	go o.invokeCron(entry, entry.cronGeneration())
+	select {
+	case <-svc.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cron tick never started")
+	}
+	if err := o.StopService("p", time.Second); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+	if got := svc.exited.Load(); got != 1 {
+		t.Fatalf("exited ticks = %d, want 1", got)
+	}
+
+	if err := o.StartService("p"); err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+	go o.invokeCron(entry, entry.cronGeneration())
+	deadline := time.After(time.Second)
+	for svc.calls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("a re-scheduled cron entry never accepted a tick")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// TestStopService_DeadlineBoundsStop covers the "Blocking Stop bounded" matrix
+// row: with no WithStopTimeout, the StopService deadline must cap a blocking
+// Stop() so the call returns promptly with ErrStopTimeout.
+func TestStopService_DeadlineBoundsStop(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		stopFn:  func() error { <-release; return nil },
+	}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		close(release)
+		_ = o.Stop(time.Second)
+	}()
+
+	const budget = 100 * time.Millisecond
+	start := time.Now()
+	err := o.StopService("s", budget)
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("StopService = %v, want ErrStopTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*budget {
+		t.Errorf("StopService took %v; the deadline did not bound Stop()", elapsed)
+	}
+}
+
+// TestStopService_PerServiceCapWins covers the "Per-service cap wins" matrix row:
+// WithStopTimeout smaller than the caller's deadline still decides when the stop
+// returns.
+func TestStopService_PerServiceCapWins(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		stopFn:  func() error { <-release; return nil },
+	}
+	if err := o.Register(svc, WithName("s"), WithStopTimeout(50*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		close(release)
+		_ = o.Stop(time.Second)
+	}()
+
+	start := time.Now()
+	err := o.StopService("s", 5*time.Second)
+	if err == nil {
+		t.Fatal("expected a stop timeout from the per-service cap")
+	}
+	if errors.Is(err, ErrStopTimeout) {
+		t.Errorf("per-service cap error = %v, must not be the caller's ErrStopTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("StopService took %v; the per-service cap did not apply", elapsed)
+	}
+}
+
+// TestHandleServiceDone_ReleasesTeardown covers the "Normal exit releases
+// teardown" matrix row: a non-self-heal instance that exits clears its per-entry
+// teardown context instead of leaking it across cycles.
+func TestHandleServiceDone_ReleasesTeardown(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	svc := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		o.mu.RLock()
+		entry := o.nameIndex["s"]
+		o.mu.RUnlock()
+		if entry.getTeardown() == nil {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("teardown context must be released after a normal exit")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}

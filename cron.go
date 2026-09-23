@@ -5,7 +5,17 @@ import (
 	"fmt"
 )
 
-func (o *Orchestrator) invokeCron(entry *serviceEntry) {
+func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
+	// Refuse a tick dispatched while the entry is being torn down, or one that
+	// belongs to a superseded schedule. Every tick of a generation derives from
+	// the same context, so cancelling it (cronDrain) reaches all in-flight ticks,
+	// not only the newest.
+	cronParent, ok := entry.cronBegin(gen)
+	if !ok {
+		return
+	}
+	defer entry.cronEnd(gen)
+
 	switch entry.cfg.cronMode {
 	case CronSkip:
 		if !entry.running.CompareAndSwap(false, true) {
@@ -19,10 +29,9 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 	case CronParallel:
 	}
 
-	// Per-tick context so StopService/Unregister can cancel an in-flight tick by
-	// cancelling the entry's current cancel func (C8).
-	svcCtx, cancel := context.WithCancel(o.ctx)
-	entry.setCancel(cancel)
+	// Per-tick context as a child of the shared schedule context, so teardown
+	// cancels this tick along with every other in-flight tick (C8).
+	svcCtx, cancel := context.WithCancel(cronParent)
 	defer cancel()
 
 	sc := ServiceContext{
@@ -58,8 +67,11 @@ const (
 // the resulting entry ID. It is shared by setupCron (static registration) and
 // dynamic Register/StartService. Returns ErrInvalidCron on a bad spec.
 func (o *Orchestrator) scheduleEntry(entry *serviceEntry) error {
+	// A re-scheduled entry gets a fresh shared context and reset accounting; the
+	// generation lets a stale tick from the previous schedule be ignored.
+	gen := entry.startCronSchedule(o.ctx)
 	id, err := o.cronSched.AddFunc(entry.cfg.cronSpec, func() {
-		o.invokeCron(entry)
+		o.invokeCron(entry, gen)
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidCron, err)

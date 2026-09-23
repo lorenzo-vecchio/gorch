@@ -90,11 +90,11 @@ func (o *Orchestrator) StartService(name string) error {
 // A running hard dependent blocks the stop with ErrHasDependents unless
 // WithCascadeStop() is passed, in which case the target and its transitive hard
 // dependents are stopped in reverse topological order. Soft dependencies never
-// block and are never cascaded. timeout bounds how long the stop waits for each
-// persistent instance's current run to exit, shared across a cascade; a
-// non-positive timeout waits indefinitely. It does not bound a service's own
-// Stop(), which is controlled by WithStopTimeout. A cron tick is cancelled but
-// not awaited. Returns ErrServiceNotFound for an unknown name and
+// block and are never cascaded. timeout bounds the whole stop — the service's
+// own Stop() and the wait for its instance or in-flight cron ticks to exit — and
+// is shared across a cascade; a non-positive timeout waits indefinitely. A
+// per-service WithStopTimeout still caps Stop() when it is smaller than the
+// remaining budget. Returns ErrServiceNotFound for an unknown name and
 // ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
 // shutdown has begun. Thread-safe.
 func (o *Orchestrator) StopService(name string, timeout time.Duration, opts ...StopOption) error {
@@ -248,39 +248,51 @@ func (o *Orchestrator) activeDependentsLocked(target *serviceEntry, set []*servi
 	return blockers
 }
 
-// stopEntry cancels an entry's per-service context (which also cancels a pending
-// self-heal backoff), removes its cron schedule, runs its Stop lifecycle, and
-// waits for the current instance to exit up to deadline. A zero deadline means
-// no timeout; a non-awaitable entry (runOnce, never started) returns as soon as
-// its Stop lifecycle ran.
+// stopEntry cancels an entry's contexts (which also aborts a pending self-heal
+// backoff), removes its cron schedule, runs its Stop lifecycle, and waits for the
+// current instance and any in-flight cron ticks to exit up to deadline. A zero
+// deadline means no timeout; a non-awaitable entry (runOnce, never started)
+// returns as soon as its Stop lifecycle ran.
 func (o *Orchestrator) stopEntry(entry *serviceEntry, deadline time.Time) error {
 	// Cancel the entry's teardown context first: it aborts the running instance
-	// and any pending self-heal backoff (C4). The instance cancel is also
-	// cancelled for entries without a teardown (e.g. cron ticks).
+	// and any pending self-heal backoff (C4). Cron entries have no instance
+	// cancel; their in-flight ticks are reached through the shared schedule
+	// context in cronDrain below.
 	if cancel := entry.getTeardownCancel(); cancel != nil {
 		cancel()
 	}
 	if cancel := entry.getCancel(); cancel != nil {
 		cancel()
 	}
+
+	// A cron entry has no instance channel: cancel every in-flight tick and wait
+	// on the drained latch instead of entry.getDone().
+	var awaited <-chan struct{}
 	if entry.cfg.cronSpec != "" {
 		o.removeCronEntry(entry)
+		awaited = entry.cronDrain()
+	} else {
+		awaited = entry.getDone()
 	}
 
-	err := o.stopOneService(entry)
+	err := o.stopOneServiceDeadline(entry, deadline)
+	return waitOrDeadline(err, awaited, deadline)
+}
 
-	done := entry.getDone()
-	if done == nil {
+// waitOrDeadline blocks on ch (when non-nil) up to deadline, joining
+// ErrStopTimeout on expiry. A zero deadline waits indefinitely.
+func waitOrDeadline(err error, ch <-chan struct{}, deadline time.Time) error {
+	if ch == nil {
 		return err
 	}
 	if deadline.IsZero() {
-		<-done
+		<-ch
 		return err
 	}
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
-	case <-done:
+	case <-ch:
 	case <-timer.C:
 		err = errors.Join(err, ErrStopTimeout)
 	}

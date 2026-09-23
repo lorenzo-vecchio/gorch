@@ -71,6 +71,18 @@ type serviceEntry struct {
 	running atomic.Bool
 	// CronQueue serialization lock (serialize ticks mode)
 	cronMu sync.Mutex
+	// cronTrack guards the per-schedule tick accounting below. All ticks of one
+	// schedule derive from cronCtx, so cancelling it cancels every in-flight
+	// tick; cronActive lets stopEntry wait for them all before returning. cronGen
+	// distinguishes schedules so a stale tick from a stopped generation cannot
+	// touch the next one's accounting.
+	cronTrackMu  sync.Mutex
+	cronCtx      context.Context
+	cronCancel   context.CancelFunc
+	cronGen      uint64
+	cronActive   int
+	cronDraining bool
+	cronDrained  chan struct{}
 }
 
 // getSvc returns the current service instance (thread-safe).
@@ -215,6 +227,103 @@ func (e *serviceEntry) teardownActive() bool {
 		return true
 	}
 	return false
+}
+
+// cronGeneration returns the current schedule generation (thread-safe).
+func (e *serviceEntry) cronGeneration() uint64 {
+	e.cronTrackMu.Lock()
+	defer e.cronTrackMu.Unlock()
+	return e.cronGen
+}
+
+// releaseTeardownIf cancels and drops the entry's teardown context only when it
+// is still the one the caller owns. A concurrent start installs a fresh teardown
+// before the old instance's exit handler runs, and the old handler must not
+// cancel it. Thread-safe.
+func (e *serviceEntry) releaseTeardownIf(ctx context.Context) {
+	e.stateMu.Lock()
+	if e.teardown != ctx {
+		e.stateMu.Unlock()
+		return
+	}
+	cancel := e.teardownCancel
+	e.teardown = nil
+	e.teardownCancel = nil
+	e.stateMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// startCronSchedule installs a fresh shared context for a cron schedule and
+// resets the tick accounting, so a re-scheduled entry never inherits a drained
+// or cancelled context. It returns the new schedule generation, which every tick
+// must present to cronBegin/cronEnd. parent is the orchestrator context.
+// Thread-safe.
+func (e *serviceEntry) startCronSchedule(parent context.Context) uint64 {
+	e.cronTrackMu.Lock()
+	defer e.cronTrackMu.Unlock()
+	// Release the previous generation's context before replacing it, so a
+	// re-schedule does not leak uncancelled children of o.ctx.
+	if e.cronCancel != nil {
+		e.cronCancel()
+	}
+	e.cronGen++
+	e.cronCtx, e.cronCancel = context.WithCancel(parent)
+	e.cronActive = 0
+	e.cronDraining = false
+	e.cronDrained = nil
+	return e.cronGen
+}
+
+// cronBegin marks a tick of generation gen as in flight and returns the schedule
+// context every tick derives from. ok is false when the schedule is draining, is
+// from another generation, or its context is already cancelled, so the tick must
+// not run user code. Thread-safe.
+func (e *serviceEntry) cronBegin(gen uint64) (context.Context, bool) {
+	e.cronTrackMu.Lock()
+	defer e.cronTrackMu.Unlock()
+	if e.cronDraining || e.cronCtx == nil || gen != e.cronGen || e.cronCtx.Err() != nil {
+		return nil, false
+	}
+	e.cronActive++
+	return e.cronCtx, true
+}
+
+// cronEnd marks a tick of generation gen finished and closes the drain latch
+// once the last one of that generation exits. A stale generation is ignored so
+// it cannot drive the current schedule's counter negative. Thread-safe.
+func (e *serviceEntry) cronEnd(gen uint64) {
+	e.cronTrackMu.Lock()
+	defer e.cronTrackMu.Unlock()
+	if gen != e.cronGen {
+		return
+	}
+	e.cronActive--
+	if e.cronActive == 0 && e.cronDraining && e.cronDrained != nil {
+		close(e.cronDrained)
+		e.cronDrained = nil
+	}
+}
+
+// cronDrain latches the schedule as draining (refusing any tick not yet past
+// cronBegin), cancels every in-flight tick, and returns a channel closed once
+// they have all exited. It returns nil when nothing is in flight, so callers can
+// skip the wait. Idempotent. Thread-safe.
+func (e *serviceEntry) cronDrain() <-chan struct{} {
+	e.cronTrackMu.Lock()
+	defer e.cronTrackMu.Unlock()
+	e.cronDraining = true
+	if e.cronCancel != nil {
+		e.cronCancel()
+	}
+	if e.cronActive == 0 {
+		return nil
+	}
+	if e.cronDrained == nil {
+		e.cronDrained = make(chan struct{})
+	}
+	return e.cronDrained
 }
 
 // Orchestrator manages service lifecycles.
