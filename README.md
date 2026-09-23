@@ -586,7 +586,7 @@ case <-time.After(10 * time.Second):
 
 gorch follows [Semantic Versioning](https://semver.org/). Until 1.0, minor
 releases may contain breaking changes; every one is marked **Breaking** in the
-[CHANGELOG](CHANGELOG.md) and covered by a migration note.
+[release notes](https://github.com/lorenzo-vecchio/gorch/releases) and covered by a migration note.
 
 - **Stable** — exported identifiers (types, functions, methods), the `Service`,
   `HealthChecker`, `ReadinessChecker`, `Validator`, and `Logger` interfaces, the
@@ -595,9 +595,9 @@ releases may contain breaking changes; every one is marked **Breaking** in the
   internal goroutine counts, and anything unexported. Do not parse log lines.
 - **Deprecations** — a deprecated exported identifier keeps working for at least
   one minor release and is listed as `Deprecated:` in its doc comment and in the
-  CHANGELOG before removal.
+  release notes before removal.
 
-See [MIGRATION.md](MIGRATION.md) for upgrade steps between releases.
+See the [release notes](https://github.com/lorenzo-vecchio/gorch/releases) for upgrade steps between releases.
 
 ## Examples
 
