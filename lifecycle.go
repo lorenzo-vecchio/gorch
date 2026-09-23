@@ -33,8 +33,15 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 
 	o.setStatus(entry, StatusStarting)
 
+	// Per-entry teardown context, fresh for each start era. Instance contexts
+	// are its children, so only StopService/Unregister (or orchestrator Stop)
+	// aborts a pending self-heal; a health-threshold restart cancels just the
+	// instance.
+	entryCtx, entryCancel := context.WithCancel(o.ctx)
+	entry.setTeardown(entryCtx, entryCancel)
+
 	// Per-service context with optional timeout.
-	svcCtx, svcCancel := context.WithCancel(o.ctx)
+	svcCtx, svcCancel := context.WithCancel(entryCtx)
 	entry.setCancel(svcCancel)
 	entry.startedAt = time.Now()
 	entry.setStableSince(time.Now())
@@ -85,6 +92,9 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 		}
 		entry.setCancel(nil)
 		svcCancel()
+		// runOnce does not self-heal, so its teardown context has no further use.
+		entry.clearTeardown()
+		entryCancel()
 
 		if err != nil && err != context.Canceled {
 			o.setStatusErr(entry, StatusCrashed, err)
@@ -102,6 +112,11 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	o.setStatus(entry, StatusRunning)
 	o.metricsStarts.Add(1)
 	o.wg.Add(1)
+
+	// done closes when this instance's goroutine has fully exited, so a
+	// StopService/Unregister can wait for exactly this run.
+	done := make(chan struct{})
+	entry.setDone(done)
 
 	// Create a detachable start context. If timeout is set, we use a separate
 	// context for the race window rather than wrapping the service context.
@@ -124,6 +139,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 				default:
 				}
 				o.handleServiceDone(entry, sc, exitErr)
+				close(done)
 				return
 			}
 			// No self-heal: update status before signalling so a dependent's
@@ -133,6 +149,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 			case startErrCh <- exitErr:
 			default:
 			}
+			close(done)
 		}()
 		exitErr = entry.getSvc().Start(sc)
 		if exitErr != nil && exitErr != context.Canceled {
@@ -313,8 +330,9 @@ func (o *Orchestrator) persistentEntries() []*serviceEntry {
 }
 
 // runService runs a persistent service's Start to completion, recovering panics
-// and handing the exit to handleServiceDone.
-func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext) {
+// and handing the exit to handleServiceDone. done is closed once both the Start
+// call and the self-heal decision have finished.
+func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext, done chan struct{}) {
 	var exitErr error
 	defer func() {
 		if r := recover(); r != nil {
@@ -322,6 +340,7 @@ func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext) {
 			exitErr = fmt.Errorf("panic: %v", r)
 		}
 		o.handleServiceDone(entry, sc, exitErr)
+		close(done)
 	}()
 
 	exitErr = entry.getSvc().Start(sc)
@@ -419,8 +438,23 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	entry.getLogger().Warn("self-heal: restarting service",
 		"retry", entry.getRetryCount(), "delay", delay.String())
 
+	// Wait out the backoff, aborting if the entry is torn down or the
+	// orchestrator shuts down. A cancelled instance context alone is not a
+	// teardown (the health threshold cancels it to trigger a restart), so watch
+	// the per-entry teardown context, which only StopService/Unregister or Stop
+	// cancel (C4).
+	teardown := entry.getTeardown()
+	if teardown == nil {
+		teardown = sc.Context
+	}
 	select {
-	case <-o.ctx.Done():
+	case <-teardown.Done():
+	case <-time.After(delay):
+	}
+	// Re-read the teardown after the select: when the timer and teardown fire
+	// together the select may pick the timer, and spawning the next instance
+	// under a cancelled context would let it outlive this teardown.
+	if teardown.Err() != nil {
 		o.setStatus(entry, StatusStopped)
 		o.mu.Lock()
 		if !entry.wgDone {
@@ -431,7 +465,6 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 			o.mu.Unlock()
 		}
 		return
-	case <-time.After(delay):
 	}
 
 	o.safeStop(entry) // best-effort cleanup of old instance
@@ -447,12 +480,17 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	}
 	entry.setStableSince(time.Now())
 
-	// New per-service context.
-	svcCtx, svcCancel := context.WithCancel(o.ctx)
+	// New per-service context, still under the entry's teardown so a later
+	// teardown aborts this instance too.
+	svcCtx, svcCancel := context.WithCancel(teardown)
 	entry.setCancel(svcCancel)
 	newSc := ServiceContext{Context: svcCtx, Logger: entry.getLogger(), Messenger: o.messenger.scoped(entry.owner)}
 
-	go o.runService(entry, newSc)
+	// The restarted instance gets its own exit channel, so a later teardown
+	// waits for the current run rather than the crashed one.
+	newDone := make(chan struct{})
+	entry.setDone(newDone)
+	go o.runService(entry, newSc, newDone)
 	o.metricsRestarts.Add(1)
 }
 
