@@ -49,6 +49,7 @@ func FuzzMembershipTransitions(f *testing.F) {
 		)
 		_ = o.Start()
 
+		const maxLate = 8
 		late := 0
 		for _, b := range data {
 			switch b % 8 {
@@ -61,12 +62,15 @@ func FuzzMembershipTransitions(f *testing.F) {
 			case 3:
 				_ = o.Unregister("c", 50*time.Millisecond)
 			case 4:
-				// Hot-add a fresh dependent of a and try to start it. Unique
-				// names keep the registration accepted across iterations.
-				late++
-				name := fmt.Sprintf("late-%d", late)
-				_ = o.Register(&namedSvc{}, WithName(name), DependsOn("a"))
-				_ = o.StartService(name)
+				// Hot-add a fresh dependent of a and try to start it. The cap
+				// keeps a large input from exploding the registry, and unique
+				// names keep each registration accepted.
+				if late < maxLate {
+					late++
+					name := fmt.Sprintf("late-%d", late)
+					_ = o.Register(&namedSvc{}, WithName(name), DependsOn("a"))
+					_ = o.StartService(name)
+				}
 			case 5:
 				_ = o.StartService("c")
 			case 6:
