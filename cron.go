@@ -21,8 +21,14 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry) {
 	case CronParallel:
 	}
 
+	// Per-tick context so StopService/Unregister can cancel an in-flight tick by
+	// cancelling the entry's current cancel func (C8).
+	svcCtx, cancel := context.WithCancel(o.ctx)
+	entry.setCancel(cancel)
+	defer cancel()
+
 	sc := ServiceContext{
-		Context:   o.ctx,
+		Context:   svcCtx,
 		Logger:    entry.getLogger(),
 		Messenger: o.messenger.scoped(entry.owner),
 	}
@@ -62,6 +68,19 @@ func (o *Orchestrator) scheduleEntry(entry *serviceEntry) error {
 	}
 	entry.cronID = id
 	return nil
+}
+
+// removeCronEntry deletes entry's schedule from the live scheduler and clears
+// its cron ID, so a later StartService re-schedules it (D14). It is a no-op when
+// the entry has no live schedule. Thread-safe.
+func (o *Orchestrator) removeCronEntry(entry *serviceEntry) {
+	o.mu.Lock()
+	id := entry.cronID
+	entry.cronID = 0
+	o.mu.Unlock()
+	if id != 0 && o.cronSched != nil {
+		o.cronSched.Remove(id)
+	}
 }
 
 // setupCron creates and starts the cron scheduler, registering every cron

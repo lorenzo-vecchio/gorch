@@ -212,6 +212,24 @@ func WithStartCondition(fn func() bool) RegisterOption {
 	return func(cfg *registerConfig) { cfg.startCondition = fn }
 }
 
+// StopOption configures StopService and Unregister.
+type StopOption func(*stopConfig)
+
+// stopConfig holds the resolved stop options.
+type stopConfig struct {
+	cascade bool
+}
+
+// WithCascadeStop extends StopService/Unregister to the target's transitive
+// hard dependents (services whose DependsOn chain reaches the target). They are
+// stopped — or removed — in reverse topological order under the one shared
+// timeout. Without it both operations refuse when a running hard dependent
+// exists (ErrHasDependents). Soft dependencies never block and are never
+// cascaded.
+func WithCascadeStop() StopOption {
+	return func(c *stopConfig) { c.cascade = true }
+}
+
 // Sentinel errors
 var (
 	ErrAlreadyStarted    = errors.New("gorch: orchestrator already started")
@@ -224,6 +242,7 @@ var (
 
 	// Dynamic membership sentinels. See the Contract section of README.md.
 	ErrServiceNotFound      = errors.New("gorch: service not found")
+	ErrHasDependents        = errors.New("gorch: service has running dependents")
 	ErrOrchestratorStopping = errors.New("gorch: orchestrator is stopping")
 	ErrOrchestratorStopped  = errors.New("gorch: orchestrator already stopped")
 	ErrDependencyNotRunning = errors.New("gorch: dependency not running")

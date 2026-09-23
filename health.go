@@ -71,6 +71,10 @@ func (o *Orchestrator) Health() map[string]error {
 
 	result := make(map[string]error, len(entries))
 	for _, e := range entries {
+		// An entry being torn down must not be probed (C5).
+		if e.removing.Load() {
+			continue
+		}
 		hc, ok := e.getSvc().(HealthChecker)
 		if !ok {
 			result[e.name] = nil
@@ -108,6 +112,11 @@ func (o *Orchestrator) runHealthChecks() {
 	o.mu.RUnlock()
 
 	for _, e := range entries {
+		// Skip an entry the health loop snapshotted just before it was removed
+		// or while it is being torn down (C5).
+		if e.removing.Load() {
+			continue
+		}
 		hc, ok := e.getSvc().(HealthChecker)
 		if !ok {
 			continue

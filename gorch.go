@@ -15,9 +15,10 @@ import (
 )
 
 type serviceEntry struct {
-	// stateMu guards svc, logger, cancel, retryCount, stableSince, and
-	// healthFailures — the fields the self-heal restart path mutates while the
-	// health-check loop and introspection methods (Health, IsReady) read them.
+	// stateMu guards svc, logger, cancel, retryCount, stableSince,
+	// healthFailures, done, and teardown — the fields the self-heal restart
+	// path mutates while the health-check loop and introspection methods
+	// (Health, IsReady) read them.
 	stateMu sync.Mutex
 
 	svc    Service
@@ -30,6 +31,14 @@ type serviceEntry struct {
 	status    ServiceStatus
 	cancel    context.CancelFunc // per-service cancellation (nil until started)
 	startedAt time.Time          // when the current instance started
+
+	// teardown and teardownCancel parent every instance context of a running
+	// service. Cancelling them aborts the current instance and any pending
+	// self-heal restart (StopService/Unregister/whole-orchestrator Stop). The
+	// instance context handed to Start is a child, so a health-threshold restart
+	// (which cancels only the instance) does not abort the entry.
+	teardown       context.Context
+	teardownCancel context.CancelFunc
 
 	// retry / backoff state
 	retryCount  int
@@ -47,6 +56,13 @@ type serviceEntry struct {
 	// op (a service starting itself from its own Start) be rejected instead of
 	// recursing (C17).
 	starting atomic.Bool
+	// removing is true while a StopService/Unregister is tearing this entry
+	// down. It rejects new hard-dependency edges from Register (C11).
+	removing atomic.Bool
+	// done is closed once the current instance's goroutine has fully exited,
+	// including its self-heal decision. It is replaced on each (re)start; nil
+	// before the first start and for runOnce entries.
+	done chan struct{}
 	// CronSkip / CronQueue gate
 	running atomic.Bool
 	// CronQueue serialization lock (serialize ticks mode)
@@ -137,6 +153,52 @@ func (e *serviceEntry) setHealthFailures(n int) {
 	e.stateMu.Unlock()
 }
 
+// getDone returns the current instance's exit channel (thread-safe).
+func (e *serviceEntry) getDone() chan struct{} {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.done
+}
+
+// setDone replaces the current instance's exit channel (thread-safe).
+func (e *serviceEntry) setDone(d chan struct{}) {
+	e.stateMu.Lock()
+	e.done = d
+	e.stateMu.Unlock()
+}
+
+// getTeardown returns the entry's teardown context (thread-safe).
+func (e *serviceEntry) getTeardown() context.Context {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.teardown
+}
+
+// getTeardownCancel returns the teardown cancel func (thread-safe).
+func (e *serviceEntry) getTeardownCancel() context.CancelFunc {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	return e.teardownCancel
+}
+
+// setTeardown replaces the entry's teardown context and cancel func
+// (thread-safe).
+func (e *serviceEntry) setTeardown(ctx context.Context, cancel context.CancelFunc) {
+	e.stateMu.Lock()
+	e.teardown = ctx
+	e.teardownCancel = cancel
+	e.stateMu.Unlock()
+}
+
+// clearTeardown drops the entry's teardown context and cancel func
+// (thread-safe).
+func (e *serviceEntry) clearTeardown() {
+	e.stateMu.Lock()
+	e.teardown = nil
+	e.teardownCancel = nil
+	e.stateMu.Unlock()
+}
+
 // Orchestrator manages service lifecycles.
 type Orchestrator struct {
 	cfg     config
@@ -147,6 +209,12 @@ type Orchestrator struct {
 	stopping bool
 	stopped  bool
 	mu       sync.RWMutex // protects started, stopping, stopped, entries slice, nameIndex
+
+	// membershipMu serializes StopService, Unregister, StartGroup and StopGroup
+	// so their entry selection and teardown cannot interleave (C3, D16). It is
+	// held while user Stop hooks run, but startOneService is never called under
+	// it, so a service's own Start can still call StartService safely.
+	membershipMu sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -311,6 +379,9 @@ func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption, dynamic bool)
 				return cfg, fmt.Errorf("%w: dependency %q not found for service %s", ErrDependencyNotFound, dep, cfg.name)
 			}
 			return cfg, fmt.Errorf("gorch: dependency %q not found for service %s", dep, cfg.name)
+		}
+		if depEntry.removing.Load() {
+			return cfg, fmt.Errorf("%w: dependency %q is being removed for service %s", ErrHasDependents, dep, cfg.name)
 		}
 		// Check if dep transitively depends on cfg.name (would create a cycle).
 		if o.dependsOnRecursive(depEntry, cfg.name) {
@@ -649,6 +720,8 @@ func (o *Orchestrator) resetAfterStartFailure() {
 		entry.status = StatusRegistered
 		entry.wgDone = false
 		entry.setCancel(nil)
+		entry.setDone(nil)
+		entry.clearTeardown()
 		entry.setRetryCount(0)
 		entry.setHealthFailures(0)
 		entry.setStableSince(time.Time{})

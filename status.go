@@ -98,15 +98,24 @@ func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
 }
 
 // StartGroup starts all services in the named group in topological order.
+// It takes the shared membership lock, so it cannot interleave with
+// StopService/Unregister/StopGroup (C3, D16).
 func (o *Orchestrator) StartGroup(group string) error {
-	o.mu.RLock()
+	o.membershipMu.Lock()
+	defer o.membershipMu.Unlock()
+
+	o.mu.Lock()
+	if err := o.membershipGateLocked(); err != nil {
+		o.mu.Unlock()
+		return err
+	}
 	entries := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
 		if e.cfg.group == group {
 			entries = append(entries, e)
 		}
 	}
-	o.mu.RUnlock()
+	o.mu.Unlock()
 	levels, err := o.topoSort(entries)
 	if err != nil {
 		return err
@@ -122,16 +131,25 @@ func (o *Orchestrator) StartGroup(group string) error {
 }
 
 // StopGroup stops all non-cron, non-runOnce services in the named group in
-// reverse topological order. Errors are aggregated via errors.Join.
+// reverse topological order. Errors are aggregated via errors.Join. It takes the
+// shared membership lock, so it is serialized against other membership
+// operations (C3, D16).
 func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
-	o.mu.RLock()
+	o.membershipMu.Lock()
+	defer o.membershipMu.Unlock()
+
+	o.mu.Lock()
+	if err := o.membershipGateLocked(); err != nil {
+		o.mu.Unlock()
+		return err
+	}
 	persistent := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
 		if e.cfg.group == group && e.cfg.cronSpec == "" && !e.cfg.runOnce {
 			persistent = append(persistent, e)
 		}
 	}
-	o.mu.RUnlock()
+	o.mu.Unlock()
 	levels, _ := o.topoSort(persistent)
 	var stopErr error
 	for i := len(levels) - 1; i >= 0; i-- {
