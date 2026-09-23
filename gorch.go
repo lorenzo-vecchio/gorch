@@ -27,10 +27,14 @@ type serviceEntry struct {
 
 	// runtime state
 	name      string
-	owner     uint64 // per-instance Messenger ownership id
 	status    ServiceStatus
 	cancel    context.CancelFunc // per-service cancellation (nil until started)
 	startedAt time.Time          // when the current instance started
+
+	// ownerMu guards owners: the Messenger owner ids currently live for this
+	// entry, one per running instance or cron tick. Teardown drains them all.
+	ownerMu sync.Mutex
+	owners  map[uint64]struct{}
 
 	// teardown and teardownCancel parent every instance context of a running
 	// service. Cancelling them aborts the current instance and any pending
@@ -227,6 +231,48 @@ func (e *serviceEntry) teardownActive() bool {
 		return true
 	}
 	return false
+}
+
+// addOwner records id as a live Messenger owner of the entry (one per running
+// instance or cron tick). Thread-safe.
+func (e *serviceEntry) addOwner(id uint64) {
+	e.ownerMu.Lock()
+	if e.owners == nil {
+		e.owners = make(map[uint64]struct{})
+	}
+	e.owners[id] = struct{}{}
+	e.ownerMu.Unlock()
+}
+
+// removeOwner drops id from the entry's live owners. Thread-safe.
+func (e *serviceEntry) removeOwner(id uint64) {
+	e.ownerMu.Lock()
+	delete(e.owners, id)
+	e.ownerMu.Unlock()
+}
+
+// takeOwners returns the entry's live owner ids and clears the set, so a
+// teardown drains exactly what is still live. Thread-safe.
+func (e *serviceEntry) takeOwners() []uint64 {
+	e.ownerMu.Lock()
+	defer e.ownerMu.Unlock()
+	ids := make([]uint64, 0, len(e.owners))
+	for id := range e.owners {
+		ids = append(ids, id)
+	}
+	e.owners = nil
+	return ids
+}
+
+// currentOwner returns one live owner id of the entry, or 0 if none. It is used
+// by introspection; a cron entry may have several owners at once.
+func (e *serviceEntry) currentOwner() uint64 {
+	e.ownerMu.Lock()
+	defer e.ownerMu.Unlock()
+	for id := range e.owners {
+		return id
+	}
+	return 0
 }
 
 // cronGeneration returns the current schedule generation (thread-safe).
@@ -457,7 +503,7 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 		}
 	}
 
-	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, owner: o.ownerSeq.Add(1), status: StatusRegistered}
+	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
 	o.entries = append(o.entries, entry)
 	o.nameIndex[cfg.name] = entry
 	o.mu.Unlock()
@@ -567,7 +613,7 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 		}
 	}
 
-	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, owner: o.ownerSeq.Add(1), status: StatusRegistered}
+	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
 	if customLogger != nil {
 		entry.setLogger(newServiceLoggerWith(entry.name, customLogger))
 	} else {

@@ -793,8 +793,10 @@ func TestDrainService_ScopedToOwner(t *testing.T) {
 	entryA := o.nameIndex["a"]
 	entryB := o.nameIndex["b"]
 	o.mu.Unlock()
-	if entryA.owner == 0 || entryB.owner == 0 || entryA.owner == entryB.owner {
-		t.Fatalf("owner ids must be nonzero and distinct: a=%d b=%d", entryA.owner, entryB.owner)
+	ownerA := entryA.currentOwner()
+	ownerB := entryB.currentOwner()
+	if ownerA == 0 || ownerB == 0 || ownerA == ownerB {
+		t.Fatalf("owner ids must be nonzero and distinct: a=%d b=%d", ownerA, ownerB)
 	}
 
 	o.drainService(entryA)
@@ -829,7 +831,7 @@ func TestDrainService_ResubscribeSameNameFreshOwner(t *testing.T) {
 
 	o.mu.Lock()
 	oldEntry := o.nameIndex["svc"]
-	oldOwner := oldEntry.owner
+	oldOwner := oldEntry.currentOwner()
 	o.mu.Unlock()
 	o.drainService(oldEntry)
 
@@ -855,7 +857,7 @@ func TestDrainService_ResubscribeSameNameFreshOwner(t *testing.T) {
 	<-svc2.ready
 
 	o.mu.Lock()
-	newOwner := o.nameIndex["svc"].owner
+	newOwner := o.nameIndex["svc"].currentOwner()
 	o.mu.Unlock()
 	if newOwner == oldOwner {
 		t.Fatalf("re-added service reused owner id %d", newOwner)
@@ -2058,9 +2060,15 @@ type overlapCronSvc struct {
 	exited  atomic.Int32
 	once    sync.Once
 	entered chan struct{}
+	mu      sync.Mutex
+	chans   []<-chan any
 }
 
 func (s *overlapCronSvc) Start(ctx ServiceContext) error {
+	ch, _ := ctx.Messenger.Subscribe("t")
+	s.mu.Lock()
+	s.chans = append(s.chans, ch)
+	s.mu.Unlock()
 	s.calls.Add(1)
 	s.running.Add(1)
 	s.once.Do(func() { close(s.entered) })
@@ -2071,6 +2079,12 @@ func (s *overlapCronSvc) Start(ctx ServiceContext) error {
 }
 
 func (s *overlapCronSvc) Stop() error { return nil }
+
+func (s *overlapCronSvc) channel(i int) <-chan any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.chans[i]
+}
 
 // TestServiceEntry_CronTracking covers the cron tracking helpers directly: a
 // fresh entry refuses a tick, startCronSchedule installs a context, a stale
@@ -2183,6 +2197,19 @@ func TestStopService_CancelsAllParallelCronTicks(t *testing.T) {
 	}
 	if got := svc.exited.Load(); got != 2 {
 		t.Errorf("exited ticks = %d, want 2 (all cancelled and awaited)", got)
+	}
+	if owner := entry.currentOwner(); owner != 0 {
+		t.Errorf("after teardown the entry must own no Messenger owner, got %d", owner)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case _, ok := <-svc.channel(i):
+			if ok {
+				t.Errorf("tick %d subscription must be drained by teardown", i)
+			}
+		default:
+			t.Errorf("tick %d subscription channel must be closed", i)
+		}
 	}
 }
 
@@ -2329,4 +2356,407 @@ func TestHandleServiceDone_ReleasesTeardown(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
+}
+
+// TestMessenger_PostDrainSubscribeRefused covers the retired-view guard: a
+// scoped view whose owner was drained cannot resurrect subscriptions, and the
+// channel it receives is already closed.
+func TestMessenger_PostDrainSubscribeRefused(t *testing.T) {
+	m := newMessenger()
+	view := m.scoped(11)
+	first, unsub := view.Subscribe("t")
+	if unsub == nil {
+		t.Fatal("Subscribe must return an unsubscribe func")
+	}
+	if first == nil {
+		t.Fatal("Subscribe must return a channel")
+	}
+	m.drainOwner(11)
+
+	ch, noop := view.Subscribe("t")
+	noop() // no-op unsubscribe must be safe
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Error("a post-drain Subscribe must return a closed channel")
+		}
+	default:
+		t.Error("a post-drain Subscribe channel must already be closed")
+	}
+	// Publishing must not reach (or panic on) the refused channel.
+	m.Publish("late", "t")
+}
+
+// TestServiceEntry_CurrentOwnerEmpty covers the empty case of currentOwner.
+func TestServiceEntry_CurrentOwnerEmpty(t *testing.T) {
+	if got := (&serviceEntry{}).currentOwner(); got != 0 {
+		t.Errorf("currentOwner of an idle entry = %d, want 0", got)
+	}
+}
+
+// subTrackingSvc records every channel it subscribes to, so a test can prove an
+// instance's subscriptions are released when it exits.
+type subTrackingSvc struct {
+	once  sync.Once
+	ready chan struct{}
+	mu    sync.Mutex
+	chans []<-chan any
+}
+
+func (s *subTrackingSvc) Start(ctx ServiceContext) error {
+	ch, _ := ctx.Messenger.Subscribe("t")
+	s.mu.Lock()
+	s.chans = append(s.chans, ch)
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.ready) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *subTrackingSvc) Stop() error { return nil }
+
+func (s *subTrackingSvc) channel(i int) <-chan any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.chans[i]
+}
+
+func (s *subTrackingSvc) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.chans)
+}
+
+// TestStopService_RestartDrainsInstanceSubs covers the "Restart drains old subs"
+// matrix row: stopping an instance releases only its subscriptions, and a restart
+// subscribes again under a fresh owner that still receives.
+func TestStopService_RestartDrainsInstanceSubs(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(time.Second)
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	svc := &subTrackingSvc{ready: make(chan struct{})}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("s"); err != nil {
+		t.Fatal(err)
+	}
+	<-svc.ready
+
+	if err := o.StopService("s", time.Second); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+	select {
+	case _, ok := <-svc.channel(0):
+		if ok {
+			t.Error("the stopped instance's subscription must be closed")
+		}
+	default:
+		t.Error("the stopped instance's subscription channel must be closed immediately")
+	}
+
+	if err := o.StartService("s"); err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+	deadline := time.After(2 * time.Second)
+	for svc.count() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("restart did not subscribe")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	o.messenger.Publish("hello", "t")
+	select {
+	case _, ok := <-svc.channel(1):
+		if !ok {
+			t.Error("the restarted instance's subscription must be live")
+		}
+	case <-time.After(time.Second):
+		t.Error("the restarted instance must receive after restart")
+	}
+}
+
+// cronSubSvc subscribes on every tick and returns immediately.
+type cronSubSvc struct {
+	once       sync.Once
+	subscribed chan struct{}
+	mu         sync.Mutex
+	chans      []<-chan any
+}
+
+func (s *cronSubSvc) Start(ctx ServiceContext) error {
+	ch, _ := ctx.Messenger.Subscribe("t")
+	s.mu.Lock()
+	s.chans = append(s.chans, ch)
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.subscribed) })
+	return nil
+}
+
+func (s *cronSubSvc) Stop() error { return nil }
+
+func (s *cronSubSvc) channel(i int) <-chan any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.chans[i]
+}
+
+// TestInvokeCron_ReleasesTickOwner covers the "Tick releases subs" matrix row: a
+// finished tick leaves no live owner behind.
+func TestInvokeCron_ReleasesTickOwner(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(time.Second)
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	svc := &cronSubSvc{subscribed: make(chan struct{})}
+	if err := o.Register(svc, WithName("c"), WithCron("0 0 0 1 1 *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("c"); err != nil {
+		t.Fatal(err)
+	}
+	o.mu.RLock()
+	entry := o.nameIndex["c"]
+	o.mu.RUnlock()
+
+	o.invokeCron(entry, entry.cronGeneration()) // synchronous; the tick returns
+
+	<-svc.subscribed
+	if owner := entry.currentOwner(); owner != 0 {
+		t.Errorf("a finished tick must leave no live owner, got %d", owner)
+	}
+	select {
+	case _, ok := <-svc.channel(0):
+		if ok {
+			t.Error("a finished tick's subscription must be drained")
+		}
+	default:
+		t.Error("a finished tick's subscription channel must be closed")
+	}
+}
+
+// subOnceSvc subscribes then returns immediately, so its instance ends without
+// a teardown.
+type subOnceSvc struct {
+	once  sync.Once
+	ready chan struct{}
+	mu    sync.Mutex
+	ch    <-chan any
+}
+
+func (s *subOnceSvc) Start(ctx ServiceContext) error {
+	ch, _ := ctx.Messenger.Subscribe("t")
+	s.mu.Lock()
+	s.ch = ch
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.ready) })
+	return nil
+}
+
+func (s *subOnceSvc) Stop() error { return nil }
+
+func (s *subOnceSvc) channel() <-chan any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ch
+}
+
+// TestRunOnce_ReleasesSubscription covers the runOnce release: a one-shot
+// service's subscriptions are gone once its Start returns.
+func TestRunOnce_ReleasesSubscription(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(time.Second)
+	svc := &subOnceSvc{ready: make(chan struct{})}
+	if err := o.Register(svc, WithName("r"), WithRunOnce()); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-svc.ready
+
+	o.mu.RLock()
+	entry := o.nameIndex["r"]
+	o.mu.RUnlock()
+	if owner := entry.currentOwner(); owner != 0 {
+		t.Errorf("runOnce must release its owner, got %d", owner)
+	}
+	select {
+	case _, ok := <-svc.channel():
+		if ok {
+			t.Error("a runOnce subscription must be released")
+		}
+	default:
+		t.Error("a runOnce subscription channel must be closed")
+	}
+}
+
+// TestHandleServiceDone_ReleasesInstanceSubs covers the natural-exit release: a
+// non-self-heal instance that returns on its own has its subscriptions drained.
+func TestHandleServiceDone_ReleasesInstanceSubs(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(time.Second)
+	svc := &subOnceSvc{ready: make(chan struct{})}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-svc.ready
+
+	deadline := time.After(2 * time.Second)
+	for {
+		o.mu.RLock()
+		entry := o.nameIndex["s"]
+		o.mu.RUnlock()
+		if entry.currentOwner() == 0 {
+			select {
+			case _, ok := <-svc.channel():
+				if ok {
+					t.Error("a naturally exited instance's subscription must be drained")
+				}
+			default:
+				t.Error("a naturally exited instance's channel must be closed")
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("subscription was not released after a natural exit")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// healSubSvc crashes on its first Start and blocks on the second, recording each
+// instance's subscription channel.
+type healSubSvc struct {
+	mu       sync.Mutex
+	chans    []<-chan any
+	second   chan struct{}
+	secondOn sync.Once
+}
+
+func (s *healSubSvc) Start(ctx ServiceContext) error {
+	ch, _ := ctx.Messenger.Subscribe("t")
+	s.mu.Lock()
+	s.chans = append(s.chans, ch)
+	n := len(s.chans)
+	s.mu.Unlock()
+	if n == 1 {
+		return errors.New("boom")
+	}
+	if n == 2 {
+		s.secondOn.Do(func() { close(s.second) })
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *healSubSvc) Stop() error { return nil }
+
+func (s *healSubSvc) channel(i int) <-chan any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.chans[i]
+}
+
+// TestSelfHeal_RestartDrainsCrashedSubs covers the self-heal restart drain: the
+// crashed instance's subscription is released and the restarted instance owns a
+// fresh, live owner.
+func TestSelfHeal_RestartDrainsCrashedSubs(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(time.Second)
+	svc := &healSubSvc{second: make(chan struct{})}
+	if err := o.Register(svc, WithName("h"),
+		WithSelfHeal(func() Service { return svc }),
+		WithMaxRetries(1),
+		WithBackoff(ConstantBackoff{Delay: time.Millisecond}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-svc.second:
+	case <-time.After(2 * time.Second):
+		t.Fatal("self-heal never restarted the service")
+	}
+
+	select {
+	case _, ok := <-svc.channel(0):
+		if ok {
+			t.Error("the crashed instance's subscription must be drained on restart")
+		}
+	default:
+		t.Error("the crashed instance's subscription channel must be closed")
+	}
+	o.mu.RLock()
+	entry := o.nameIndex["h"]
+	o.mu.RUnlock()
+	if entry.currentOwner() == 0 {
+		t.Error("the restarted instance must own a live owner")
+	}
+}
+
+// TestMessenger_RequestOnDrainedOwner covers the refusal path: Request,
+// RequestAsync and TypedRequest must report an error, never a nil reply.
+func TestMessenger_RequestOnDrainedOwner(t *testing.T) {
+	m := newMessenger()
+	view := m.scoped(42)
+	m.drainOwner(42)
+
+	if _, err := view.Request(context.Background(), "x", "t"); err == nil {
+		t.Error("Request on a drained owner must fail")
+	}
+	if _, err := view.RequestAsync(context.Background(), "x", "t"); err == nil {
+		t.Error("RequestAsync on a drained owner must fail")
+	}
+	if _, err := TypedRequest[string, string](view, context.Background(), "x", "t"); err == nil {
+		t.Error("TypedRequest on a drained owner must fail")
+	}
+}
+
+// TestMessenger_GlobalDrainRetiresOwners covers the Drain/owner symmetry: an
+// existing scoped view cannot resubscribe after a global Drain, while a fresh
+// view (lazy re-init) still can.
+func TestMessenger_GlobalDrainRetiresOwners(t *testing.T) {
+	m := newMessenger()
+	view := m.scoped(5)
+	m.Drain()
+	select {
+	case _, ok := <-mustSubscribe(t, view, "t"):
+		if ok {
+			t.Error("a pre-Drain view must not resubscribe after a global Drain")
+		}
+	default:
+		t.Error("a pre-Drain view's post-Drain channel must be closed")
+	}
+
+	fresh := m.scoped(5)
+	ch, unsub := fresh.Subscribe("t")
+	defer unsub()
+	m.Publish("v", "t")
+	select {
+	case got := <-ch:
+		if got != "v" {
+			t.Errorf("fresh view got %v, want v", got)
+		}
+	case <-time.After(time.Second):
+		t.Error("a fresh view must subscribe after a global Drain")
+	}
+}
+
+func mustSubscribe(t *testing.T, m *Messenger, topic string) <-chan any {
+	t.Helper()
+	ch, _ := m.Subscribe(topic)
+	return ch
 }

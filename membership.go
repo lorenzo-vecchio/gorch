@@ -314,12 +314,35 @@ func (o *Orchestrator) removeEntryLocked(entry *serviceEntry) {
 	o.entries = filtered
 }
 
-// drainService releases every Messenger subscription owned by entry. It is the
-// per-service counterpart of the orchestrator-wide Drain and is used when a
-// service leaves the graph. Repeated calls are a no-op; other services keep
-// their subscriptions and continue to receive Publish. Thread-safe.
+// newOwner allocates a fresh Messenger owner for a running instance or cron
+// tick, registers its liveness token immediately (so a drain that lands before
+// the view is built still retires it), and records it on the entry.
+func (o *Orchestrator) newOwner(entry *serviceEntry) *ownerState {
+	id := o.ownerSeq.Add(1)
+	st := o.messenger.registerOwner(id)
+	entry.addOwner(id)
+	return st
+}
+
+// releaseOwner drains and forgets one owner of the entry when its instance or
+// tick exits. Owner id 0 is the unowned root registry and is never released.
+func (o *Orchestrator) releaseOwner(entry *serviceEntry, id uint64) {
+	if id == 0 {
+		return
+	}
+	entry.removeOwner(id)
+	o.messenger.drainOwner(id)
+}
+
+// drainService releases every Messenger subscription owned by entry, across all
+// live owner ids (one per running instance or cron tick). It is the per-service
+// counterpart of the orchestrator-wide Drain and is used when a service leaves
+// the graph or an instance exits. Repeated calls are a no-op; other services
+// keep their subscriptions and continue to receive Publish. Thread-safe.
 func (o *Orchestrator) drainService(entry *serviceEntry) {
-	o.messenger.drainOwner(entry.owner)
+	for _, id := range entry.takeOwners() {
+		o.messenger.drainOwner(id)
+	}
 }
 
 // statusOf reads an entry's status under the shared status lock.

@@ -113,7 +113,10 @@ func TypedRequest[TReq, TResp any](m *Messenger, ctx context.Context, req TReq, 
 		return zero, fmt.Errorf("gorch: failed to encode request: %w", err)
 	}
 	wrapper := Message{Payload: buf.Bytes(), Topic: topic, TypeName: reflect.TypeOf(req).String()}
-	replyCh, unsub := m.requestMessage(wrapper, topic)
+	replyCh, unsub, ok := m.requestMessage(wrapper, topic)
+	if !ok {
+		return zero, fmt.Errorf("gorch: messenger owner is no longer active")
+	}
 	defer unsub()
 
 	select {
