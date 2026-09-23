@@ -2,6 +2,7 @@ package gorch
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -57,5 +58,68 @@ func BenchmarkTopoSort(b *testing.B) {
 		if _, err := o.topoSort(entries); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// churnOrchestrator builds and starts an orchestrator with n trivial services,
+// then spawns one background goroutine per service that repeatedly stops and
+// restarts it, so registry reads contend with live membership churn. The
+// returned cleanup quiesces the churn and shuts the orchestrator down.
+func churnOrchestrator(b *testing.B, n int) (*Orchestrator, func()) {
+	b.Helper()
+	o := New(WithHealthChecksDisabled())
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("svc-%02d", i)
+		if err := o.Register(&namedSvc{}, WithName(name)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := o.Start(); err != nil {
+		b.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("svc-%02d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = o.StopService(name, 50*time.Millisecond)
+				_ = o.StartService(name)
+			}
+		}()
+	}
+	return o, func() {
+		close(stop)
+		wg.Wait()
+		_ = o.Stop(5 * time.Second)
+	}
+}
+
+// BenchmarkStatusesChurn measures Statuses throughput while background
+// membership operations stop and restart services concurrently (C20).
+func BenchmarkStatusesChurn(b *testing.B) {
+	o, cleanup := churnOrchestrator(b, 8)
+	defer cleanup()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = o.Statuses()
+	}
+}
+
+// BenchmarkNamesChurn measures Names throughput while background membership
+// operations stop and restart services concurrently (C20).
+func BenchmarkNamesChurn(b *testing.B) {
+	o, cleanup := churnOrchestrator(b, 8)
+	defer cleanup()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = o.Names()
 	}
 }

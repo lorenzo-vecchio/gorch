@@ -516,8 +516,9 @@ func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bo
 // after a transient dependency failure).
 // A persistent service that returns an error synchronously aborts Start only when a
 // start timeout is set; without one its launch is fire-and-forget by construction.
-// An orchestrator is single-shot: after a successful Stop it cannot be restarted; a
-// subsequent Start (or Register) returns ErrAlreadyStarted.
+// The whole-orchestrator lifecycle is single-shot: after a successful Stop it cannot
+// be restarted, and a subsequent Start returns ErrAlreadyStarted. Registering after
+// Stop returns ErrOrchestratorStopped instead.
 // Thread-safe.
 func (o *Orchestrator) Start() error {
 	o.mu.Lock()
@@ -733,8 +734,9 @@ func (o *Orchestrator) resetAfterStartFailure() {
 // finish. Returns aggregated errors from all Stop failures, or ErrStopTimeout
 // if services don't all stop within the timeout.
 // Thread-safe. Safe to call on an orchestrator that was never started (no-op).
-// An orchestrator is single-shot: after a successful Stop it cannot be
-// restarted; a subsequent Start (or Register) returns ErrAlreadyStarted.
+// The whole-orchestrator lifecycle is single-shot: after a successful Stop it
+// cannot be restarted, and a subsequent Start returns ErrAlreadyStarted.
+// Registering after Stop returns ErrOrchestratorStopped instead.
 func (o *Orchestrator) Stop(timeout time.Duration) error {
 	var stopErr error
 	o.stopOnce.Do(func() {
