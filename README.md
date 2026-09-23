@@ -89,8 +89,8 @@ These guarantees are part of the public API and are relied upon by callers.
   orchestrator runs. `StopService` keeps the entry registered so it can be
   started again; `Unregister` removes it from the graph. Both cancel the
   service's context and release its Messenger subscriptions; a persistent
-  service's instance is then waited for until it exits, whereas a cron tick is
-  only cancelled. `Unregister` also drops the cron schedule. A stop is refused
+  service's instance and any in-flight cron ticks are then awaited until they
+  exit. `Unregister` also drops the cron schedule. A stop is refused
   with `ErrHasDependents` while a hard dependent is running, unless `WithCascadeStop`
   is passed; soft dependencies never block and are never cascaded.
 - **Whole-orchestrator lifecycle is single-shot.** After a successful `Stop`,
@@ -239,15 +239,15 @@ _ = orch.StopService("db", 5*time.Second)
 _ = orch.StopService("db", 5*time.Second, gorch.WithCascadeStop())
 ```
 
-`timeout` bounds how long the stop waits for each persistent instance's current
-run to exit, and is shared across a cascade (one budget, not one per service).
-A service's own `Stop()` is bounded separately by its `WithStopTimeout`; a
-non-positive `timeout` waits indefinitely. Soft dependencies never block a stop
-and are never cascaded. On a running orchestrator, `Register` and every
-membership method return `ErrOrchestratorStopping` during `Stop` and
-`ErrOrchestratorStopped` afterwards. For a cron service the in-flight tick is
-cancelled and the schedule removed, but the stop does not wait for that tick to
-return.
+`timeout` bounds the whole stop — the service's own `Stop()` and the wait for
+its instance or in-flight cron ticks to exit — and is shared across a cascade
+(one budget, not one per service). A per-service `WithStopTimeout` still caps
+`Stop()` when it is smaller than the remaining budget; a non-positive `timeout`
+waits indefinitely. Soft dependencies never block a stop and are never cascaded.
+On a running orchestrator, `Register` and every membership method return
+`ErrOrchestratorStopping` during `Stop` and `ErrOrchestratorStopped` afterwards.
+For a cron service every in-flight tick is cancelled, the schedule is removed,
+and the stop waits for those ticks to return.
 
 #### Naming policy
 
@@ -281,7 +281,8 @@ orch.Register(svc, gorch.WithStartTimeout(30 * time.Second)) // per-service over
 | `CronSkip` | Drop ticks that would overlap. |
 
 Each tick receives a fresh `ServiceContext` whose context is cancelled when that
-tick returns; `StopService`/`Unregister` cancel the in-flight tick through it.
+tick returns; `StopService`/`Unregister` cancel every in-flight tick through it
+and wait for them to return.
 A statically registered cron entry starts as `StatusRunning`; a hot-added one
 is scheduled immediately by `Register` but reports `StatusRegistered` until
 `StartService` marks it running. `StopService` removes the schedule and a later

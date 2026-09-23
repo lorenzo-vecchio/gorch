@@ -260,6 +260,14 @@ func (o *Orchestrator) setStatusErr(entry *serviceEntry, s ServiceStatus, err er
 // recovery, honoring the entry's per-service stop timeout. It transitions the
 // entry Running/Starting → Stopping → Stopped.
 func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
+	return o.stopOneServiceDeadline(entry, time.Time{})
+}
+
+// stopOneServiceDeadline is stopOneService with an additional hard deadline on
+// the service's own Stop() call: the effective cap is the smaller of the
+// per-service WithStopTimeout and the time remaining before deadline. A zero
+// deadline leaves the per-service timeout in charge.
+func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time.Time) error {
 	o.statusMu.RLock()
 	wasActive := entry.status == StatusRunning || entry.status == StatusStarting
 	o.statusMu.RUnlock()
@@ -279,13 +287,33 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 	// --- stop ---
 	var stopErr error
 	timeout := entry.cfg.stopTimeout
+	// deadlineCapped records that the caller's deadline (rather than the
+	// per-service WithStopTimeout) determined the stop budget, so the caller can
+	// recognise the failure as its own ErrStopTimeout.
+	deadlineCapped := false
+	if !deadline.IsZero() {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			// The deadline already passed: do not fall through to an unbounded
+			// synchronous Stop().
+			remaining = time.Nanosecond
+		}
+		if timeout <= 0 || remaining < timeout {
+			timeout = remaining
+			deadlineCapped = true
+		}
+	}
 	if timeout > 0 {
 		done := make(chan error, 1)
 		go func() { done <- o.safeStopWithResult(entry.getSvc()) }()
 		select {
 		case stopErr = <-done:
 		case <-time.After(timeout):
-			stopErr = fmt.Errorf("stop timeout after %v", timeout)
+			if deadlineCapped {
+				stopErr = fmt.Errorf("stop timeout after %v: %w", timeout, ErrStopTimeout)
+			} else {
+				stopErr = fmt.Errorf("stop timeout after %v", timeout)
+			}
 		}
 	} else {
 		stopErr = o.safeStopWithResult(entry.getSvc())
@@ -361,6 +389,13 @@ func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext, done c
 // For self-heal services it uses the configured backoff and retry policy.
 func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext, exitErr error) {
 	if entry.cfg.factory == nil {
+		// A non-self-heal instance has no further use for its teardown context;
+		// releasing it (deferred, so it runs after the status transition) stops
+		// children of o.ctx accumulating across stop/start cycles. Only this
+		// instance's context is released, so a concurrent restart's fresh one
+		// survives.
+		teardown := entry.getTeardown()
+		defer entry.releaseTeardownIf(teardown)
 		// No self-heal: service stays dead.
 		// If orchestrator is shutting down, Stop() handles status transitions
 		// via stopOneService (running→stopping→stopped). Don't double-transition.
