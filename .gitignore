@@ -1,3 +1,14 @@
 # Coverage
 coverage*.out
 coverage*.html
+
+# Agent tooling (BMAD, AI assistants, code intelligence)
+_bmad/
+_bmad-output/
+.agents/
+.claude/
+.opencode/
+.github/agents/
+.codegraph/
+.ruff_cache/
+AGENTS.md
