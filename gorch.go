@@ -59,6 +59,10 @@ type serviceEntry struct {
 	// removing is true while a StopService/Unregister is tearing this entry
 	// down. It rejects new hard-dependency edges from Register (C11).
 	removing atomic.Bool
+	// removed is set permanently when Unregister deletes the entry from the
+	// registry. It lets a caller that selected the entry before the removal
+	// (e.g. StartGroup) refuse to start it afterwards.
+	removed atomic.Bool
 	// done is closed once the current instance's goroutine has fully exited,
 	// including its self-heal decision. It is replaced on each (re)start; nil
 	// before the first start and for runOnce entries.
@@ -199,6 +203,20 @@ func (e *serviceEntry) clearTeardown() {
 	e.stateMu.Unlock()
 }
 
+// teardownActive reports whether this entry is being torn down: the removing
+// flag is set, or the per-entry teardown context was cancelled. An exit that
+// observes an active teardown is reported StatusStopped rather than Crashed, so
+// StopService/Unregister owns the terminal status.
+func (e *serviceEntry) teardownActive() bool {
+	if e.removing.Load() {
+		return true
+	}
+	if tc := e.getTeardown(); tc != nil && tc.Err() != nil {
+		return true
+	}
+	return false
+}
+
 // Orchestrator manages service lifecycles.
 type Orchestrator struct {
 	cfg     config
@@ -211,9 +229,9 @@ type Orchestrator struct {
 	mu       sync.RWMutex // protects started, stopping, stopped, entries slice, nameIndex
 
 	// membershipMu serializes StopService, Unregister, StartGroup and StopGroup
-	// so their entry selection and teardown cannot interleave (C3, D16). It is
-	// held while user Stop hooks run, but startOneService is never called under
-	// it, so a service's own Start can still call StartService safely.
+	// so their entry selection and reservation cannot interleave (C3, D16). It
+	// is released before any user code runs (Start/Stop and hooks), so a service
+	// may call a membership op from its own Start or Stop without deadlocking.
 	membershipMu sync.Mutex
 
 	ctx    context.Context
@@ -425,6 +443,12 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 		o.mu.Unlock()
 		return err
 	}
+	// Capture the log fields under o.mu: a concurrent Start publishes them in
+	// one critical section, so reading them here without the lock would race.
+	customLogger := o.cfg.Logger
+	logCh := o.logCh
+	logQuit := o.logQuit
+	logLevel := o.cfg.LogLevel
 	o.mu.Unlock()
 
 	// Validate is user code: never invoke it while holding the orchestrator lock.
@@ -435,10 +459,10 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 	}
 
 	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, owner: o.ownerSeq.Add(1), status: StatusRegistered}
-	if o.cfg.Logger != nil {
-		entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
+	if customLogger != nil {
+		entry.setLogger(newServiceLoggerWith(entry.name, customLogger))
 	} else {
-		entry.setLogger(newServiceLogger(entry.name, o.logCh, o.logQuit, o.cfg.LogLevel))
+		entry.setLogger(newServiceLogger(entry.name, logCh, logQuit, logLevel))
 	}
 
 	o.mu.Lock()
@@ -529,29 +553,53 @@ func (o *Orchestrator) Start() error {
 	o.mu.Unlock()
 
 	var startErr error
+	// entries is the graph this Start owns; it is set under o.mu inside the
+	// startOnce closure and reused by resetAfterStartFailure on a failed start.
+	var entries []*serviceEntry
 	o.startOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Only create log channels when using the default (channel-based) logger.
+		var logCh chan logEntry
+		var logQuit chan struct{}
+		var logPumpDone chan struct{}
+		if o.cfg.Logger == nil {
+			logCh = make(chan logEntry, 256)
+			logQuit = make(chan struct{})
+			logPumpDone = make(chan struct{})
+		}
+
+		// Publish the runtime fields and snapshot the graph in one critical
+		// section, before started=true is observable. A concurrent Register
+		// therefore either lands before the snapshot (and is included) or sees a
+		// live orchestrator and appends on the dynamic path under o.mu. Start then
+		// operates only on the snapshot, so it never reads a field a hot
+		// Register is mutating.
 		o.mu.Lock()
 		o.started = true
 		// A no-op Stop() before Start() is harmless but consumes stopOnce; clear it
 		// now that a genuine start is under way so the real shutdown is not skipped.
 		o.stopOnce = sync.Once{}
-		o.mu.Unlock()
-
-		o.ctx, o.cancel = context.WithCancel(context.Background())
-		// Only create log channel when using the default (channel-based) logger.
-		if o.cfg.Logger == nil {
-			o.logCh = make(chan logEntry, 256)
-			o.logQuit = make(chan struct{})
-			o.logPumpDone = make(chan struct{})
+		o.ctx = ctx
+		o.cancel = cancel
+		o.logCh = logCh
+		o.logQuit = logQuit
+		o.logPumpDone = logPumpDone
+		o.cronSched = cron.New(cron.WithSeconds())
+		entries = make([]*serviceEntry, len(o.entries))
+		copy(entries, o.entries)
+		nameIndex := make(map[string]*serviceEntry, len(o.nameIndex))
+		for name, e := range o.nameIndex {
+			nameIndex[name] = e
 		}
+		o.mu.Unlock()
 
 		// Assign loggers keyed by the service name (WithName or auto "$N"), so
 		// log output correlates with Status/name lookups.
-		for _, entry := range o.entries {
+		for _, entry := range entries {
 			if o.cfg.Logger != nil {
 				entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
 			} else {
-				entry.setLogger(newServiceLogger(entry.name, o.logCh, o.logQuit, o.cfg.LogLevel))
+				entry.setLogger(newServiceLogger(entry.name, logCh, logQuit, o.cfg.LogLevel))
 			}
 		}
 
@@ -561,11 +609,11 @@ func (o *Orchestrator) Start() error {
 		}
 
 		// Set up and start the cron scheduler.
-		if err := o.setupCron(); err != nil {
-			o.cancel()
-			if o.logQuit != nil {
-				close(o.logQuit)
-				<-o.logPumpDone
+		if err := o.setupCron(entries); err != nil {
+			cancel()
+			if logQuit != nil {
+				close(logQuit)
+				<-logPumpDone
 			}
 			o.cronSched.Stop()
 			startErr = err
@@ -574,7 +622,7 @@ func (o *Orchestrator) Start() error {
 
 		// Partition: runOnce vs persistent services.
 		var runOnce, persistent []*serviceEntry
-		for _, entry := range o.entries {
+		for _, entry := range entries {
 			if entry.cfg.cronSpec != "" {
 				continue // cron services don't go through Start goroutine
 			}
@@ -590,7 +638,7 @@ func (o *Orchestrator) Start() error {
 			if err := o.startOneService(entry); err != nil {
 				startErr = errors.Join(startErr, fmt.Errorf("%s: %w", entry.name, err))
 				// runOnce failure aborts — do not start persistent services.
-				o.stopStartedServices()
+				o.stopStartedServices(entries)
 				return
 			}
 		}
@@ -599,7 +647,7 @@ func (o *Orchestrator) Start() error {
 		levels, topoErr := o.topoSort(persistent)
 		if topoErr != nil {
 			startErr = errors.Join(startErr, topoErr)
-			o.stopStartedServices()
+			o.stopStartedServices(entries)
 			return
 		}
 
@@ -615,7 +663,7 @@ func (o *Orchestrator) Start() error {
 					defer wg.Done()
 					// Check if any dependencies failed.
 					for _, dep := range e.cfg.dependsOn {
-						depEntry := o.nameIndex[dep]
+						depEntry := nameIndex[dep]
 						o.statusMu.RLock()
 						depStatus := depEntry.status
 						o.statusMu.RUnlock()
@@ -633,7 +681,7 @@ func (o *Orchestrator) Start() error {
 					}
 					// Soft dependencies: check if registered, skip if missing.
 					for _, dep := range e.cfg.softDependsOn {
-						depEntry, ok := o.nameIndex[dep]
+						depEntry, ok := nameIndex[dep]
 						if !ok {
 							continue
 						}
@@ -670,7 +718,7 @@ func (o *Orchestrator) Start() error {
 
 			// If any in this level failed, stop all and skip remaining levels.
 			if len(failed) > 0 {
-				o.stopStartedServices()
+				o.stopStartedServices(entries)
 				return
 			}
 		}
@@ -685,16 +733,18 @@ func (o *Orchestrator) Start() error {
 		}
 	})
 	if startErr != nil {
-		o.resetAfterStartFailure()
+		o.resetAfterStartFailure(entries)
 	}
 	return startErr
 }
 
 // resetAfterStartFailure rolls back all state mutated by a failed Start so the
-// orchestrator can be started again. It first waits for all service goroutines
-// and the log-pump to fully wind down (they were signalled by stopStartedServices
-// or the cron-error path) before resetting.
-func (o *Orchestrator) resetAfterStartFailure() {
+// orchestrator can be started again. It resets only the entries that Start
+// snapshotted: a service hot-added while the failing Start ran keeps its
+// registration state and logger. It first waits for all service goroutines and
+// the log-pump to fully wind down (they were signalled by stopStartedServices or
+// the cron-error path) before resetting.
+func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry) {
 	o.wg.Wait()
 	if o.logPumpDone != nil {
 		<-o.logPumpDone
@@ -704,10 +754,6 @@ func (o *Orchestrator) resetAfterStartFailure() {
 	o.started = false
 	o.stopping = false
 	o.stopped = false
-	o.mu.Unlock()
-	o.startOnce = sync.Once{}
-	o.stopOnce = sync.Once{}
-
 	o.ctx = nil
 	o.cancel = nil
 	o.cronSched = nil
@@ -717,7 +763,7 @@ func (o *Orchestrator) resetAfterStartFailure() {
 	o.healthCancel = nil
 	o.healthDone = nil
 
-	for _, entry := range o.entries {
+	for _, entry := range entries {
 		entry.status = StatusRegistered
 		entry.wgDone = false
 		entry.setCancel(nil)
@@ -728,6 +774,9 @@ func (o *Orchestrator) resetAfterStartFailure() {
 		entry.setStableSince(time.Time{})
 		entry.setLogger(nil)
 	}
+	o.mu.Unlock()
+	o.startOnce = sync.Once{}
+	o.stopOnce = sync.Once{}
 }
 
 // Stop shuts down the orchestrator, waiting up to timeout for services to

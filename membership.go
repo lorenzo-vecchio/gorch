@@ -119,24 +119,22 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 		opt(&cfg)
 	}
 
-	// Serialize teardown transactions so a concurrent StopGroup/Unregister
-	// cannot select the same entries mid-flight (C3, D16).
+	// Serialize teardown *selection* so a concurrent StopGroup/Unregister cannot
+	// pick the same entries mid-flight (C3, D16). The lock is released before any
+	// user code runs: StopService/Unregister may be called from a service's own
+	// Stop hook, and holding membershipMu across it would self-deadlock.
 	o.membershipMu.Lock()
-	defer o.membershipMu.Unlock()
-
 	o.mu.Lock()
 	if err := o.membershipGateLocked(); err != nil {
 		o.mu.Unlock()
+		o.membershipMu.Unlock()
 		return err
 	}
 	entry := o.lookupEntry(name)
 	if entry == nil {
 		o.mu.Unlock()
+		o.membershipMu.Unlock()
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
-	}
-	if entry.starting.Load() {
-		o.mu.Unlock()
-		return fmt.Errorf("%w: %s", errReentrantMembership, name)
 	}
 
 	// ordered holds the target plus its transitive hard dependents, dependents
@@ -146,11 +144,22 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 	if !cfg.cascade {
 		if blockers := o.activeDependentsLocked(entry, ordered); len(blockers) > 0 {
 			o.mu.Unlock()
+			o.membershipMu.Unlock()
 			return fmt.Errorf("%w: %s is depended on by %s", ErrHasDependents, name, strings.Join(blockers, ", "))
 		}
 		// Without cascade only the target itself is stopped/removed; a
 		// non-running dependent stays registered untouched.
 		set = []*serviceEntry{entry}
+	}
+	// Reject any selected entry that is inside its own Start (C17) or already
+	// being removed: another transaction, or a StartGroup reservation (which
+	// sets starting on every selected entry), owns it.
+	for _, e := range set {
+		if e.starting.Load() || e.removing.Load() {
+			o.mu.Unlock()
+			o.membershipMu.Unlock()
+			return fmt.Errorf("%w: %s", errReentrantMembership, e.name)
+		}
 	}
 	// Freeze new hard-dependency edges into the set while it is torn down; a
 	// concurrent Register rejects them (C11).
@@ -158,6 +167,7 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 		e.removing.Store(true)
 	}
 	o.mu.Unlock()
+	o.membershipMu.Unlock()
 
 	// One budget for the whole set (D8): a cascade does not multiply the
 	// caller's deadline.
@@ -277,8 +287,11 @@ func (o *Orchestrator) stopEntry(entry *serviceEntry, deadline time.Time) error 
 	return err
 }
 
-// removeEntryLocked deletes entry from the registry. The caller must hold o.mu.
+// removeEntryLocked deletes entry from the registry and marks it removed. The
+// flag is permanent, so a start that selected the entry before deletion cannot
+// revive it. The caller must hold o.mu.
 func (o *Orchestrator) removeEntryLocked(entry *serviceEntry) {
+	entry.removed.Store(true)
 	delete(o.nameIndex, entry.name)
 	filtered := o.entries[:0]
 	for _, e := range o.entries {

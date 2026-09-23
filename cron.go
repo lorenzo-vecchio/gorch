@@ -3,8 +3,6 @@ package gorch
 import (
 	"context"
 	"fmt"
-
-	"github.com/robfig/cron/v3"
 )
 
 func (o *Orchestrator) invokeCron(entry *serviceEntry) {
@@ -83,11 +81,12 @@ func (o *Orchestrator) removeCronEntry(entry *serviceEntry) {
 	}
 }
 
-// setupCron creates and starts the cron scheduler, registering every cron
-// service and marking them running. Returns ErrInvalidCron on a bad spec.
-func (o *Orchestrator) setupCron() error {
-	o.cronSched = cron.New(cron.WithSeconds())
-	for _, entry := range o.entries {
+// setupCron starts the already-published cron scheduler, registering every cron
+// service from the Start snapshot and marking them running. Returns ErrInvalidCron
+// on a bad spec. The scheduler itself is created by Start under o.mu so a
+// concurrent dynamic Register sees it published before the graph goes live.
+func (o *Orchestrator) setupCron(entries []*serviceEntry) error {
+	for _, entry := range entries {
 		if entry.cfg.cronSpec == "" {
 			continue
 		}
@@ -99,7 +98,7 @@ func (o *Orchestrator) setupCron() error {
 	o.cronSched.Start()
 
 	// Mark cron services as running now that the scheduler is live.
-	for _, entry := range o.entries {
+	for _, entry := range entries {
 		if entry.cfg.cronSpec != "" {
 			o.setStatus(entry, StatusRunning)
 			o.metricsStarts.Add(1)

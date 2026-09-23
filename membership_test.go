@@ -3,6 +3,7 @@ package gorch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1530,9 +1531,12 @@ func TestMembershipTransitions(t *testing.T) {
 }
 
 // TestGroupOps_SerializedWithMembership covers the group-sync matrix row:
-// StartGroup/StopGroup and membership ops share the membership lock, so
-// concurrent calls are serialized instead of racing on entry selection. Run
-// under -race, this asserts no interleaving tears an entry mid-operation.
+// StartGroup/StopGroup and membership ops serialize their *selection*, so
+// concurrent calls never interleave on entry selection. Now that user code runs
+// outside the lock, a call that loses the race against an in-flight group
+// start or teardown is rejected with errReentrantMembership rather than
+// blocking; run under -race, this asserts no interleaving tears an entry
+// mid-operation.
 func TestGroupOps_SerializedWithMembership(t *testing.T) {
 	o := New(WithHealthChecksDisabled())
 	defer o.Stop(2 * time.Second)
@@ -1557,7 +1561,7 @@ func TestGroupOps_SerializedWithMembership(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := fn(); err != nil {
+			if err := fn(); err != nil && !errors.Is(err, errReentrantMembership) {
 				t.Errorf("serialized op failed: %v", err)
 			}
 		}()
@@ -1672,5 +1676,375 @@ func TestStopService_CascadeSharesOneBudget(t *testing.T) {
 	close(d2.release)
 	if err := o.Stop(2 * time.Second); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// ── HSM-5 hardening: Start/Register races and teardown reentrancy ──
+
+// TestStart_ConcurrentRegister exercises the matrix row "Register during Start":
+// a Register loop runs while Start starts a blocking base graph. Start must
+// snapshot the graph under o.mu so the concurrent appends are race-free, and
+// every accepted entry must be either started by that Start or left registered
+// for a later StartService (D1).
+func TestStart_ConcurrentRegister(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+
+	blocking := func() *testSvc {
+		return &testSvc{startFn: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+	}
+	// A slow before-start hook widens the window in which Start is live so the
+	// Register loop overlaps it deterministically.
+	slowHook := func(string) error { time.Sleep(30 * time.Millisecond); return nil }
+	for _, name := range []string{"a", "b", "c"} {
+		if err := o.Register(blocking(), WithName(name), WithOnBeforeStart(slowHook)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	regErr := make(chan error, 1)
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := o.Register(blocking(), WithName(fmt.Sprintf("hot-%d", i))); err != nil {
+				regErr <- err
+				return
+			}
+		}
+	}()
+
+	if err := o.Start(); err != nil {
+		close(stop)
+		wg.Wait()
+		t.Fatalf("Start: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-regErr:
+		t.Fatalf("concurrent Register: %v", err)
+	default:
+	}
+
+	for _, name := range o.Names() {
+		s, ok := o.Status(name)
+		if !ok {
+			t.Fatalf("service %s missing from Status after Start", name)
+		}
+		if !strings.HasPrefix(name, "hot-") {
+			if s != StatusRunning {
+				t.Errorf("base %s status = %v, want StatusRunning", name, s)
+			}
+			continue
+		}
+		if s != StatusRunning && s != StatusRegistered {
+			t.Errorf("hot %s status = %v, want Running (in Start's snapshot) or Registered (hot add)", name, s)
+		}
+	}
+	if err := o.Stop(time.Second); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestMembership_ReentrantFromStart covers the matrix row "Reentrant op from
+// Start": a membership op issued from a service's own Start must return rather
+// than self-deadlock, for both a direct Start and one driven by StartGroup.
+func TestMembership_ReentrantFromStart(t *testing.T) {
+	t.Run("direct self StopService", func(t *testing.T) {
+		o := New()
+		var innerErr error
+		done := make(chan struct{})
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			innerErr = o.StopService("self", time.Second)
+			close(done)
+			return nil
+		}}
+		if err := o.Register(svc, WithName("self"), WithRunOnce()); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer o.Stop(time.Second)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("reentrant StopService from Start deadlocked")
+		}
+		if !errors.Is(innerErr, errReentrantMembership) {
+			t.Errorf("self StopService = %v, want errReentrantMembership", innerErr)
+		}
+	})
+
+	t.Run("direct other Unregister", func(t *testing.T) {
+		o := New()
+		other := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+		if err := o.Register(other, WithName("other"), WithRunOnce()); err != nil {
+			t.Fatal(err)
+		}
+		var innerErr error
+		done := make(chan struct{})
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			innerErr = o.Unregister("other", time.Second)
+			close(done)
+			return nil
+		}}
+		if err := o.Register(svc, WithName("driver"), WithRunOnce()); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer o.Stop(time.Second)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("reentrant Unregister from Start deadlocked")
+		}
+		if innerErr != nil {
+			t.Errorf("Unregister(other) = %v, want nil", innerErr)
+		}
+		if _, ok := o.Status("other"); ok {
+			t.Error("other should be removed")
+		}
+	})
+
+	t.Run("StartGroup self StopService", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+
+		var innerErr error
+		done := make(chan struct{})
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			innerErr = o.StopService("g-self", time.Second)
+			close(done)
+			return nil
+		}}
+		if err := o.Register(svc, WithName("g-self"), WithRunOnce(), WithGroup("g")); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.StartGroup("g"); err != nil {
+			t.Fatalf("StartGroup: %v", err)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("reentrant StopService inside StartGroup deadlocked")
+		}
+		if !errors.Is(innerErr, errReentrantMembership) {
+			t.Errorf("self StopService = %v, want errReentrantMembership", innerErr)
+		}
+	})
+
+	t.Run("StartGroup other Unregister", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+
+		if err := o.Register(&namedSvc{}, WithName("other")); err != nil {
+			t.Fatal(err)
+		}
+		var innerErr error
+		done := make(chan struct{})
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			innerErr = o.Unregister("other", time.Second)
+			close(done)
+			return nil
+		}}
+		if err := o.Register(svc, WithName("g-driver"), WithRunOnce(), WithGroup("g")); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.StartGroup("g"); err != nil {
+			t.Fatalf("StartGroup: %v", err)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("reentrant Unregister inside StartGroup deadlocked")
+		}
+		if innerErr != nil {
+			t.Errorf("Unregister(other) = %v, want nil", innerErr)
+		}
+		if _, ok := o.Status("other"); ok {
+			t.Error("other should be removed")
+		}
+	})
+}
+
+// TestSelfHeal_MaxRetriesVsTeardown drives the crash race deterministically: a
+// self-heal service reaches maxRetries exactly as StopService cancels the
+// instance, and the teardown must win so the entry ends StatusStopped, not
+// StatusCrashed.
+func TestSelfHeal_MaxRetriesVsTeardown(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	var n atomic.Int32
+	secondStarted := make(chan struct{})
+	factory := func() Service {
+		if n.Add(1) == 1 {
+			return &testSvc{startFn: func(ctx context.Context) error {
+				return errors.New("boom")
+			}}
+		}
+		return &testSvc{startFn: func(ctx context.Context) error {
+			close(secondStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+	}
+	if err := o.Register(factory(), WithName("heal"),
+		WithSelfHeal(factory),
+		WithMaxRetries(1),
+		WithBackoff(ConstantBackoff{Delay: time.Millisecond}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer o.Stop(time.Second)
+
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("self-heal never reached the second instance")
+	}
+
+	if err := o.StopService("heal", time.Second); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+	if s, _ := o.Status("heal"); s != StatusStopped {
+		t.Errorf("final status = %v, want StatusStopped (teardown wins the crash race)", s)
+	}
+}
+
+// TestStartOneService_RemovedRejected pins that a start selected before an
+// Unregister removed the entry (e.g. a StartGroup reservation) never revives it.
+func TestStartOneService_RemovedRejected(t *testing.T) {
+	o := New()
+	entry := &serviceEntry{name: "gone", svc: &namedSvc{}, cfg: registerConfig{name: "gone"}}
+	entry.removed.Store(true)
+	if err := o.startOneService(entry); !errors.Is(err, ErrServiceNotFound) {
+		t.Errorf("startOneService on a removed entry = %v, want ErrServiceNotFound", err)
+	}
+}
+
+// TestServiceEntry_TeardownActive covers both teardown signals: the removing
+// flag and a cancelled per-entry teardown context.
+func TestServiceEntry_TeardownActive(t *testing.T) {
+	e := &serviceEntry{}
+	if e.teardownActive() {
+		t.Error("fresh entry must not report a teardown")
+	}
+	e.removing.Store(true)
+	if !e.teardownActive() {
+		t.Error("removing entry must report a teardown")
+	}
+	e.removing.Store(false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.setTeardown(ctx, cancel)
+	if e.teardownActive() {
+		t.Error("live teardown context must not report a teardown")
+	}
+	cancel()
+	if !e.teardownActive() {
+		t.Error("cancelled teardown context must report a teardown")
+	}
+}
+
+// TestStopGroup_HonorsStartGroupReservation covers the StopGroup regression: it
+// released membershipMu before stopping and could stop an entry an in-flight
+// StartGroup had reserved. While the group start is blocked in a synchronous
+// service Start, StopGroup must skip that entry rather than stop it.
+func TestStopGroup_HonorsStartGroupReservation(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		close(entered)
+		<-release
+		return nil
+	}}
+	if err := o.Register(svc, WithName("g1"), WithGroup("g"), WithStartTimeout(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- o.StartGroup("g") }()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("group service never entered Start")
+	}
+
+	if err := o.StopGroup("g", time.Second); err != nil {
+		t.Fatalf("StopGroup: %v", err)
+	}
+	if got := svc.stopCalls.Load(); got != 0 {
+		t.Errorf("StopGroup stopped a reserved entry: Stop calls = %d, want 0", got)
+	}
+
+	close(release)
+	if err := <-startDone; err != nil {
+		t.Fatalf("StartGroup: %v", err)
+	}
+}
+
+// TestStopService_NonCanceledExitIsStopped covers a non-self-heal service that
+// returns a real error just as StopService cancels it: the teardown wins, so it
+// ends StatusStopped, does not fire OnCrash, and does not count as a crash.
+func TestStopService_NonCanceledExitIsStopped(t *testing.T) {
+	var crashCalled atomic.Bool
+	o := New(
+		WithHealthChecksDisabled(),
+		WithOnCrash(func(string, error) { crashCalled.Store(true) }),
+	)
+	started := make(chan struct{})
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return errors.New("shutdown failed")
+	}}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer o.Stop(time.Second)
+	<-started
+
+	if err := o.StopService("s", time.Second); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+	if s, _ := o.Status("s"); s != StatusStopped {
+		t.Errorf("status = %v, want StatusStopped", s)
+	}
+	if crashCalled.Load() {
+		t.Error("OnCrash fired for a teardown-owned exit")
+	}
+	if got := o.Metrics().Crashes; got != 0 {
+		t.Errorf("Crashes = %d, want 0", got)
 	}
 }

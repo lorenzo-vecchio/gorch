@@ -76,14 +76,23 @@ func (o *Orchestrator) Health() map[string]error {
 			continue
 		}
 		hc, ok := e.getSvc().(HealthChecker)
-		if !ok {
-			result[e.name] = nil
+		var probeErr error
+		if ok {
+			// Per-probe deadline so a slow checker does not fail later probes.
+			probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
+			probeErr = hc.Health(probeCtx)
+			cancel()
+		}
+		// Re-validate membership after the probe: a concurrent teardown may have
+		// removed the entry from the graph while the probe ran, and a removed
+		// name must not appear in the result (C5).
+		o.mu.RLock()
+		current := o.nameIndex[e.name]
+		o.mu.RUnlock()
+		if current != e {
 			continue
 		}
-		// Per-probe deadline so a slow checker does not fail later probes.
-		probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
-		result[e.name] = hc.Health(probeCtx)
-		cancel()
+		result[e.name] = probeErr
 	}
 	return result
 }
