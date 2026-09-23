@@ -548,3 +548,325 @@ func TestStartService_ReentrantFromOwnStart(t *testing.T) {
 		t.Fatalf("nested StartService = %v, want reentrant membership error", innerErr)
 	}
 }
+
+// ── Per-service Messenger ownership ──
+
+// TestMessenger_ZeroValueUsable guards the root/view indirection: a bare
+// Messenger value must keep working as before (lazily initializing its
+// registry), so ownership plumbing is invisible to callers.
+func TestMessenger_ZeroValueUsable(t *testing.T) {
+	var m Messenger
+	ch, unsub := m.Subscribe("t")
+	defer unsub()
+	m.Publish("v", "t")
+	select {
+	case got := <-ch:
+		if got != "v" {
+			t.Errorf("zero-value Messenger got %v, want v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("zero-value Messenger should deliver after Subscribe")
+	}
+}
+
+func TestMessenger_DrainOwner_Isolation(t *testing.T) {
+	m := newMessenger()
+	a := m.scoped(1)
+	b := m.scoped(2)
+
+	chA, _ := a.Subscribe("topic")
+	chB, _ := b.Subscribe("topic")
+
+	m.drainOwner(1)
+
+	if _, ok := <-chA; ok {
+		t.Error("drained owner's channel should be closed")
+	}
+	m.Publish("still-there", "topic")
+	select {
+	case v := <-chB:
+		if v != "still-there" {
+			t.Errorf("owner b got %v, want still-there", v)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner b should still receive Publish after owner a drained")
+	}
+	if _, ok := m.subs["topic"][1]; ok {
+		t.Error("drained owner 1 must be absent from the registry")
+	}
+}
+
+func TestMessenger_DrainOwner_IdempotentAndMissing(t *testing.T) {
+	m := newMessenger()
+	ch, _ := m.scoped(7).Subscribe("t")
+
+	m.drainOwner(7)
+	m.drainOwner(7) // no panic, no double close
+	if _, ok := <-ch; ok {
+		t.Error("channel should be closed after drainOwner")
+	}
+	m.drainOwner(99) // owner that never subscribed is a no-op
+}
+
+func TestMessenger_DrainOwner_ThenGlobalDrain(t *testing.T) {
+	m := newMessenger()
+	chA, _ := m.scoped(1).Subscribe("t")
+	chB, _ := m.scoped(2).Subscribe("t")
+
+	m.drainOwner(1)
+	m.Drain()
+
+	if _, ok := <-chA; ok {
+		t.Error("scoped-drained channel should be closed")
+	}
+	if _, ok := <-chB; ok {
+		t.Error("global Drain should close the remaining channel")
+	}
+	if m.subs != nil {
+		t.Error("global Drain must empty the registry")
+	}
+}
+
+func TestMessenger_DrainOwner_RemovesEmptyTopic(t *testing.T) {
+	m := newMessenger()
+	_, _ = m.scoped(3).Subscribe("only")
+	_, _ = m.scoped(4).Subscribe("other")
+
+	m.drainOwner(3)
+
+	if _, ok := m.subs["only"]; ok {
+		t.Error("empty topic must be pruned after drainOwner")
+	}
+	if _, ok := m.subs["other"]; !ok {
+		t.Error("other topics must survive drainOwner")
+	}
+}
+
+func TestMessenger_DrainOwner_ResubscribeFreshOwner(t *testing.T) {
+	m := newMessenger()
+	oldCh, _ := m.scoped(1).Subscribe("t")
+	m.drainOwner(1)
+
+	newCh, _ := m.scoped(2).Subscribe("t")
+	m.Publish("v", "t")
+
+	select {
+	case got := <-newCh:
+		if got != "v" {
+			t.Errorf("new owner got %v, want v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new owner should receive after re-subscribe")
+	}
+	if _, ok := <-oldCh; ok {
+		t.Error("old owner's channel must stay closed")
+	}
+}
+
+// ownerSubSvc subscribes through its ServiceContext.Messenger and exposes both
+// subscription readiness and delivered messages, so tests can tell which
+// instance owns which channel.
+type ownerSubSvc struct {
+	ready chan struct{}
+	got   chan any
+}
+
+func (s *ownerSubSvc) Start(ctx ServiceContext) error {
+	ch, _ := ctx.Messenger.Subscribe("owned")
+	close(s.ready)
+	for {
+		select {
+		case v, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			select {
+			case s.got <- v:
+			default:
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *ownerSubSvc) Stop() error { return nil }
+
+// ownerPubSvc captures the scoped Messenger it is handed so a test can publish
+// through a service's own view.
+type ownerPubSvc struct {
+	ready     chan struct{}
+	messenger *Messenger
+}
+
+func (s *ownerPubSvc) Start(ctx ServiceContext) error {
+	s.messenger = ctx.Messenger
+	close(s.ready)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *ownerPubSvc) Stop() error { return nil }
+
+// TestScopedPublish_ReachesOtherOwners pins Publish to the shared root registry:
+// a service publishing through its scoped view must reach a subscription owned
+// by a different service.
+func TestScopedPublish_ReachesOtherOwners(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(1 * time.Second)
+
+	sub := &ownerSubSvc{ready: make(chan struct{}), got: make(chan any, 8)}
+	pub := &ownerPubSvc{ready: make(chan struct{})}
+	if err := o.Register(sub, WithName("sub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(pub, WithName("pub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-sub.ready
+	<-pub.ready
+
+	pub.messenger.Publish("cross-owner", "owned")
+
+	select {
+	case got := <-sub.got:
+		if got != "cross-owner" {
+			t.Errorf("subscriber got %v, want cross-owner", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a scoped view's Publish must reach another owner's subscription")
+	}
+}
+
+// TestTypedMessaging_SharedAcrossScopedViews pins RegisterType and TypedPublish
+// to the shared root: a type registered via one scoped view must be publishable
+// via another and reach a subscriber on a third.
+func TestTypedMessaging_SharedAcrossScopedViews(t *testing.T) {
+	m := newMessenger()
+	registrar := m.scoped(1)
+	subscriber := m.scoped(2)
+	publisher := m.scoped(3)
+
+	if err := RegisterType[string](registrar); err != nil {
+		t.Fatal(err)
+	}
+	ch, unsub := TypedSubscribe[string](subscriber, "typed")
+	defer unsub()
+
+	TypedPublish(publisher, "hello", "typed")
+
+	select {
+	case got := <-ch:
+		if got != "hello" {
+			t.Errorf("scoped typed delivery got %q, want hello", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("typed message registered on one scoped view must reach a subscriber on another")
+	}
+}
+
+func TestDrainService_ScopedToOwner(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(1 * time.Second)
+
+	svcA := &ownerSubSvc{ready: make(chan struct{}), got: make(chan any, 8)}
+	svcB := &ownerSubSvc{ready: make(chan struct{}), got: make(chan any, 8)}
+	if err := o.Register(svcA, WithName("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(svcB, WithName("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-svcA.ready
+	<-svcB.ready
+
+	o.mu.Lock()
+	entryA := o.nameIndex["a"]
+	entryB := o.nameIndex["b"]
+	o.mu.Unlock()
+	if entryA.owner == 0 || entryB.owner == 0 || entryA.owner == entryB.owner {
+		t.Fatalf("owner ids must be nonzero and distinct: a=%d b=%d", entryA.owner, entryB.owner)
+	}
+
+	o.drainService(entryA)
+
+	o.messenger.Publish("ping", "owned")
+	select {
+	case <-svcB.got:
+	case <-time.After(time.Second):
+		t.Fatal("service b should still receive after service a is drained")
+	}
+	select {
+	case <-svcA.got:
+		t.Error("drained service a must not receive")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	o.drainService(entryA) // idempotent
+}
+
+func TestDrainService_ResubscribeSameNameFreshOwner(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	defer o.Stop(1 * time.Second)
+
+	svc1 := &ownerSubSvc{ready: make(chan struct{}), got: make(chan any, 8)}
+	if err := o.Register(svc1, WithName("svc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-svc1.ready
+
+	o.mu.Lock()
+	oldEntry := o.nameIndex["svc"]
+	oldOwner := oldEntry.owner
+	o.mu.Unlock()
+	o.drainService(oldEntry)
+
+	// Simulate a Phase-3 removal, then re-add under the same name.
+	o.mu.Lock()
+	filtered := o.entries[:0]
+	for _, e := range o.entries {
+		if e != oldEntry {
+			filtered = append(filtered, e)
+		}
+	}
+	o.entries = filtered
+	delete(o.nameIndex, "svc")
+	o.mu.Unlock()
+
+	svc2 := &ownerSubSvc{ready: make(chan struct{}), got: make(chan any, 8)}
+	if err := o.Register(svc2, WithName("svc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("svc"); err != nil {
+		t.Fatalf("StartService re-added: %v", err)
+	}
+	<-svc2.ready
+
+	o.mu.Lock()
+	newOwner := o.nameIndex["svc"].owner
+	o.mu.Unlock()
+	if newOwner == oldOwner {
+		t.Fatalf("re-added service reused owner id %d", newOwner)
+	}
+
+	o.messenger.Publish("fresh", "owned")
+	select {
+	case <-svc2.got:
+	case <-time.After(time.Second):
+		t.Fatal("new instance should receive")
+	}
+	select {
+	case <-svc1.got:
+		t.Error("removed instance must not receive after re-add")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
