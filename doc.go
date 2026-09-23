@@ -28,8 +28,11 @@
 //
 // # Contract
 //
-//   - Lifecycle is single-shot: after a successful Stop the orchestrator cannot
-//     be restarted.
+//   - Membership is dynamic: Register may add a service to a running
+//     orchestrator, and StartService, StopService, and Unregister start, stop,
+//     and remove services while it runs. Only the whole-orchestrator lifecycle
+//     is single-shot: after a successful Stop the orchestrator cannot be
+//     restarted.
 //   - The wire format is encoding/gob and is part of the public contract; types
 //     passed through the typed Messenger helpers must be gob-compatible.
 //   - Publish is drop-only: when a subscriber's buffer is full the message is

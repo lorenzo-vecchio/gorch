@@ -1,6 +1,7 @@
 package gorch
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -31,11 +32,11 @@ func FuzzTypedSubscribeDecode(f *testing.F) {
 
 // FuzzMembershipTransitions drives a random add/start/stop/remove/crash/restart
 // sequence against a small dependency graph, asserting no panic or deadlock.
-// The per-iteration orchestrator is always stopped, so it also guards against
-// goroutine leaks.
+// The per-iteration orchestrator is always stopped and Done() is required to
+// close within a bound, so the target also guards against goroutine leaks.
 func FuzzMembershipTransitions(f *testing.F) {
 	f.Add([]byte{})
-	f.Add([]byte{0, 1, 2, 3, 4, 5})
+	f.Add([]byte{0, 1, 2, 3, 4, 5, 6, 7})
 	f.Add([]byte{5, 5, 4, 3, 2, 1, 0, 2, 2, 0})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		o := New(WithHealthChecksDisabled())
@@ -48,8 +49,9 @@ func FuzzMembershipTransitions(f *testing.F) {
 		)
 		_ = o.Start()
 
+		late := 0
 		for _, b := range data {
-			switch b % 6 {
+			switch b % 8 {
 			case 0:
 				_ = o.StartService("a")
 			case 1:
@@ -59,11 +61,25 @@ func FuzzMembershipTransitions(f *testing.F) {
 			case 3:
 				_ = o.Unregister("c", 50*time.Millisecond)
 			case 4:
-				_ = o.Register(&namedSvc{}, WithName("late"))
+				// Hot-add a fresh dependent of a and try to start it. Unique
+				// names keep the registration accepted across iterations.
+				late++
+				name := fmt.Sprintf("late-%d", late)
+				_ = o.Register(&namedSvc{}, WithName(name), DependsOn("a"))
+				_ = o.StartService(name)
 			case 5:
 				_ = o.StartService("c")
+			case 6:
+				_ = o.StopService("c", 50*time.Millisecond)
+			case 7:
+				_ = o.StopService("b", 50*time.Millisecond)
 			}
 		}
 		_ = o.Stop(2 * time.Second)
+		select {
+		case <-o.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatal("goroutines did not wind down after Stop")
+		}
 	})
 }

@@ -17,6 +17,7 @@ Requires Go 1.25+.
 ## Features
 
 - **Service lifecycle** — Start/Stop with context cancellation and graceful shutdown.
+- **Dynamic membership** — `Register` adds a service to a running orchestrator, and `StartService`/`StopService`/`Unregister` start, stop, and remove services while it runs; `WithCascadeStop` extends a removal to hard dependents.
 - **Run() convenience** — single call starts, blocks on OS signals, then stops.
 - **Dependency ordering** — declare dependencies with `DependsOn`, cycle detection at registration, topological start and reverse-topological stop.
 - **Start timeout** — per-service start deadline via `WithStartTimeout`, with a `DefaultStartTimeout` config default.
@@ -56,12 +57,14 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 
 | Method group | Concurrent with `Start`/`Stop` |
 |--------------|-------------------------------|
-| `Register`, `RegisterFunc` | No — call before `Start`. During or after the lifecycle they return `ErrAlreadyStarted`. |
-| `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the orchestrator is single-shot, so after a successful `Stop` neither can run again. |
-| `Status`, `Statuses`, `Names`, `Count` | Yes — safe to read while services run and during shutdown. |
+| `Register`, `RegisterFunc` | Yes — before `Start` the registry is static (whole graph validated at once); after `Start` the call is a hot add that lands as `StatusRegistered` and is **not** auto-started. While `Stop` runs it returns `ErrOrchestratorStopping`; after `Stop`, `ErrOrchestratorStopped`. |
+| `StartService` | Yes — (re)starts a registered service once every hard dependency is `StatusRunning`. Rejected with an error once whole-orchestrator `Stop` has begun. |
+| `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A running hard dependent blocks the call with `ErrHasDependents` unless `WithCascadeStop` is passed. |
+| `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the **whole-orchestrator lifecycle** is single-shot, so after a successful `Stop` neither can run again. |
+| `Status`, `Statuses`, `Names`, `Count` | Yes — safe to read while services run, while membership churns, and during shutdown. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
 | `Metrics`, `Done` | Yes — atomic counters and a lazily cached channel. |
-| `StartGroup`, `StopGroup` | Not synchronized with `Start`/`Stop`; drive one lifecycle per orchestrator. |
+| `StartGroup`, `StopGroup` | Drive one group per orchestrator; synchronized with `StopService`/`Unregister` but not with whole-orchestrator `Start`/`Stop`. |
 | `Messenger` (`Subscribe`, `Publish`, `Request`, `RequestAsync`, `Drain`) and the typed helpers | Yes — all Messenger methods are safe for concurrent use. |
 
 Service implementations are responsible for their own internal concurrency:
@@ -79,8 +82,19 @@ These guarantees are part of the public API and are relied upon by callers.
 - **`Publish` is drop-only.** Delivery is best-effort. When a subscriber's
   channel is full the message is dropped for that subscriber; gorch never blocks
   the publisher and never replays dropped messages.
-- **Lifecycle is single-shot.** After a successful `Stop`, neither `Start` nor
-  `Register` can be used again; both return `ErrAlreadyStarted`. A failed
+- **Membership is dynamic.** Before `Start`, registration is static. After a
+  successful `Start`, `Register` adds a service to the live graph as
+  `StatusRegistered` (it is not auto-started), and `StartService`,
+  `StopService`, and `Unregister` start, stop, and remove services while the
+  orchestrator runs. `StopService` keeps the entry registered so it can be
+  started again; `Unregister` removes it from the graph. Both cancel the
+  service's context, wait for its instance to exit, and release its Messenger
+  subscriptions; `Unregister` also drops its cron schedule. A stop is refused
+  with `ErrHasDependents` while a hard dependent is running, unless `WithCascadeStop`
+  is passed; soft dependencies never block and are never cascaded.
+- **Whole-orchestrator lifecycle is single-shot.** After a successful `Stop`,
+  neither `Start` nor `Register` can be used again; `Start` returns
+  `ErrAlreadyStarted` and `Register` returns `ErrOrchestratorStopped`. A failed
   `Start` does not consume the lifecycle and may be retried.
 - **Errors are aggregated.** `Start` and `Stop` join every failure with
   `errors.Join`, so a single call reports all causes, not just the first. Use
@@ -90,13 +104,19 @@ Sentinel errors returned by the orchestrator:
 
 | Error | Returned by | Meaning |
 |-------|-------------|---------|
-| `ErrAlreadyStarted` | `Register`, `Start` | Called after the orchestrator already started (or was stopped). |
+| `ErrAlreadyStarted` | `Start` | Called after the orchestrator already started (including after a `Stop`). |
 | `ErrDuplicateName` | `Register` | Two services share a `WithName`. |
 | `ErrDependencyCycle` | `Register`, `Start` | A hard or soft dependency chain loops. |
 | `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
 | `ErrInvalidCron` | `Start` | A `WithCron` spec is invalid. |
 | `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
 | `ErrStopTimeout` | `Stop` | Services did not stop within the caller's timeout. |
+| `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
+| `ErrHasDependents` | `StopService`, `Unregister`, `Register` | A stop/removal would break running hard dependents (pass `WithCascadeStop`), or a dynamic registration names a dependency that is being removed. |
+| `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
+| `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is not `StatusRunning`. |
+| `ErrOrchestratorStopping` | `Register`, `StartService`, `StopService`, `Unregister` | Whole-orchestrator `Stop` is in progress. |
+| `ErrOrchestratorStopped` | `Register`, `StartService`, `StopService`, `Unregister` | Whole-orchestrator `Stop` has completed. |
 
 ## Quick start
 
@@ -181,6 +201,59 @@ orch.Register(apiSvc,  gorch.WithName("api"), gorch.DependsOn("db", "cache"))
 // Start: (db, cache) in parallel → api. Stop: api → (cache, db).
 ```
 
+### Dynamic membership
+
+Before `Start` the registry is static. After `Start`, `Register` is a hot add:
+the service enters the graph as `StatusRegistered` and is **not** started
+automatically — start it with `StartService`. `StartService` also restarts a
+service previously stopped with `StopService`.
+
+```go
+orch.Start()
+
+// Hot-add while the orchestrator runs.
+err := orch.Register(late, gorch.WithName("late"), gorch.DependsOn("db"))
+err = orch.StartService("late") // every hard dependency must be Running
+
+// Stop but keep the entry: Names()/Statuses() still report it, and
+// StartService can bring it back.
+err = orch.StopService("late", 5*time.Second)
+
+// Stop and remove: it leaves Names()/Statuses(), and its cron schedule and
+// Messenger subscriptions are released.
+err = orch.Unregister("late", 5*time.Second)
+```
+
+A plain stop refuses to break a running hard dependent:
+
+```go
+err := orch.StopService("db", 5*time.Second)
+// ErrHasDependents: db is depended on by api
+
+// Tear down the target and its transitive hard dependents in reverse
+// topological order, under one shared timeout.
+err = orch.StopService("db", 5*time.Second, gorch.WithCascadeStop())
+```
+
+`timeout` bounds the whole operation (a single budget shared by a cascade); a
+non-positive timeout waits indefinitely. Soft dependencies never block a stop
+and are never cascaded. On a running orchestrator, `Register` and every
+membership method return `ErrOrchestratorStopping` during `Stop` and
+`ErrOrchestratorStopped` afterwards.
+
+#### Naming policy
+
+- `WithName` assigns the name used as the key everywhere else: `DependsOn` edges,
+  `StartService`/`StopService`/`Unregister`, `Status`/`WaitFor`, and the
+  lifecycle hooks. Names must be unique across the registry.
+- Omitting `WithName` auto-assigns `$1`, `$2`, … in registration order. The
+  counter is monotonic: `Unregister` frees an explicitly named entry, but the
+  auto-name sequence never reuses a value.
+- Re-registering an explicitly named service after its `Unregister` completes is
+  allowed.
+- Registering a hard dependency on a service that is mid-removal fails with
+  `ErrHasDependents`, so a torn-down entry cannot acquire new dependents.
+
 ### Start timeout
 
 Per-service start deadline, with a config-level default.
@@ -197,6 +270,12 @@ orch.Register(svc, gorch.WithStartTimeout(30 * time.Second)) // per-service over
 | `CronParallel` | Fire every tick, overlapping runs allowed. |
 | `CronQueue` | Serialize — wait for the previous run to finish. |
 | `CronSkip` | Drop ticks that would overlap. |
+
+Each tick receives a fresh `ServiceContext` whose context is cancelled when that
+tick returns; `StopService`/`Unregister` cancel the in-flight tick through it.
+A cron entry starts as `StatusRunning`; its schedule is removed by
+`StopService` and re-created by a later `StartService`, while `Unregister` drops
+the entry itself.
 
 ### Status introspection
 
@@ -612,6 +691,7 @@ See the [release notes](https://github.com/lorenzo-vecchio/gorch/releases) for u
 go test . -coverprofile=coverage.out
 go tool cover -func=coverage.out | grep total  # must be 100.0%
 go test . -bench . -benchmem
+go test -fuzz=FuzzMembershipTransitions -fuzztime=30s .
 go vet ./...
 gofmt -w .
 ```
