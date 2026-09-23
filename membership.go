@@ -89,9 +89,11 @@ func (o *Orchestrator) StartService(name string) error {
 // A running hard dependent blocks the stop with ErrHasDependents unless
 // WithCascadeStop() is passed, in which case the target and its transitive hard
 // dependents are stopped in reverse topological order. Soft dependencies never
-// block and are never cascaded. timeout bounds the whole operation (a single
-// budget shared by a cascade); a non-positive timeout waits indefinitely.
-// Returns ErrServiceNotFound for an unknown name and
+// block and are never cascaded. timeout bounds how long the stop waits for each
+// persistent instance's current run to exit, shared across a cascade; a
+// non-positive timeout waits indefinitely. It does not bound a service's own
+// Stop(), which is controlled by WithStopTimeout. A cron tick is cancelled but
+// not awaited. Returns ErrServiceNotFound for an unknown name and
 // ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
 // shutdown has begun. Thread-safe.
 func (o *Orchestrator) StopService(name string, timeout time.Duration, opts ...StopOption) error {
