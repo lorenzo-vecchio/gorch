@@ -625,7 +625,7 @@ func TestStopMultipleErrors(t *testing.T) {
 
 	// handleServiceDone for non-self-heal decrements wg.
 	sc := ServiceContext{Context: o.ctx}
-	o.handleServiceDone(entry, sc, nil)
+	o.handleServiceDone(entry, sc, nil, 0)
 
 	// wg should be done after handleServiceDone.
 	o.wg.Wait()
@@ -951,7 +951,7 @@ func TestSelfHeal(t *testing.T) {
 		entry := &serviceEntry{svc: &namedSvc{name: "x"}, cfg: registerConfig{}}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: context.Background()}
-		o.handleServiceDone(entry, sc, nil)
+		o.handleServiceDone(entry, sc, nil, 0)
 
 		done := make(chan struct{})
 		go func() { o.wg.Wait(); close(done) }()
@@ -967,8 +967,8 @@ func TestSelfHeal(t *testing.T) {
 		entry := &serviceEntry{svc: &namedSvc{name: "x"}, cfg: registerConfig{}}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: context.Background()}
-		o.handleServiceDone(entry, sc, nil)
-		o.handleServiceDone(entry, sc, nil)
+		o.handleServiceDone(entry, sc, nil, 0)
+		o.handleServiceDone(entry, sc, nil, 0)
 
 		done := make(chan struct{})
 		go func() { o.wg.Wait(); close(done) }()
@@ -998,7 +998,7 @@ func TestSelfHeal(t *testing.T) {
 		}
 		o.wg.Add(1)
 		sc := ServiceContext{Context: ctx}
-		o.handleServiceDone(entry, sc, nil)
+		o.handleServiceDone(entry, sc, nil, 0)
 
 		if factoryCalls.Load() != 0 {
 			t.Error("factory should not be called when context is cancelled")
@@ -2940,7 +2940,7 @@ func TestHandleServiceDone_CancelledDuringBackoff(t *testing.T) {
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
 
-	go o.handleServiceDone(entry, sc, nil)
+	go o.handleServiceDone(entry, sc, nil, 0)
 
 	time.Sleep(100 * time.Millisecond)
 	cancel()
@@ -3360,7 +3360,7 @@ func TestHandleServiceDone_FactoryContextCancelled(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc, nil)
+	o.handleServiceDone(entry, sc, nil, 0)
 
 	if factoryCalls.Load() != 0 {
 		t.Error("factory should not be called when context is cancelled")
@@ -3402,7 +3402,7 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc, exitErr)
+	o.handleServiceDone(entry, sc, exitErr, 0)
 
 	if factoryCalls.Load() != 0 {
 		t.Error("factory should not be called when maxRetries reached")
@@ -3616,8 +3616,8 @@ func TestHandleServiceDone_WgDoneTrue_CtxCancelled(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc, nil)
-	o.handleServiceDone(entry, sc, nil)
+	o.handleServiceDone(entry, sc, nil, 0)
+	o.handleServiceDone(entry, sc, nil, 0)
 
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -3644,8 +3644,8 @@ func TestHandleServiceDone_WgDoneTrue_MaxRetries(t *testing.T) {
 	}
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
-	o.handleServiceDone(entry, sc, nil)
-	o.handleServiceDone(entry, sc, nil)
+	o.handleServiceDone(entry, sc, nil, 0)
+	o.handleServiceDone(entry, sc, nil, 0)
 
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -3672,14 +3672,14 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelled(t *testing.T) {
 	o.wg.Add(1)
 	sc := ServiceContext{Context: ctx}
 
-	go o.handleServiceDone(entry, sc, nil)
+	go o.handleServiceDone(entry, sc, nil, 0)
 
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 	time.Sleep(50 * time.Millisecond)
 
 	// Second call: wgDone is already true from the goroutine → else branch.
-	o.handleServiceDone(entry, sc, nil)
+	o.handleServiceDone(entry, sc, nil, 0)
 
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -4951,7 +4951,7 @@ func TestHandleServiceDone_WgDoneTrue_BackoffCancelledV2(t *testing.T) {
 	sc := ServiceContext{Context: ctx}
 
 	// Start handleServiceDone asynchronously — it will enter the backoff delay.
-	go o.handleServiceDone(entry, sc, nil)
+	go o.handleServiceDone(entry, sc, nil, 0)
 
 	// Cancel during backoff, triggering the ctx.Done case in the backoff select.
 	time.Sleep(50 * time.Millisecond)

@@ -88,9 +88,10 @@ These guarantees are part of the public API and are relied upon by callers.
   `StopService`, and `Unregister` start, stop, and remove services while the
   orchestrator runs. `StopService` keeps the entry registered so it can be
   started again; `Unregister` removes it from the graph. Both cancel the
-  service's context and release its Messenger subscriptions; a persistent
-  service's instance and any in-flight cron ticks are then awaited until they
-  exit. `Unregister` also drops the cron schedule. A stop is refused
+  service's context and release its Messenger subscriptions, which are scoped to
+  the instance or tick that created them; a persistent service's instance and any
+  in-flight cron ticks are then awaited until they exit. `Unregister` also drops
+  the cron schedule. A stop is refused
   with `ErrHasDependents` while a hard dependent is running, unless `WithCascadeStop`
   is passed; soft dependencies never block and are never cascaded.
 - **Whole-orchestrator lifecycle is single-shot.** After a successful `Stop`,
@@ -660,6 +661,8 @@ orch := gorch.New(
 ### Drain and Done
 
 `Drain()` closes all subscriber channels and clears subscriptions. `Done()` returns a channel that closes when all goroutines (services, log-pump, health-check loop) have exited — useful for non-blocking shutdown.
+
+A `ServiceContext.Messenger` is a scoped view: its subscriptions are released when the instance or cron tick that created them ends. After that release (or a global `Drain`), `Subscribe` on that same view returns an already-closed channel, and `Request`/`RequestAsync` return an error instead of a nil reply — a goroutine that outlived its service cannot resurrect its subscriptions. A newly created view still subscribes normally.
 
 ```go
 // Gracefully flush pending messages before shutdown.

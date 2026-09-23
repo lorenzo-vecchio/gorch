@@ -29,6 +29,11 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
 	case CronParallel:
 	}
 
+	// Each tick gets a fresh Messenger owner, released when the tick returns, so
+	// subscriptions from earlier ticks do not accumulate under one id.
+	owner := o.newOwner(entry)
+	defer o.releaseOwner(entry, owner.id)
+
 	// Per-tick context as a child of the shared schedule context, so teardown
 	// cancels this tick along with every other in-flight tick (C8).
 	svcCtx, cancel := context.WithCancel(cronParent)
@@ -37,7 +42,7 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
 	sc := ServiceContext{
 		Context:   svcCtx,
 		Logger:    entry.getLogger(),
-		Messenger: o.messenger.scoped(entry.owner),
+		Messenger: o.messenger.view(owner),
 	}
 
 	defer func() {

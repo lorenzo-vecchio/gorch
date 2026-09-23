@@ -38,6 +38,10 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 
 	o.setStatus(entry, StatusStarting)
 
+	// Each instance gets a fresh Messenger owner, so a restart or a later cron
+	// tick never reuses (or accumulates under) the previous instance's id.
+	owner := o.newOwner(entry)
+
 	// Per-entry teardown context, fresh for each start era. Instance contexts
 	// are its children, so only StopService/Unregister (or orchestrator Stop)
 	// aborts a pending self-heal; a health-threshold restart cancels just the
@@ -54,7 +58,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	sc := ServiceContext{
 		Context:   svcCtx,
 		Logger:    entry.getLogger(),
-		Messenger: o.messenger.scoped(entry.owner),
+		Messenger: o.messenger.view(owner),
 	}
 
 	// Determine timeout.
@@ -64,6 +68,9 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	}
 
 	if entry.cfg.runOnce {
+		// runOnce runs synchronously, so its subscriptions have no use once Start
+		// returns: release the owner as the start unwinds.
+		defer o.releaseOwner(entry, owner.id)
 		// RunOnce: run Start synchronously with timeout, don't spawn goroutine.
 		o.setStatus(entry, StatusRunning)
 		o.metricsStarts.Add(1)
@@ -143,13 +150,13 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 				case startErrCh <- nil:
 				default:
 				}
-				o.handleServiceDone(entry, sc, exitErr)
+				o.handleServiceDone(entry, sc, exitErr, owner.id)
 				close(done)
 				return
 			}
 			// No self-heal: update status before signalling so a dependent's
 			// status check deterministically sees Crashed/Stopped, not Running.
-			o.handleServiceDone(entry, sc, exitErr)
+			o.handleServiceDone(entry, sc, exitErr, owner.id)
 			select {
 			case startErrCh <- exitErr:
 			default:
@@ -367,14 +374,14 @@ func (o *Orchestrator) persistentEntries() []*serviceEntry {
 // runService runs a persistent service's Start to completion, recovering panics
 // and handing the exit to handleServiceDone. done is closed once both the Start
 // call and the self-heal decision have finished.
-func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext, done chan struct{}) {
+func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext, done chan struct{}, ownerID uint64) {
 	var exitErr error
 	defer func() {
 		if r := recover(); r != nil {
 			sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
 			exitErr = fmt.Errorf("panic: %v", r)
 		}
-		o.handleServiceDone(entry, sc, exitErr)
+		o.handleServiceDone(entry, sc, exitErr, ownerID)
 		close(done)
 	}()
 
@@ -387,7 +394,10 @@ func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext, done c
 // handleServiceDone is called when a non-cron service exits (normally or via panic).
 // For services without self-heal it decrements the waitgroup once.
 // For self-heal services it uses the configured backoff and retry policy.
-func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext, exitErr error) {
+func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext, exitErr error, ownerID uint64) {
+	// Release exactly this instance's subscriptions as it exits; a concurrent
+	// restart's fresh owner is never touched.
+	defer o.releaseOwner(entry, ownerID)
 	if entry.cfg.factory == nil {
 		// A non-self-heal instance has no further use for its teardown context;
 		// releasing it (deferred, so it runs after the status transition) stops
@@ -492,6 +502,11 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	entry.getLogger().Warn("self-heal: restarting service",
 		"retry", entry.getRetryCount(), "delay", delay.String())
 
+	// The crashed instance's subscriptions have no further use: release them
+	// before the (possibly long) backoff wait, so they do not keep receiving
+	// while the restart is pending.
+	o.releaseOwner(entry, ownerID)
+
 	// Wait out the backoff, aborting if the entry is torn down or the
 	// orchestrator shuts down. A cancelled instance context alone is not a
 	// teardown (the health threshold cancels it to trigger a restart), so watch
@@ -535,16 +550,18 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	entry.setStableSince(time.Now())
 
 	// New per-service context, still under the entry's teardown so a later
-	// teardown aborts this instance too.
+	// teardown aborts this instance too. The restarted instance gets a fresh
+	// Messenger owner, so the crashed instance's subscriptions are not reused.
 	svcCtx, svcCancel := context.WithCancel(teardown)
 	entry.setCancel(svcCancel)
-	newSc := ServiceContext{Context: svcCtx, Logger: entry.getLogger(), Messenger: o.messenger.scoped(entry.owner)}
+	restartOwner := o.newOwner(entry)
+	newSc := ServiceContext{Context: svcCtx, Logger: entry.getLogger(), Messenger: o.messenger.view(restartOwner)}
 
 	// The restarted instance gets its own exit channel, so a later teardown
 	// waits for the current run rather than the crashed one.
 	newDone := make(chan struct{})
 	entry.setDone(newDone)
-	go o.runService(entry, newSc, newDone)
+	go o.runService(entry, newSc, newDone, restartOwner.id)
 	o.metricsRestarts.Add(1)
 }
 
