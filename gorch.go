@@ -1033,7 +1033,22 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 			<-o.cronSched.Stop().Done()
 		}
 
-		// 3. Call Stop() on services in reverse topological order.
+		// 3. Call Stop() on services in reverse topological order. Each stop is
+		// recorded so its terminal status can be committed only after the final
+		// wait proves every instance goroutine exited.
+		type pendingStop struct {
+			entry     *serviceEntry
+			wasActive bool
+			completed bool
+		}
+		var pending []pendingStop
+		stopOne := func(entry *serviceEntry) {
+			wasActive, completed, err := o.stopOneServiceDeadline(entry, stopDeadline)
+			pending = append(pending, pendingStop{entry: entry, wasActive: wasActive, completed: completed})
+			if err != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+			}
+		}
 		persistent := o.persistentEntries()
 		levels, topoErr := o.topoSortForStop(persistent)
 		// A cyclic subset still stops every persistent entry (registration-order
@@ -1041,19 +1056,13 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		stopErr = errors.Join(stopErr, topoErr)
 		for i := len(levels) - 1; i >= 0; i-- {
 			for _, entry := range levels[i] {
-				err := o.stopOneServiceDeadline(entry, stopDeadline)
-				if err != nil {
-					stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
-				}
+				stopOne(entry)
 			}
 		}
 		// Also stop any remaining entries not in levels (e.g., cron-only, runOnce that failed).
 		for _, entry := range o.entries {
 			if entry.cfg.runOnce || entry.cfg.cronSpec != "" {
-				err := o.stopOneServiceDeadline(entry, stopDeadline)
-				if err != nil {
-					stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
-				}
+				stopOne(entry)
 			}
 		}
 
@@ -1065,7 +1074,11 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		// 5. Clean up messenger subscriptions.
 		o.messenger.Drain()
 
-		// 6. Wait for all services + log-pump with whatever budget is left.
+		// 6. Wait for all services + log-pump with whatever budget is left. A
+		// non-positive timeout waits indefinitely. Only once every goroutine has
+		// exited is the stop verified and its terminal status committed; on a
+		// timeout the entries stay StatusStopping rather than falsely claiming
+		// they stopped.
 		done := make(chan struct{})
 		go func() {
 			o.wg.Wait()
@@ -1074,14 +1087,25 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 			}
 			close(done)
 		}()
-		remaining := timeout
-		if !stopDeadline.IsZero() {
-			remaining = max(time.Until(stopDeadline), 0)
+		allDone := false
+		if stopDeadline.IsZero() {
+			<-done
+			allDone = true
+		} else {
+			remaining := max(time.Until(stopDeadline), 0)
+			select {
+			case <-done:
+				allDone = true
+			case <-time.After(remaining):
+				stopErr = errors.Join(stopErr, ErrStopTimeout)
+			}
 		}
-		select {
-		case <-done:
-		case <-time.After(remaining):
-			stopErr = errors.Join(stopErr, ErrStopTimeout)
+		if allDone {
+			for _, p := range pending {
+				if p.completed {
+					o.finishStop(p.entry, p.wasActive)
+				}
+			}
 		}
 
 		// Shutdown is complete: persist the terminal flag so later membership

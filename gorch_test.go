@@ -568,6 +568,50 @@ func TestStop_DeadlineBoundsBlockingHook(t *testing.T) {
 	}
 }
 
+// TestStop_WholeOrchestratorTimeout_StatusNotStopped pins that when the
+// whole-orchestrator Stop deadline expires while a service ignores context
+// cancellation, its entry is left StatusStopping rather than falsely claiming
+// it stopped.
+func TestStop_WholeOrchestratorTimeout_StatusNotStopped(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	svc := &testSvc{startFn: func(ctx context.Context) error { <-release; return nil }}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer close(release)
+
+	if err := o.Stop(50 * time.Millisecond); !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("Stop = %v, want ErrStopTimeout", err)
+	}
+	if s, _ := o.Status("s"); s == StatusStopped {
+		t.Fatalf("Status = %s after Stop timed out; want not stopped (instance is still live)", s)
+	}
+}
+
+// TestStop_ZeroTimeoutWaitsAndCommits pins the documented "non-positive timeout
+// waits indefinitely" contract: Stop(0) waits for every instance to exit and
+// commits the terminal Stopped status without an ErrStopTimeout.
+func TestStop_ZeroTimeoutWaitsAndCommits(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	svc := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Stop(0); err != nil {
+		t.Fatalf("Stop(0) = %v, want nil (waits indefinitely)", err)
+	}
+	if s, _ := o.Status("s"); s != StatusStopped {
+		t.Fatalf("Status = %s after Stop(0), want Stopped", s)
+	}
+}
+
 // TestStop_ClosesMessengerSubscriberChannels verifies that a subscriber blocked
 // on receive observes a channel close when the orchestrator stops.
 func TestStop_ClosesMessengerSubscriberChannels(t *testing.T) {

@@ -45,6 +45,9 @@
 //   - A panic from a lifecycle hook, Validator, start condition, or probe is
 //     recovered and reported as an error (or as unhealthy/unready), so a
 //     misbehaving callback never unwinds through a public entry point.
+//   - A stop that times out is reported honestly: the entry stays
+//     StatusStopping rather than StatusStopped, and the incomplete stop is not
+//     counted in Metrics().Stops.
 //
 // See the README for the concurrency table and the per-method guarantees.
 package gorch

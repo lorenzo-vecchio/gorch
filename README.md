@@ -119,6 +119,14 @@ These guarantees are part of the public API and are relied upon by callers.
   is always invoked, and a hook that overruns is reported as `ErrHookTimeout`
   (also matching `ErrStopTimeout`). A hook that never returns cannot consume the
   entire deadline and leave the service's resources unreleased.
+- **A timed-out stop is reported honestly.** A stop that does not finish inside
+  the caller's timeout — because a hook overran, `Stop()` was still running, or
+  the instance had not exited — leaves the entry `StatusStopping`, not
+  `StatusStopped`, and does not increment `Metrics().Stops`. The terminal
+  `StatusStopped` is committed only once the whole teardown is verified complete,
+  so `Status()`/`Statuses()` never claim a service stopped while it may still be
+  alive. `WaitFor(name, StatusStopped, …)` therefore does not succeed for a
+  timed-out stop.
 
 Sentinel errors returned by the orchestrator:
 
@@ -130,8 +138,8 @@ Sentinel errors returned by the orchestrator:
 | `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
 | `ErrInvalidCron` | `Start`, `Register` (hot add) | A `WithCron` spec is invalid. |
 | `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
-| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister` | A service's `Stop()` did not finish within the caller's timeout. |
-| `ErrHookTimeout` | `Stop`, `StopService`, `Unregister` | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. |
+| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister` | A stop did not finish within the caller's timeout: the before/after-stop hooks, `Stop()`, or the wait for the instance to exit was still in flight. The entry is left `StatusStopping` (not `StatusStopped`) and the stop is not counted in `Metrics().Stops`. |
+| `ErrHookTimeout` | `Stop`, `StopService`, `Unregister` | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. The teardown is unverified, so the entry stays `StatusStopping`. |
 | `ErrNilService` | `Register`, `RegisterFunc` | A nil `Service`, or a nil `Start` closure passed to `RegisterFunc`. |
 | `ErrOrchestratorNotStarted` | `StartService` | Called before the orchestrator was started. |
 | `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | The entry is reserved by an in-flight membership operation. Either the caller re-entered from a service's own `Start`/`Stop` (a programming error) or it lost a benign race with a concurrent reservation (retry once the reservation clears). |
@@ -274,7 +282,11 @@ every membership method return `ErrOrchestratorStopping` during `Stop` and
 cancelled, the schedule is removed, and the stop waits for those ticks to return.
 The budget is split so a before-stop hook cannot consume all of it: the hook is
 bounded and an overrun is reported as `ErrHookTimeout` while the service's own
-`Stop()` still runs with the remainder.
+`Stop()` still runs with the remainder. A stop that does not complete inside the
+budget — a hook overran, `Stop()` was capped away, or the instance had not yet
+exited — leaves the entry `StatusStopping` rather than `StatusStopped`, and is
+not counted in `Metrics().Stops`; `StatusStopped` is committed only once the
+teardown is verified complete.
 
 A membership operation that finds the entry reserved by another in-flight
 operation returns `ErrReentrantMembership`. That is either a genuine
@@ -627,7 +639,7 @@ No manual gob encoding is required anywhere in user code.
 
 ### Metrics
 
-`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency. Each stop of an instance is counted exactly once, even when a teardown and the instance's own exit race.
+`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency. Each stop of an instance is counted exactly once, even when a teardown and the instance's own exit race. `Stops` counts only stops that completed; a stop that timed out (`ErrStopTimeout`/`ErrHookTimeout`, or a `WithStopTimeout` cap that fired) is not counted, matching its unverified `StatusStopping`.
 
 ```go
 stats := orch.Metrics()
