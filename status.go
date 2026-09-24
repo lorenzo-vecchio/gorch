@@ -94,7 +94,8 @@ func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
 	if !ok {
 		return true
 	}
-	return rc.Ready(ctx) == nil
+	err := callErr(func() error { return rc.Ready(ctx) })
+	return err == nil
 }
 
 // StartGroup starts all services in the named group in topological order.

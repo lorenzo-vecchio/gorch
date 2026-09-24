@@ -164,12 +164,21 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 		}
 	}
 	// Freeze new hard-dependency edges into the set while it is torn down; a
-	// concurrent Register rejects them (C11).
+	// concurrent Register rejects them (C11). The defer guarantees the flags are
+	// cleared even if a stop below panics: a leaked removing flag would reject
+	// every later membership op on the entry (C1.1).
 	for _, e := range set {
 		e.removing.Store(true)
 	}
 	o.mu.Unlock()
 	o.membershipMu.Unlock()
+	defer func() {
+		o.mu.Lock()
+		for _, e := range set {
+			e.removing.Store(false)
+		}
+		o.mu.Unlock()
+	}()
 
 	// One budget for the whole set (D8): a cascade does not multiply the
 	// caller's deadline.
@@ -201,11 +210,6 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 		o.drainService(e)
 	}
 
-	o.mu.Lock()
-	for _, e := range set {
-		e.removing.Store(false)
-	}
-	o.mu.Unlock()
 	return stopErr
 }
 

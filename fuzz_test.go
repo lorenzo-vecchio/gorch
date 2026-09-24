@@ -68,6 +68,22 @@ func FuzzMembershipTransitions(f *testing.F) {
 		_ = o.Register(cronSvc, WithName("cron"), WithCron("* * * * * *", CronParallel))
 		_ = o.Start()
 
+		// assertNoReservationLeak pins the reservation lifecycle: once every
+		// membership op of an iteration has returned, no entry may still be
+		// flagged starting. A leaked reservation is what would leave an entry
+		// stuck in StatusStarting and reject every later membership op.
+		assertNoReservationLeak := func() {
+			o.mu.RLock()
+			entries := make([]*serviceEntry, len(o.entries))
+			copy(entries, o.entries)
+			o.mu.RUnlock()
+			for _, e := range entries {
+				if e.starting.Load() {
+					t.Fatalf("entry %s left a start reservation in flight", e.name)
+				}
+			}
+		}
+
 		// stopChecked runs a stop op and, when it succeeds, asserts the public
 		// status is honest and the Stops metric moved by at most maxDelta, so a
 		// teardown/done race cannot double-count one stop.
@@ -145,8 +161,15 @@ func FuzzMembershipTransitions(f *testing.F) {
 				}
 				_ = o.StartService("cron")
 			}
+			assertNoReservationLeak()
 		}
 		_ = o.Stop(2 * time.Second)
+		assertNoReservationLeak()
+		for name, s := range o.Statuses() {
+			if s == StatusStarting {
+				t.Fatalf("entry %s still StatusStarting after shutdown", name)
+			}
+		}
 		select {
 		case <-o.Done():
 		case <-time.After(2 * time.Second):

@@ -119,26 +119,19 @@ func (o *Orchestrator) removeCronEntry(entry *serviceEntry) {
 
 // setupCron starts the already-published cron scheduler, registering every cron
 // service from the Start snapshot and marking them running. Returns ErrInvalidCron
-// on a bad spec. The scheduler itself is created by Start under o.mu so a
+// on a bad spec. It funnels each entry through startCronEntry — the same commit
+// path dynamic StartService uses — so a statically and a dynamically scheduled
+// entry cannot diverge. The scheduler itself is created by Start under o.mu so a
 // concurrent dynamic Register sees it published before the graph goes live.
 func (o *Orchestrator) setupCron(entries []*serviceEntry) error {
 	for _, entry := range entries {
 		if entry.cfg.cronSpec == "" {
 			continue
 		}
-		if err := o.scheduleEntry(entry); err != nil {
+		if err := o.startCronEntry(entry); err != nil {
 			return err
 		}
 	}
-
 	o.cronSched.Start()
-
-	// Mark cron services as running now that the scheduler is live.
-	for _, entry := range entries {
-		if entry.cfg.cronSpec != "" {
-			o.setStatus(entry, StatusRunning)
-			o.metricsStarts.Add(1)
-		}
-	}
 	return nil
 }
