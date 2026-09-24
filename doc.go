@@ -37,6 +37,11 @@
 //     passed through the typed Messenger helpers must be gob-compatible.
 //   - Publish is drop-only: when a subscriber's buffer is full the message is
 //     dropped for that subscriber.
+//   - No user code (Start, Stop, Validate, probes, or lifecycle hooks) runs
+//     while an orchestrator lock is held, so user code may block or call back
+//     into membership operations without deadlocking.
+//   - A hot-added cron service is staged by Register and only scheduled by
+//     StartService, so it never ticks while reporting StatusRegistered.
 //
 // See the README for the concurrency table and the per-method guarantees.
 package gorch
