@@ -58,13 +58,13 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 | Method group | Concurrent with `Start`/`Stop` |
 |--------------|-------------------------------|
 | `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A hot add made while `Start` runs lands either in `Start`'s snapshot or, after it, live as `StatusRegistered` (never auto-started); before `Start` it is part of the static graph. It is rejected with `ErrOrchestratorStopping` while `Stop` runs and `ErrOrchestratorStopped` after `Stop`. |
-| `StartService` | Yes — (re)starts a registered service once every hard dependency is `StatusRunning`. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. |
-| `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A running hard dependent blocks the call with `ErrHasDependents` unless `WithCascadeStop` is passed. |
+| `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning`; an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. |
+| `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents` unless `WithCascadeStop` is passed; with cascade, every transitive hard dependent is stopped/removed, while non-running ones are marked `Stopped` without blocking. |
 | `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the **whole-orchestrator lifecycle** is single-shot, so after a successful `Stop` neither can run again. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
 | `Status`, `Statuses`, `Names`, `Count` | Yes — safe to read while services run, while membership churns, and during shutdown. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
 | `Metrics`, `Done` | Yes — atomic counters and a lazily cached channel. |
-| `StartGroup`, `StopGroup` | Drive one group per orchestrator; serialized with `StopService`/`Unregister` by the membership lock, and gated by shutdown (`ErrOrchestratorStopping`/`ErrOrchestratorStopped`). |
+| `StartGroup`, `StopGroup` | Drive one group per orchestrator. Serialized with `StopService`/`Unregister` by the membership lock; a group start reserves each member and rolls back the members it already started if a later one fails, and a group stop honours a concurrent start's reservation by skipping that entry. Both are gated by shutdown (`ErrOrchestratorStopping`/`ErrOrchestratorStopped`). Group ops are not synchronized with the whole-orchestrator `Start`/`Stop` beyond that shutdown gate: do not drive them from inside a concurrent `Start`/`Stop`. |
 | `Messenger` (`Subscribe`, `Publish`, `Request`, `RequestAsync`, `Drain`) and the typed helpers | Yes — all Messenger methods are safe for concurrent use. |
 
 Service implementations are responsible for their own internal concurrency:
@@ -108,6 +108,17 @@ These guarantees are part of the public API and are relied upon by callers.
   deadlocking. This is enforced as a class-wide invariant (static and dynamic
   registration, `Health` and the periodic probe path, `Start`, and group
   selection), not per call site.
+- **A misbehaving callback does not panic the caller.** A panic raised by a
+  lifecycle hook, `Validator`, start condition, or health/readiness probe is
+  recovered and reported as an error (or as unhealthy/unready); it never unwinds
+  through a public entry point. `Register(nil, …)` and a nil `RegisterFunc`
+  `startFn` are rejected with `ErrNilService` rather than deferred to a panic at
+  `Start`.
+- **A blocked before-stop hook cannot strand a service.** `Stop`'s budget is
+  split so the hook gets at most half of what remains; the service's own `Stop()`
+  is always invoked, and a hook that overruns is reported as `ErrHookTimeout`
+  (also matching `ErrStopTimeout`). A hook that never returns cannot consume the
+  entire deadline and leave the service's resources unreleased.
 
 Sentinel errors returned by the orchestrator:
 
@@ -119,9 +130,11 @@ Sentinel errors returned by the orchestrator:
 | `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
 | `ErrInvalidCron` | `Start`, `Register` (hot add) | A `WithCron` spec is invalid. |
 | `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
-| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister` | Services or their stop hooks did not finish within the caller's timeout. |
+| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister` | A service's `Stop()` did not finish within the caller's timeout. |
+| `ErrHookTimeout` | `Stop`, `StopService`, `Unregister` | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. |
+| `ErrNilService` | `Register`, `RegisterFunc` | A nil `Service`, or a nil `Start` closure passed to `RegisterFunc`. |
 | `ErrOrchestratorNotStarted` | `StartService` | Called before the orchestrator was started. |
-| `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | A membership op re-entered from a service's own `Start`/`Stop`, or lost a race against an in-flight reservation. |
+| `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | The entry is reserved by an in-flight membership operation. Either the caller re-entered from a service's own `Start`/`Stop` (a programming error) or it lost a benign race with a concurrent reservation (retry once the reservation clears). |
 | `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
 | `ErrHasDependents` | `StopService`, `Unregister`, `Register` | A stop/removal would break running hard dependents (pass `WithCascadeStop`), or a dynamic registration names a dependency that is being removed. |
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
@@ -259,6 +272,26 @@ every membership method return `ErrOrchestratorStopping` during `Stop` and
 `ErrOrchestratorStopped` afterwards. `StartService` before `Start` returns
 `ErrOrchestratorNotStarted`. For a cron service every in-flight tick is
 cancelled, the schedule is removed, and the stop waits for those ticks to return.
+The budget is split so a before-stop hook cannot consume all of it: the hook is
+bounded and an overrun is reported as `ErrHookTimeout` while the service's own
+`Stop()` still runs with the remainder.
+
+A membership operation that finds the entry reserved by another in-flight
+operation returns `ErrReentrantMembership`. That is either a genuine
+same-goroutine re-entry (a service calling a membership op from its own `Start`
+or `Stop`, a programming error) or a lost race against a concurrent reservation,
+which is benign and retryable: the reservation is released when the in-flight
+`Start`/`Stop`/group operation returns. `Status` reports `StatusStarting` while a
+service's `Start` runs, so a reserved entry is observable; a reservation taken by
+`StopService`/`Unregister`/`StopGroup` is visible as `StatusStopping`.
+
+Hard dependencies must be registered before the service that names them, both
+statically and on a hot add: `Register` rejects an unknown hard dependency
+immediately (dynamically with `ErrDependencyNotFound`). `Count`, `Names`, and
+`Statuses` include an entry the moment it is registered, including one reserved
+mid-`Start` and a staged cron entry, so their status is `StatusStarting`/
+`StatusStopped`/`StatusRegistered` as appropriate. `Done()` closes only after
+`Stop` has wound everything down, even if every service was unregistered first.
 
 #### Naming policy
 
@@ -690,7 +723,8 @@ case <-time.After(10 * time.Second):
 
 gorch follows [Semantic Versioning](https://semver.org/). Until 1.0, minor
 releases may contain breaking changes; every one is marked **Breaking** in the
-[release notes](https://github.com/lorenzo-vecchio/gorch/releases) and covered by a migration note.
+[release notes](https://github.com/lorenzo-vecchio/gorch/releases) and covered by
+the [migration guide](MIGRATION.md).
 
 - **Stable** — exported identifiers (types, functions, methods), the `Service`,
   `HealthChecker`, `ReadinessChecker`, `Validator`, and `Logger` interfaces, the
