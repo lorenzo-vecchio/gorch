@@ -222,8 +222,8 @@ func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
 		o.mu.Unlock()
 	}()
 
-	levels, _ := o.topoSort(persistent)
-	var stopErr error
+	levels, topoErr := o.topoSortForStop(persistent)
+	stopErr := topoErr
 	for i := len(levels) - 1; i >= 0; i-- {
 		for _, entry := range levels[i] {
 			if err := o.stopOneService(entry); err != nil {
@@ -319,7 +319,10 @@ func (o *Orchestrator) Done() <-chan struct{} {
 
 // topoSort groups entries into levels based on their dependsOn chains.
 // Services in the same level are independent and can start in parallel.
-// Returns ErrDependencyCycle if a cycle is detected.
+// entries may be a subset of the registered graph: dependency edges pointing
+// outside the set are ignored (there is no ordering to derive against an entry
+// this call will not operate on). Returns ErrDependencyCycle if a cycle is
+// detected within the set.
 func (o *Orchestrator) topoSort(entries []*serviceEntry) ([][]*serviceEntry, error) {
 	if len(entries) == 0 {
 		return nil, nil
@@ -337,11 +340,19 @@ func (o *Orchestrator) topoSort(entries []*serviceEntry) ([][]*serviceEntry, err
 			inDegree[name] = 0
 		}
 	}
-	// Add hard edges, then soft edges (only when the soft dep is present in
-	// this entry set — otherwise it is ignored).
+	// Add hard edges, then soft edges. Only an edge whose target is present in
+	// this entry set constrains the ordering: entries is a subset of the graph
+	// (e.g. Start skips cron/runOnce gates, StopGroup selects one group), and a
+	// dependency outside the subset is never visited, so counting it would leave
+	// a dangling in-degree and report a phantom ErrDependencyCycle. Hard-dep
+	// existence is already enforced by parseRegisterOptions, so ignoring the
+	// out-of-subset edge cannot mask a real config error.
 	for _, e := range entries {
 		name := e.name
 		for _, dep := range e.cfg.dependsOn {
+			if _, ok := byName[dep]; !ok {
+				continue
+			}
 			children[dep] = append(children[dep], name)
 			inDegree[name]++
 		}
@@ -386,6 +397,19 @@ func (o *Orchestrator) topoSort(entries []*serviceEntry) ([][]*serviceEntry, err
 		levels = append(levels, levelEntries)
 	}
 
+	return levels, nil
+}
+
+// topoSortForStop orders entries for teardown. A cyclic subset has no valid
+// topological order, so it falls back to registration order (the caller iterates
+// levels in reverse) and still returns the error: every entry is reached, and
+// the caller surfaces why the order could not be honoured instead of silently
+// stopping nothing.
+func (o *Orchestrator) topoSortForStop(entries []*serviceEntry) ([][]*serviceEntry, error) {
+	levels, err := o.topoSort(entries)
+	if err != nil {
+		return [][]*serviceEntry{entries}, err
+	}
 	return levels, nil
 }
 
