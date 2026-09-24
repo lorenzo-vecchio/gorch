@@ -2199,21 +2199,45 @@ func TestOneShot(t *testing.T) {
 		_ = o.Stop(time.Second)
 	})
 
-	t.Run("hard_dep_on_runonce_is_cycle", func(t *testing.T) {
-		// runOnce gates are not part of the persistent topo set, so a hard
-		// DependsOn on one is a dependency cycle by construction (use ordering,
-		// not a hard edge, to run after a gate).
+	t.Run("hard_dep_on_runonce_is_allowed", func(t *testing.T) {
+		// A runOnce gate runs in an earlier phase than persistent services, so a
+		// hard DependsOn on one is satisfiable: the gate is outside the persistent
+		// topo subset, and its edge must be ignored rather than treated as a cycle.
 		o := New(WithLogLevel(LogLevelWarn))
-		gate := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+		var mu sync.Mutex
+		var order []string
+		gate := &testSvc{startFn: func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "gate")
+			mu.Unlock()
+			return nil
+		}}
+		workerStarted := make(chan struct{})
+		worker := &testSvc{startFn: func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, "worker")
+			mu.Unlock()
+			close(workerStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		}}
 		_ = o.Register(gate, WithName("gate"), WithRunOnce())
-		_ = o.Register(&testSvc{}, WithName("worker"), DependsOn("gate"))
-		err := o.Start()
-		if err == nil {
-			o.Stop(time.Second)
-			t.Fatal("expected ErrDependencyCycle for a hard dep on a runOnce gate")
+		_ = o.Register(worker, WithName("worker"), DependsOn("gate"))
+		if err := o.Start(); err != nil {
+			t.Fatalf("hard dep on a runOnce gate must not fail Start: %v", err)
 		}
-		if !errors.Is(err, ErrDependencyCycle) {
-			t.Errorf("expected ErrDependencyCycle, got %v", err)
+		defer o.Stop(time.Second)
+
+		select {
+		case <-workerStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker was never started")
+		}
+		mu.Lock()
+		got := append([]string(nil), order...)
+		mu.Unlock()
+		if len(got) != 2 || got[0] != "gate" || got[1] != "worker" {
+			t.Errorf("expected gate to run before worker, got %v", got)
 		}
 	})
 
@@ -2564,6 +2588,118 @@ func TestTopoSort_Single(t *testing.T) {
 	}
 	if len(levels) != 1 || len(levels[0]) != 1 || levels[0][0].name != "lonely" {
 		t.Errorf("expected single level with lonely, got %v", levels)
+	}
+}
+
+// TestTopoSort_HardDepOutsideSet_NoCycle pins that a hard dependency pointing
+// outside the entry subset does not leave a dangling in-degree and falsely
+// report ErrDependencyCycle.
+func TestTopoSort_HardDepOutsideSet_NoCycle(t *testing.T) {
+	o := New()
+	entries := []*serviceEntry{
+		{name: "app", cfg: registerConfig{name: "app", dependsOn: []string{"migrate"}}},
+	}
+	levels, err := o.topoSort(entries)
+	if err != nil {
+		t.Fatalf("hard dependency outside the entry set must not yield a cycle, got %v", err)
+	}
+	if len(levels) != 1 || len(levels[0]) != 1 || levels[0][0].name != "app" {
+		t.Fatalf("expected app in a single level, got %v", levels)
+	}
+}
+
+// TestStart_Stop_PersistentDependingOnRunOnceGate pins the documented migration
+// pattern: a persistent service hard-depends on a runOnce gate. Start skips the
+// gate in its persistent subset, so the out-of-subset hard edge used to abort
+// Start with ErrDependencyCycle.
+func TestStart_Stop_PersistentDependingOnRunOnceGate(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	gate := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+	app := &testSvc{}
+	_ = o.Register(gate, WithName("migrate"), WithRunOnce())
+	_ = o.Register(app, WithName("app"), DependsOn("migrate"))
+
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start with a persistent service depending on a runOnce gate must succeed, got %v", err)
+	}
+	if err := o.Stop(time.Second); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	if app.stopCalls.Load() < 1 {
+		t.Error("persistent service depending on a runOnce gate must receive Stop()")
+	}
+}
+
+// TestStartGroup_CrossGroupHardDep pins that StartGroup does not report a hard
+// dependency on a service outside the started group as a cycle.
+func TestStartGroup_CrossGroupHardDep(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	infra := &testSvc{}
+	app := &testSvc{}
+	_ = o.Register(infra, WithName("infra"), WithGroup("infra"))
+	_ = o.Register(app, WithName("app"), WithGroup("app"), DependsOn("infra"))
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer o.Stop(time.Second)
+
+	if err := o.StartGroup("app"); err != nil {
+		t.Fatalf("StartGroup must not report a cross-group hard dependency as a cycle, got %v", err)
+	}
+}
+
+// TestStopGroup_CrossGroupHardDep pins that StopGroup stops the members it
+// selected even when one of them hard-depends on a service in another group.
+// Before the fix the discarded topoSort error left levels nil and nothing was
+// stopped.
+func TestStopGroup_CrossGroupHardDep(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	infra := &testSvc{}
+	app := &testSvc{}
+	_ = o.Register(infra, WithName("infra"), WithGroup("infra"))
+	_ = o.Register(app, WithName("app"), WithGroup("app"), DependsOn("infra"))
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer o.Stop(time.Second)
+
+	if err := o.StopGroup("app", time.Second); err != nil {
+		t.Fatalf("StopGroup failed: %v", err)
+	}
+	if app.stopCalls.Load() < 1 {
+		t.Error("StopGroup must stop the selected member")
+	}
+	if infra.stopCalls.Load() != 0 {
+		t.Error("StopGroup must not stop services outside the group")
+	}
+}
+
+// TestStop_FailsIfTopoSortFails pins that a topoSort failure is surfaced rather
+// than swallowed, while every service is still torn down. Register rejects
+// cycles, so a cyclic pair is injected straight into the registry (the same
+// white-box technique TestTopoSort_ErrorInStart uses) to hand Stop a subset it
+// cannot order.
+func TestStop_FailsIfTopoSortFails(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	_ = o.Register(&testSvc{}, WithName("a"))
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	c := &testSvc{}
+	d := &testSvc{}
+	o.mu.Lock()
+	o.entries = append(o.entries,
+		&serviceEntry{name: "c", svc: c, cfg: registerConfig{name: "c", dependsOn: []string{"d"}}, status: StatusRegistered},
+		&serviceEntry{name: "d", svc: d, cfg: registerConfig{name: "d", dependsOn: []string{"c"}}, status: StatusRegistered},
+	)
+	o.mu.Unlock()
+
+	err := o.Stop(time.Second)
+	if !errors.Is(err, ErrDependencyCycle) {
+		t.Fatalf("Stop must surface a topoSort failure, got %v", err)
+	}
+	if c.stopCalls.Load() < 1 || d.stopCalls.Load() < 1 {
+		t.Errorf("a cyclic subset must still be torn down: c=%d d=%d", c.stopCalls.Load(), d.stopCalls.Load())
 	}
 }
 

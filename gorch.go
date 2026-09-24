@@ -1035,7 +1035,10 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 
 		// 3. Call Stop() on services in reverse topological order.
 		persistent := o.persistentEntries()
-		levels, _ := o.topoSort(persistent) // ignore error, graph already validated
+		levels, topoErr := o.topoSortForStop(persistent)
+		// A cyclic subset still stops every persistent entry (registration-order
+		// fallback); surface the ordering failure rather than leaving them running.
+		stopErr = errors.Join(stopErr, topoErr)
 		for i := len(levels) - 1; i >= 0; i-- {
 			for _, entry := range levels[i] {
 				err := o.stopOneServiceDeadline(entry, stopDeadline)
