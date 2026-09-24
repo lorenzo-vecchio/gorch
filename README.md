@@ -57,10 +57,10 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 
 | Method group | Concurrent with `Start`/`Stop` |
 |--------------|-------------------------------|
-| `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A dynamic hot add is safe only **after `Start` has returned**; it lands as `StatusRegistered` and is **not** auto-started. Calling `Register` while `Start` is still running is not supported. While `Stop` runs it returns `ErrOrchestratorStopping`; after `Stop`, `ErrOrchestratorStopped`. |
-| `StartService` | Yes — (re)starts a registered service once every hard dependency is `StatusRunning`. Rejected with an error once whole-orchestrator `Stop` has begun. |
+| `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A hot add made while `Start` runs lands either in `Start`'s snapshot or, after it, live as `StatusRegistered` (never auto-started); before `Start` it is part of the static graph. It is rejected with `ErrOrchestratorStopping` while `Stop` runs and `ErrOrchestratorStopped` after `Stop`. |
+| `StartService` | Yes — (re)starts a registered service once every hard dependency is `StatusRunning`. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. |
 | `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A running hard dependent blocks the call with `ErrHasDependents` unless `WithCascadeStop` is passed. |
-| `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the **whole-orchestrator lifecycle** is single-shot, so after a successful `Stop` neither can run again. |
+| `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the **whole-orchestrator lifecycle** is single-shot, so after a successful `Stop` neither can run again. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
 | `Status`, `Statuses`, `Names`, `Count` | Yes — safe to read while services run, while membership churns, and during shutdown. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
 | `Metrics`, `Done` | Yes — atomic counters and a lazily cached channel. |
@@ -101,6 +101,13 @@ These guarantees are part of the public API and are relied upon by callers.
 - **Errors are aggregated.** `Start` and `Stop` join every failure with
   `errors.Join`, so a single call reports all causes, not just the first. Use
   `errors.Is`/`errors.As` to inspect them.
+- **No user code runs under an orchestrator lock.** The orchestrator never calls
+  service code — `Start`, `Stop`, `Validate`, health/readiness probes, or any
+  lifecycle hook — while holding `o.mu` or `membershipMu`. A hook or `Validate`
+  may therefore block or call back into a membership operation without
+  deadlocking. This is enforced as a class-wide invariant (static and dynamic
+  registration, `Health` and the periodic probe path, `Start`, and group
+  selection), not per call site.
 
 Sentinel errors returned by the orchestrator:
 
@@ -110,9 +117,11 @@ Sentinel errors returned by the orchestrator:
 | `ErrDuplicateName` | `Register` | Two services share a `WithName`. |
 | `ErrDependencyCycle` | `Register`, `Start` | A hard or soft dependency chain loops. |
 | `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
-| `ErrInvalidCron` | `Start` | A `WithCron` spec is invalid. |
+| `ErrInvalidCron` | `Start`, `Register` (hot add) | A `WithCron` spec is invalid. |
 | `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
-| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister` | Services did not stop within the caller's timeout. |
+| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister` | Services or their stop hooks did not finish within the caller's timeout. |
+| `ErrOrchestratorNotStarted` | `StartService` | Called before the orchestrator was started. |
+| `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | A membership op re-entered from a service's own `Start`/`Stop`, or lost a race against an in-flight reservation. |
 | `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
 | `ErrHasDependents` | `StopService`, `Unregister`, `Register` | A stop/removal would break running hard dependents (pass `WithCascadeStop`), or a dynamic registration names a dependency that is being removed. |
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
@@ -208,10 +217,10 @@ orch.Register(apiSvc,  gorch.WithName("api"), gorch.DependsOn("db", "cache"))
 Before `Start` the registry is static. After `Start`, `Register` is a hot add:
 the service enters the graph as `StatusRegistered` and is **not** started
 automatically — start it with `StartService`. `StartService` also restarts a
-service previously stopped with `StopService`. A hot-added cron service is the
-exception: `Register` puts it on the live scheduler immediately, so it begins
-ticking while still reporting `StatusRegistered`, and `StartService` only
-reconciles it to `StatusRunning`.
+service previously stopped with `StopService`. A hot-added cron service follows
+the same rule: `Register` validates and stages the schedule but does not install
+it, so the entry stays `StatusRegistered` with no ticks until `StartService`
+schedules it and reports `StatusRunning`.
 
 ```go
 orch.Start()
@@ -240,15 +249,16 @@ _ = orch.StopService("db", 5*time.Second)
 _ = orch.StopService("db", 5*time.Second, gorch.WithCascadeStop())
 ```
 
-`timeout` bounds the whole stop — the service's own `Stop()` and the wait for
-its instance or in-flight cron ticks to exit — and is shared across a cascade
-(one budget, not one per service). A per-service `WithStopTimeout` still caps
-`Stop()` when it is smaller than the remaining budget; a non-positive `timeout`
-waits indefinitely. Soft dependencies never block a stop and are never cascaded.
-On a running orchestrator, `Register` and every membership method return
-`ErrOrchestratorStopping` during `Stop` and `ErrOrchestratorStopped` afterwards.
-For a cron service every in-flight tick is cancelled, the schedule is removed,
-and the stop waits for those ticks to return.
+`timeout` bounds the whole stop — the before/after-stop hooks, the service's own
+`Stop()`, and the wait for its instance or in-flight cron ticks to exit — and is
+shared across a cascade (one budget, not one per service). A per-service
+`WithStopTimeout` still caps `Stop()` when it is smaller than the remaining
+budget; a non-positive `timeout` waits indefinitely. Soft dependencies never
+block a stop and are never cascaded. On a running orchestrator, `Register` and
+every membership method return `ErrOrchestratorStopping` during `Stop` and
+`ErrOrchestratorStopped` afterwards. `StartService` before `Start` returns
+`ErrOrchestratorNotStarted`. For a cron service every in-flight tick is
+cancelled, the schedule is removed, and the stop waits for those ticks to return.
 
 #### Naming policy
 
@@ -284,10 +294,11 @@ orch.Register(svc, gorch.WithStartTimeout(30 * time.Second)) // per-service over
 Each tick receives a fresh `ServiceContext` whose context is cancelled when that
 tick returns; `StopService`/`Unregister` cancel every in-flight tick through it
 and wait for them to return.
-A statically registered cron entry starts as `StatusRunning`; a hot-added one
-is scheduled immediately by `Register` but reports `StatusRegistered` until
-`StartService` marks it running. `StopService` removes the schedule and a later
-`StartService` re-creates it, while `Unregister` drops the entry itself.
+A statically registered cron entry starts as `StatusRunning`; a hot-added one is
+staged by `Register` (spec validated, no schedule installed) and reports
+`StatusRegistered` until `StartService` schedules it and marks it running.
+`StopService` removes the schedule and a later `StartService` re-creates it,
+while `Unregister` drops the entry itself.
 
 ### Status introspection
 
@@ -583,7 +594,7 @@ No manual gob encoding is required anywhere in user code.
 
 ### Metrics
 
-`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency.
+`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency. Each stop of an instance is counted exactly once, even when a teardown and the instance's own exit race.
 
 ```go
 stats := orch.Metrics()
@@ -593,7 +604,7 @@ fmt.Printf("starts=%d stops=%d crashes=%d restarts=%d healthFails=%d\n",
 
 ### Validator
 
-Implement the `Validator` interface to catch config errors at `Register` time (before `Start`).
+Implement the `Validator` interface to catch config errors at `Register` time (before `Start`). `Validate` runs outside the orchestrator's locks, so it may block or call back into membership operations without deadlocking.
 
 ```go
 type Validator interface {
