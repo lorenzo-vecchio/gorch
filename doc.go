@@ -42,6 +42,9 @@
 //     into membership operations without deadlocking.
 //   - A hot-added cron service is staged by Register and only scheduled by
 //     StartService, so it never ticks while reporting StatusRegistered.
+//   - A panic from a lifecycle hook, Validator, start condition, or probe is
+//     recovered and reported as an error (or as unhealthy/unready), so a
+//     misbehaving callback never unwinds through a public entry point.
 //
 // See the README for the concurrency table and the per-method guarantees.
 package gorch
