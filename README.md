@@ -723,8 +723,7 @@ case <-time.After(10 * time.Second):
 
 gorch follows [Semantic Versioning](https://semver.org/). Until 1.0, minor
 releases may contain breaking changes; every one is marked **Breaking** in the
-[release notes](https://github.com/lorenzo-vecchio/gorch/releases) and covered by
-the [migration guide](MIGRATION.md).
+[release notes](https://github.com/lorenzo-vecchio/gorch/releases).
 
 - **Stable** — exported identifiers (types, functions, methods), the `Service`,
   `HealthChecker`, `ReadinessChecker`, `Validator`, and `Logger` interfaces, the
