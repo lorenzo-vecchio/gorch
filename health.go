@@ -80,7 +80,7 @@ func (o *Orchestrator) Health() map[string]error {
 		if ok {
 			// Per-probe deadline so a slow checker does not fail later probes.
 			probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
-			probeErr = hc.Health(probeCtx)
+			probeErr = callErr(func() error { return hc.Health(probeCtx) })
 			cancel()
 		}
 		// Re-validate membership after the probe: a concurrent teardown may have
@@ -139,7 +139,7 @@ func (o *Orchestrator) runHealthChecks() {
 		}
 
 		if o.cfg.BeforeHealthCheck != nil {
-			if err := o.cfg.BeforeHealthCheck(e.name); err != nil {
+			if err := callErr(func() error { return o.cfg.BeforeHealthCheck(e.name) }); err != nil {
 				e.getLogger().Warn("before-health-check hook failed", "error", err.Error())
 			}
 		}
@@ -147,10 +147,10 @@ func (o *Orchestrator) runHealthChecks() {
 		// Each probe gets a fresh per-service deadline so a slow checker does
 		// not fail all later probes with an expired context.
 		probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
-		healthErr := hc.Health(probeCtx)
+		healthErr := callErr(func() error { return hc.Health(probeCtx) })
 		cancel()
 		if o.cfg.AfterHealthCheck != nil {
-			o.cfg.AfterHealthCheck(e.name, healthErr)
+			callVoid(func() { o.cfg.AfterHealthCheck(e.name, healthErr) })
 		}
 		// Re-validate membership after the (possibly slow) probe, exactly as
 		// Health does: a concurrent Unregister may have removed or replaced this

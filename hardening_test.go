@@ -1,0 +1,543 @@
+package gorch
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// entryNamed fetches a registered entry under the orchestrator lock.
+func entryNamed(t *testing.T, o *Orchestrator, name string) *serviceEntry {
+	t.Helper()
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	e := o.nameIndex[name]
+	if e == nil {
+		t.Fatalf("service %q is not registered", name)
+	}
+	return e
+}
+
+// mustNotPanic fails the test if fn panics, so a public entry point can be
+// pinned as panic-free even when handed hostile input.
+func mustNotPanic(t *testing.T, name string, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%s panicked: %v", name, r)
+		}
+	}()
+	fn()
+}
+
+// TestNoPublicAPI_Panics pins that no public entry point panics when called
+// with nil, unknown, or post-shutdown input. It complements the sentinel tests:
+// where a value cannot be used, a documented error must come back, never an
+// unwind.
+func TestNoPublicAPI_Panics(t *testing.T) {
+	t.Run("nil_service", func(t *testing.T) {
+		o := New()
+		if err := o.Register(nil); !errors.Is(err, ErrNilService) {
+			t.Fatalf("Register(nil) = %v, want ErrNilService", err)
+		}
+		if err := o.RegisterFunc("fn", nil, nil); !errors.Is(err, ErrNilService) {
+			t.Fatalf("RegisterFunc(nil startFn) = %v, want ErrNilService", err)
+		}
+		if o.Count() != 0 {
+			t.Fatalf("rejected registrations must not enter the graph, got %d", o.Count())
+		}
+	})
+
+	t.Run("before_start_introspection", func(t *testing.T) {
+		o := New()
+		mustNotPanic(t, "Names", func() { _ = o.Names() })
+		mustNotPanic(t, "Statuses", func() { _ = o.Statuses() })
+		mustNotPanic(t, "Count", func() { _ = o.Count() })
+		mustNotPanic(t, "Metrics", func() { _ = o.Metrics() })
+		mustNotPanic(t, "Done", func() { _ = o.Done() })
+		mustNotPanic(t, "Health", func() { _ = o.Health() })
+		mustNotPanic(t, "Status", func() { _, _ = o.Status("nope") })
+		mustNotPanic(t, "IsReady", func() { _ = o.IsReady(context.Background(), "nope") })
+	})
+
+	t.Run("unknown_names", func(t *testing.T) {
+		o := New()
+		if err := o.StartService("nope"); !errors.Is(err, ErrOrchestratorNotStarted) {
+			t.Fatalf("StartService unknown before Start = %v, want ErrOrchestratorNotStarted", err)
+		}
+		if err := o.StopService("nope", time.Second); !errors.Is(err, ErrServiceNotFound) {
+			t.Fatalf("StopService unknown = %v, want ErrServiceNotFound", err)
+		}
+		if err := o.Unregister("nope", time.Second); !errors.Is(err, ErrServiceNotFound) {
+			t.Fatalf("Unregister unknown = %v, want ErrServiceNotFound", err)
+		}
+		if err := o.WaitFor("nope", StatusRunning, 10*time.Millisecond); err == nil {
+			t.Fatal("WaitFor unknown must return an error")
+		}
+	})
+
+	t.Run("dynamic_bad_cron", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+		if err := o.Register(&namedSvc{}, WithName("bad"), WithCron("not a spec", CronParallel)); !errors.Is(err, ErrInvalidCron) {
+			t.Fatalf("dynamic invalid cron = %v, want ErrInvalidCron", err)
+		}
+	})
+
+	t.Run("messenger_after_drain", func(t *testing.T) {
+		m := newMessenger()
+		m.Drain()
+		mustNotPanic(t, "Publish", func() { m.Publish("x", "topic") })
+		mustNotPanic(t, "Subscribe", func() { _, unsub := m.Subscribe("topic"); unsub() })
+		mustNotPanic(t, "Request", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+			_, _ = m.Request(ctx, "x", "topic")
+		})
+	})
+}
+
+// TestUserCodePanics_AreContained pins that a panic raised by any caller
+// supplied callback is turned into ordinary control flow instead of unwinding
+// through a public entry point.
+func TestUserCodePanics_AreContained(t *testing.T) {
+	t.Run("before_start_hook", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Register(&namedSvc{}, WithName("s"),
+			WithOnBeforeStart(func(string) error { panic("hook boom") })); err != nil {
+			t.Fatal(err)
+		}
+		err := o.Start()
+		if err == nil || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("Start = %v, want a recovered panic error", err)
+		}
+		_ = o.Stop(time.Second)
+	})
+
+	t.Run("start_condition", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Register(&namedSvc{}, WithName("s"),
+			WithStartCondition(func() bool { panic("condition boom") })); err != nil {
+			t.Fatal(err)
+		}
+		err := o.Start()
+		if err == nil || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("Start = %v, want a recovered panic error", err)
+		}
+		_ = o.Stop(time.Second)
+	})
+
+	t.Run("after_start_hook", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Register(&namedSvc{}, WithName("s"),
+			WithOnAfterStart(func(string, error) { panic("after start boom") })); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start = %v", err)
+		}
+		if s, _ := o.Status("s"); s != StatusRunning {
+			t.Fatalf("status = %v, want running", s)
+		}
+		_ = o.Stop(time.Second)
+	})
+
+	t.Run("before_and_after_stop_hooks", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Register(&namedSvc{}, WithName("s"),
+			WithOnBeforeStop(func(string) error { panic("before stop boom") }),
+			WithOnAfterStop(func(string, error) { panic("after stop boom") })); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		err := o.StopService("s", time.Second)
+		if err == nil || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("StopService = %v, want a recovered panic error", err)
+		}
+		if s, _ := o.Status("s"); s != StatusStopped {
+			t.Fatalf("status = %v, want stopped", s)
+		}
+		_ = o.Stop(time.Second)
+	})
+
+	t.Run("state_change_and_crash_callbacks", func(t *testing.T) {
+		o := New(
+			WithHealthChecksDisabled(),
+			WithOnStateChange(func(string, ServiceStatus, ServiceStatus) { panic("state boom") }),
+			WithOnCrash(func(string, error) { panic("crash boom") }),
+		)
+		if err := o.Register(&errSvc{err: errors.New("boom")}, WithName("s")); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		waitForStatus(t, o, "s", StatusCrashed)
+		_ = o.Stop(time.Second)
+	})
+
+	t.Run("health_and_readiness_probes", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		h := &healthSvc{
+			testSvc: testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+			healthFn: func(context.Context) error {
+				panic("health boom")
+			},
+		}
+		r := &readySvc{
+			testSvc: testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+			readyFn: func(context.Context) error {
+				panic("ready boom")
+			},
+		}
+		if err := o.Register(h, WithName("h")); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Register(r, WithName("r")); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		health := o.Health()
+		if health["h"] == nil || !strings.Contains(health["h"].Error(), "panicked") {
+			t.Fatalf("Health[h] = %v, want recovered panic error", health["h"])
+		}
+		if o.IsReady(context.Background(), "r") {
+			t.Fatal("IsReady must be false when Ready panics")
+		}
+		o.runHealthChecks() // must not panic
+		_ = o.Stop(time.Second)
+	})
+
+	t.Run("validator", func(t *testing.T) {
+		o := New()
+		if err := o.Register(&validSvc{}, WithName("ok")); err != nil {
+			t.Fatal(err)
+		}
+		err := o.Register(&panicValidateSvc{}, WithName("v"))
+		if err == nil || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("Register with panicking Validate = %v, want recovered panic error", err)
+		}
+	})
+}
+
+// panicValidateSvc panics from Validate.
+type panicValidateSvc struct{ namedSvc }
+
+func (s *panicValidateSvc) Validate() error { panic("validate boom") }
+
+// TestHooksUnderConcurrentMembership_Race exercises every lifecycle hook under
+// the race detector while another goroutine churns membership, so the
+// "no user code under an orchestrator lock" invariant is tested, not merely
+// documented: a hook that calls back into the orchestrator must not deadlock.
+func TestHooksUnderConcurrentMembership_Race(t *testing.T) {
+	var o *Orchestrator
+	o = New(
+		WithHealthChecksDisabled(),
+		WithGlobalOnBeforeStart(func(string) error { _ = o.Names(); return nil }),
+		WithGlobalOnAfterStart(func(string, error) { _ = o.Statuses() }),
+		WithGlobalOnBeforeStop(func(string) error { _ = o.Count(); return nil }),
+		WithGlobalOnAfterStop(func(string, error) { _ = o.Metrics() }),
+		WithOnStateChange(func(string, ServiceStatus, ServiceStatus) { _ = o.Names() }),
+	)
+	for _, name := range []string{"a", "b", "c"} {
+		if err := o.Register(&namedSvc{}, WithName(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 30; i++ {
+			_ = o.StopService("b", 200*time.Millisecond)
+			_ = o.StartService("b")
+		}
+	}()
+	for i := 0; i < 30; i++ {
+		_ = o.Statuses()
+		_ = o.Health()
+	}
+	wg.Wait()
+	if err := o.Stop(time.Second); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestFailedStart_ReleasesReservations_AndRetrySucceeds pins the lifecycle of
+// the start reservation: a Start that aborts partway must release every
+// reservation it took, so the orchestrator is not bricked and a retry can
+// succeed. This is the regression the reservation mechanism could reintroduce.
+func TestFailedStart_ReleasesReservations_AndRetrySucceeds(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	var failing = true
+	hook := func(string) error {
+		if failing {
+			return errors.New("nope")
+		}
+		return nil
+	}
+	if err := o.Register(&namedSvc{}, WithName("a"), WithOnBeforeStart(hook)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&namedSvc{}, WithName("b"), DependsOn("a")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.Start(); err == nil {
+		t.Fatal("first Start must fail")
+	}
+	for _, name := range []string{"a", "b"} {
+		if entryNamed(t, o, name).starting.Load() {
+			t.Fatalf("entry %s stayed reserved after a failed Start", name)
+		}
+		if s, _ := o.Status(name); s != StatusRegistered {
+			t.Fatalf("entry %s status = %v after failed Start, want registered", name, s)
+		}
+	}
+
+	failing = false
+	if err := o.Start(); err != nil {
+		t.Fatalf("retry Start: %v", err)
+	}
+	waitForStatus(t, o, "a", StatusRunning)
+	waitForStatus(t, o, "b", StatusRunning)
+	if err := o.Stop(time.Second); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestStop_BusyReservation_IsRetryable pins that a membership op rejected only
+// because the entry was momentarily reserved can be retried once the
+// reservation is released.
+func TestStop_BusyReservation_IsRetryable(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+	if err := o.Register(&namedSvc{}, WithName("r")); err != nil {
+		t.Fatal(err)
+	}
+	entry := entryNamed(t, o, "r")
+
+	entry.starting.Store(true)
+	if err := o.StopService("r", time.Second); !errors.Is(err, ErrReentrantMembership) {
+		t.Fatalf("StopService on a reserved entry = %v, want ErrReentrantMembership", err)
+	}
+	entry.starting.Store(false)
+
+	if err := o.StartService("r"); err != nil {
+		t.Fatalf("StartService after reservation release: %v", err)
+	}
+	if err := o.StopService("r", time.Second); err != nil {
+		t.Fatalf("StopService retry after reservation release: %v", err)
+	}
+}
+
+// TestCascade_StartingDependentBlocks pins the dependency guard's boundary: a
+// hard dependent that is Starting (a reserved, explicit state) blocks a plain
+// stop exactly like a Running one, and cascade overrides it.
+func TestCascade_StartingDependentBlocks(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Register(&namedSvc{}, WithName("base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&namedSvc{}, WithName("dep"), DependsOn("base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	o.setStatus(entryNamed(t, o, "dep"), StatusStarting)
+	if err := o.StopService("base", time.Second); !errors.Is(err, ErrHasDependents) {
+		t.Fatalf("plain stop with a Starting dependent = %v, want ErrHasDependents", err)
+	}
+	if err := o.StopService("base", time.Second, WithCascadeStop()); err != nil {
+		t.Fatalf("cascade stop = %v", err)
+	}
+	if s, _ := o.Status("dep"); s != StatusStopped {
+		t.Fatalf("cascaded dependent status = %v, want stopped", s)
+	}
+}
+
+// TestUnregister_DestroysAllPerServiceState pins that Unregister removes every
+// trace of the entry from the live graph and releases its per-instance
+// resources, so a later re-add cannot inherit or leak them.
+func TestUnregister_DestroysAllPerServiceState(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	subscribed := make(chan struct{})
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		sc := ctx.(ServiceContext)
+		_, unsub := sc.Messenger.Subscribe("topic")
+		defer unsub()
+		close(subscribed)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&namedSvc{}, WithName("c"), WithCron("0 0 0 1 1 *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-subscribed
+	entry := entryNamed(t, o, "s")
+	if entry.currentOwner() == 0 {
+		t.Fatal("running instance has no Messenger owner")
+	}
+	cronEntry := entryNamed(t, o, "c")
+	if cronEntry.cronID == 0 {
+		t.Fatal("cron entry was not scheduled")
+	}
+
+	if err := o.Unregister("s", time.Second); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	if _, ok := o.Status("s"); ok {
+		t.Error("unregistered service still reports a status")
+	}
+	if !entry.removed.Load() {
+		t.Error("removed flag was not set")
+	}
+	if entry.currentOwner() != 0 {
+		t.Error("Messenger owners were not drained")
+	}
+	o.mu.RLock()
+	_, stillIndexed := o.nameIndex["s"]
+	o.mu.RUnlock()
+	if stillIndexed {
+		t.Error("nameIndex still holds the unregistered entry")
+	}
+
+	if err := o.Unregister("c", time.Second); err != nil {
+		t.Fatalf("Unregister cron: %v", err)
+	}
+	if cronEntry.cronID != 0 {
+		t.Error("cron schedule was not released")
+	}
+	if o.Count() != 0 {
+		t.Errorf("Count = %d after Unregister, want 0", o.Count())
+	}
+	_ = o.Stop(time.Second)
+}
+
+// TestReAdd_SameName_StartsClean pins that re-registering a name after
+// Unregister creates a genuinely fresh entry: no retry counter, health-failure
+// count, status, or cron state carries over.
+func TestReAdd_SameName_StartsClean(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	old := &crashSignalSvc{sig: make(chan struct{})}
+	if err := o.Register(old, WithName("s"),
+		WithSelfHeal(func() Service { return &crashSignalSvc{sig: make(chan struct{})} }),
+		WithBackoff(ConstantBackoff{Delay: 5 * time.Millisecond})); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-old.sig
+	oldEntry := entryNamed(t, o, "s")
+	deadline := time.After(2 * time.Second)
+	for oldEntry.getRetryCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("retry counter never advanced")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if err := o.Unregister("s", time.Second); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	if err := o.Register(&namedSvc{}, WithName("s")); err != nil {
+		t.Fatalf("re-add: %v", err)
+	}
+	fresh := entryNamed(t, o, "s")
+	if fresh == oldEntry {
+		t.Fatal("re-add reused the removed entry")
+	}
+	if fresh.getRetryCount() != 0 {
+		t.Errorf("fresh retryCount = %d, want 0", fresh.getRetryCount())
+	}
+	if fresh.getHealthFailures() != 0 {
+		t.Errorf("fresh healthFailures = %d, want 0", fresh.getHealthFailures())
+	}
+	if fresh.cronID != 0 {
+		t.Error("fresh entry inherited a cron schedule")
+	}
+	if fresh.currentOwner() != 0 {
+		t.Error("fresh entry inherited Messenger owners")
+	}
+	if s, _ := o.Status("s"); s != StatusRegistered {
+		t.Errorf("fresh status = %v, want registered", s)
+	}
+	if err := o.StartService("s"); err != nil {
+		t.Fatalf("StartService on the re-added entry: %v", err)
+	}
+	if s, _ := o.Status("s"); s != StatusRunning {
+		t.Fatalf("status after StartService = %v, want running", s)
+	}
+	if fresh.getRetryCount() != 0 || fresh.getHealthFailures() != 0 {
+		t.Error("fresh entry accumulated stale retry/health state after start")
+	}
+	_ = o.Stop(time.Second)
+}
+
+// TestHookTimeout_DoesNotStarveServiceStop pins that a before-stop hook which
+// never returns still leaves the service's own Stop() a budget, so its
+// resources are released rather than abandoned.
+func TestHookTimeout_DoesNotStarveServiceStop(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	var once sync.Once
+	svc := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(svc, WithName("s"), WithOnBeforeStop(func(string) error {
+		once.Do(func() { <-release })
+		return nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		close(release)
+		_ = o.Stop(time.Second)
+	})
+
+	const budget = 200 * time.Millisecond
+	start := time.Now()
+	err := o.StopService("s", budget)
+	if !errors.Is(err, ErrHookTimeout) {
+		t.Fatalf("StopService = %v, want ErrHookTimeout", err)
+	}
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("StopService = %v, want it to also match ErrStopTimeout", err)
+	}
+	if svc.stopCalls.Load() == 0 {
+		t.Fatal("the service's Stop() was starved by the blocking hook")
+	}
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Errorf("StopService took %v; the hook sub-budget did not bound it", elapsed)
+	}
+}

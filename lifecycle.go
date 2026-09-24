@@ -26,16 +26,23 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 		hook = o.cfg.OnBeforeStart
 	}
 	if hook != nil {
-		if err := hook(entry.name); err != nil {
+		if err := callErr(func() error { return hook(entry.name) }); err != nil {
 			o.setStatus(entry, StatusStopped)
 			return fmt.Errorf("before-start hook: %w", err)
 		}
 	}
 
 	// Check start condition.
-	if entry.cfg.startCondition != nil && !entry.cfg.startCondition() {
-		o.setStatus(entry, StatusStopped)
-		return nil
+	if entry.cfg.startCondition != nil {
+		ok, err := callBool(entry.cfg.startCondition)
+		if err != nil {
+			o.setStatus(entry, StatusStopped)
+			return fmt.Errorf("start condition: %w", err)
+		}
+		if !ok {
+			o.setStatus(entry, StatusStopped)
+			return nil
+		}
 	}
 
 	o.setStatus(entry, StatusStarting)
@@ -102,7 +109,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 				svcCancel()
 			}
 		} else {
-			err = entry.getSvc().Start(sc)
+			err = callErr(func() error { return entry.getSvc().Start(sc) })
 		}
 		entry.setCancel(nil)
 		svcCancel()
@@ -205,7 +212,7 @@ func (o *Orchestrator) callAfterStartHook(entry *serviceEntry, err error) {
 		hook = o.cfg.OnAfterStart
 	}
 	if hook != nil {
-		hook(entry.name, err)
+		callVoid(func() { hook(entry.name, err) })
 	}
 }
 
@@ -252,7 +259,7 @@ func (o *Orchestrator) setStatusErr(entry *serviceEntry, s ServiceStatus, err er
 	o.statusMu.Unlock()
 
 	if o.cfg.OnStateChange != nil && old != s {
-		o.cfg.OnStateChange(entry.name, old, s)
+		callVoid(func() { o.cfg.OnStateChange(entry.name, old, s) })
 	}
 	if s == StatusCrashed {
 		o.metricsCrashes.Add(1)
@@ -261,7 +268,7 @@ func (o *Orchestrator) setStatusErr(entry *serviceEntry, s ServiceStatus, err er
 		if err == nil {
 			err = fmt.Errorf("service %s crashed", entry.name)
 		}
-		o.cfg.OnCrash(entry.name, err)
+		callVoid(func() { o.cfg.OnCrash(entry.name, err) })
 	}
 }
 
@@ -278,6 +285,11 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 // the per-service WithStopTimeout and the time left before the deadline. A zero
 // deadline leaves the per-service timeout in charge and runs the sequence
 // synchronously.
+//
+// The before-stop hook gets at most half of the caller budget on its own, so a
+// hook that blocks forever cannot consume the whole deadline and starve the
+// service's Stop(): the service is always given a chance to release its
+// resources, and a hook that overruns is reported as ErrHookTimeout.
 func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time.Time) error {
 	o.statusMu.RLock()
 	wasActive := entry.status == StatusRunning || entry.status == StatusStarting
@@ -286,21 +298,18 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 	o.setStatus(entry, StatusStopping)
 
 	// The whole hook+Stop sequence, so the caller's deadline can bound it.
-	sequence := func() error {
-		var hookErr error
-		if hook := stopHook(entry, o); hook != nil {
-			hookErr = hook(entry.name)
-		}
+	sequence := func(hookDeadline time.Time) error {
+		hookErr := o.callBeforeStopHook(entry, hookDeadline)
 		stopErr := o.stopServiceBounded(entry)
 		if afterHook := afterStopHook(entry, o); afterHook != nil {
-			afterHook(entry.name, stopErr)
+			callVoid(func() { afterHook(entry.name, stopErr) })
 		}
 		return errors.Join(hookErr, stopErr)
 	}
 
 	var stopErr error
 	if deadline.IsZero() {
-		stopErr = sequence()
+		stopErr = sequence(time.Time{})
 	} else {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -308,8 +317,10 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 			// blocking hook or Stop() cannot hang past it.
 			remaining = time.Nanosecond
 		}
+		// Half the remaining budget for the hook, so Stop() is never starved.
+		hookDeadline := time.Now().Add(remaining / 2)
 		done := make(chan error, 1)
-		go func() { done <- sequence() }()
+		go func() { done <- sequence(hookDeadline) }()
 		timer := time.NewTimer(remaining)
 		defer timer.Stop()
 		select {
@@ -324,6 +335,33 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 		o.accountStop(entry)
 	}
 	return stopErr
+}
+
+// callBeforeStopHook runs the effective before-stop hook. When deadline is zero
+// it waits for the hook indefinitely; otherwise the hook is bounded by deadline
+// and an overrun is reported as ErrHookTimeout (which also matches
+// ErrStopTimeout, so callers that only classify whole-stop timeouts keep
+// working). A panic in the hook becomes an error, never an unwind. Running the
+// hook in its own goroutine is what lets the caller proceed to Stop() after an
+// overrun instead of abandoning the service mid-teardown.
+func (o *Orchestrator) callBeforeStopHook(entry *serviceEntry, deadline time.Time) error {
+	hook := stopHook(entry, o)
+	if hook == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- callErr(func() error { return hook(entry.name) }) }()
+	if deadline.IsZero() {
+		return <-done
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("%w: before-stop hook did not return before the deadline: %w", ErrHookTimeout, ErrStopTimeout)
+	}
 }
 
 // stopServiceBounded runs the service's own Stop(), capped by its per-service

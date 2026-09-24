@@ -483,10 +483,15 @@ func New(opts ...Option) *Orchestrator {
 //
 // Returns ErrDuplicateName if WithName conflicts with another service.
 // Returns ErrDependencyCycle if DependsOn introduces a cycle.
-// Returns ErrDependencyNotFound if a dynamic Register names an unknown hard
-// dependency.
+// Returns ErrDependencyNotFound if DependsOn names a service that is not yet
+// registered: a hard dependency must always be registered before the service
+// that names it, both statically and on a hot add.
+// Returns ErrNilService if svc is nil.
 // Thread-safe.
 func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
+	if svc == nil {
+		return fmt.Errorf("%w: Register called with a nil Service", ErrNilService)
+	}
 	o.mu.Lock()
 	if o.started {
 		o.mu.Unlock()
@@ -497,7 +502,7 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	// under o.mu (a blocking or reentrant Validator would deadlock), matching the
 	// dynamic path. The common no-validator case stays entirely under the lock.
 	if _, ok := svc.(Validator); !ok {
-		cfg, err := o.parseRegisterOptions(opts, false)
+		cfg, err := o.parseRegisterOptions(opts)
 		if err != nil {
 			o.mu.Unlock()
 			return err
@@ -515,7 +520,7 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	}
 	o.mu.Unlock()
 
-	if err := svc.(Validator).Validate(); err != nil {
+	if err := callErr(svc.(Validator).Validate); err != nil {
 		return fmt.Errorf("gorch: service %s validation failed: %w", pre.name, err)
 	}
 
@@ -525,13 +530,13 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	// hot add, appended as StatusRegistered (never auto-started). Validation has
 	// already run, so it is not repeated.
 	if o.started {
-		cfg, err := o.parseRegisterOptions(opts, true)
+		cfg, err := o.parseRegisterOptions(opts)
 		if err != nil {
 			return err
 		}
 		return o.commitDynamicLocked(svc, cfg)
 	}
-	cfg, err := o.parseRegisterOptions(opts, false)
+	cfg, err := o.parseRegisterOptions(opts)
 	if err != nil {
 		return err
 	}
@@ -551,10 +556,10 @@ func (o *Orchestrator) appendStaticEntryLocked(svc Service, cfg registerConfig) 
 // does not call user code: the self-heal combination check, auto-naming,
 // duplicate-name detection, hard-dependency existence and cycle detection, and
 // soft-dependency cycle detection. The caller must hold o.mu, because the graph
-// is inspected via lookupEntry/dependsOnRecursive. dynamic selects the
-// ErrDependencyNotFound sentinel for a missing hard dependency (static
-// registration keeps its historical message).
-func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption, dynamic bool) (registerConfig, error) {
+// is inspected via lookupEntry/dependsOnRecursive. A missing hard dependency is
+// reported with ErrDependencyNotFound on both the static and the dynamic path,
+// so callers can classify it with errors.Is regardless of when they register.
+func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption) (registerConfig, error) {
 	cfg := registerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -585,10 +590,7 @@ func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption, dynamic bool)
 		}
 		depEntry := o.lookupEntry(dep)
 		if depEntry == nil {
-			if dynamic {
-				return cfg, fmt.Errorf("%w: dependency %q not found for service %s", ErrDependencyNotFound, dep, cfg.name)
-			}
-			return cfg, fmt.Errorf("gorch: dependency %q not found for service %s", dep, cfg.name)
+			return cfg, fmt.Errorf("%w: dependency %q not found for service %s", ErrDependencyNotFound, dep, cfg.name)
 		}
 		if depEntry.removing.Load() {
 			return cfg, fmt.Errorf("%w: dependency %q is being removed for service %s", ErrHasDependents, dep, cfg.name)
@@ -630,7 +632,7 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 		o.mu.Unlock()
 		return err
 	}
-	cfg, err := o.parseRegisterOptions(opts, true)
+	cfg, err := o.parseRegisterOptions(opts)
 	if err != nil {
 		o.mu.Unlock()
 		return err
@@ -639,7 +641,7 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 
 	// Validate is user code: never invoke it while holding the orchestrator lock.
 	if v, ok := svc.(Validator); ok {
-		if err := v.Validate(); err != nil {
+		if err := callErr(v.Validate); err != nil {
 			return fmt.Errorf("gorch: service %s validation failed: %w", cfg.name, err)
 		}
 	}
@@ -1113,6 +1115,9 @@ func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) erro
 // RegisterFunc registers a closure-based service under the given name.
 // Thread-safe.
 func (o *Orchestrator) RegisterFunc(name string, startFn func(ctx ServiceContext) error, stopFn func() error, opts ...RegisterOption) error {
+	if startFn == nil {
+		return fmt.Errorf("%w: RegisterFunc called with a nil start function", ErrNilService)
+	}
 	svc := &funcService{startFn: startFn, stopFn: stopFn}
 	allOpts := make([]RegisterOption, 0, len(opts)+1)
 	allOpts = append(allOpts, WithName(name))

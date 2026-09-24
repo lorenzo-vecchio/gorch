@@ -293,8 +293,8 @@ func TestRegister_SelfDependency(t *testing.T) {
 func TestRegister_DependencyNotFound(t *testing.T) {
 	o := New()
 	err := o.Register(&namedSvc{}, WithName("orphan"), DependsOn("nobody"))
-	if err == nil {
-		t.Fatal("expected dependency-not-found error")
+	if !errors.Is(err, ErrDependencyNotFound) {
+		t.Fatalf("static Register with an unknown hard dependency = %v, want ErrDependencyNotFound", err)
 	}
 }
 
