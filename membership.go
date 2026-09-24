@@ -7,11 +7,6 @@ import (
 	"time"
 )
 
-// errReentrantMembership is returned when a membership operation is re-entered
-// from a service's own Start (C17). It is a programming error, not a state a
-// caller can recover from.
-var errReentrantMembership = errors.New("gorch: reentrant membership operation")
-
 // StartService starts (or restarts) a registered service by name.
 //
 // A persistent service is (re)started in a fresh goroutine; a cron service is
@@ -21,8 +16,9 @@ var errReentrantMembership = errors.New("gorch: reentrant membership operation")
 // Every hard dependency (DependsOn) must be StatusRunning first. Returns
 // ErrServiceNotFound for an unknown name, ErrDependencyNotFound for a missing
 // hard dependency, ErrDependencyNotRunning when a hard dependency is not
-// running, and ErrOrchestratorStopping/ErrOrchestratorStopped once
-// whole-orchestrator shutdown has begun.
+// running, ErrOrchestratorNotStarted before the orchestrator is started, and
+// ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
+// shutdown has begun.
 // Thread-safe.
 func (o *Orchestrator) StartService(name string) error {
 	o.mu.RLock()
@@ -33,6 +29,12 @@ func (o *Orchestrator) StartService(name string) error {
 	if o.stopped {
 		o.mu.RUnlock()
 		return ErrOrchestratorStopped
+	}
+	// There is no scheduler or service context to start into before Start; a
+	// cron entry in particular would otherwise reach a nil scheduler and panic.
+	if !o.started {
+		o.mu.RUnlock()
+		return ErrOrchestratorNotStarted
 	}
 	entry := o.lookupEntry(name)
 	o.mu.RUnlock()
@@ -45,7 +47,7 @@ func (o *Orchestrator) StartService(name string) error {
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
 	}
 	if entry.starting.Load() {
-		return fmt.Errorf("%w: %s", errReentrantMembership, name)
+		return fmt.Errorf("%w: %s", ErrReentrantMembership, name)
 	}
 
 	// Hard dependencies must exist (they may have been unregistered) and be
@@ -158,7 +160,7 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 		if e.starting.Load() || e.removing.Load() {
 			o.mu.Unlock()
 			o.membershipMu.Unlock()
-			return fmt.Errorf("%w: %s", errReentrantMembership, e.name)
+			return fmt.Errorf("%w: %s", ErrReentrantMembership, e.name)
 		}
 	}
 	// Freeze new hard-dependency edges into the set while it is torn down; a

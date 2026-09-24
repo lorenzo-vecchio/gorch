@@ -3,6 +3,8 @@ package gorch
 import (
 	"context"
 	"fmt"
+
+	"github.com/robfig/cron/v3"
 )
 
 func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
@@ -58,6 +60,23 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
 }
 
 type CronMode int
+
+// cronSpecParser mirrors the parser cron.New(WithSeconds()) installs, so a spec
+// accepted by validateCronSpec can always be scheduled later.
+var cronSpecParser = cron.NewParser(
+	cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
+)
+
+// validateCronSpec rejects a malformed cron expression without installing a
+// schedule. Dynamic Register uses it so a hot-added cron entry can be staged
+// (registered now, started later) without ticking while it reports
+// StatusRegistered.
+func validateCronSpec(spec string) error {
+	if _, err := cronSpecParser.Parse(spec); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidCron, err)
+	}
+	return nil
+}
 
 const (
 	CronParallel CronMode = iota // fire in new goroutine regardless

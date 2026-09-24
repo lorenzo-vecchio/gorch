@@ -539,6 +539,35 @@ func TestStop_Timeout_LogPumpExits(t *testing.T) {
 	}
 }
 
+// TestStop_DeadlineBoundsBlockingHook pins that the whole-orchestrator Stop
+// deadline also bounds a blocking before-stop hook, not just a service that
+// ignores cancellation.
+func TestStop_DeadlineBoundsBlockingHook(t *testing.T) {
+	release := make(chan struct{})
+	o := New(
+		WithHealthChecksDisabled(),
+		WithGlobalOnBeforeStop(func(string) error { <-release; return nil }),
+	)
+	svc := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	const budget = 100 * time.Millisecond
+	start := time.Now()
+	err := o.Stop(budget)
+	close(release)
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("Stop = %v, want ErrStopTimeout (blocking hook was not bounded)", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*budget {
+		t.Errorf("Stop took %v; the deadline did not bound the stop hook", elapsed)
+	}
+}
+
 // TestStop_ClosesMessengerSubscriberChannels verifies that a subscriber blocked
 // on receive observes a channel close when the orchestrator stops.
 func TestStop_ClosesMessengerSubscriberChannels(t *testing.T) {
@@ -2707,6 +2736,7 @@ func TestRunHealthChecks_FailuresTracked(t *testing.T) {
 		logger: newServiceLogger("sick", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
+	o.nameIndex[entry.name] = entry
 
 	o.runHealthChecks()
 	o.runHealthChecks()
@@ -2728,6 +2758,7 @@ func TestRunHealthChecks_HealthyResetsCounter(t *testing.T) {
 		logger: newServiceLogger("healthy", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
+	o.nameIndex[entry.name] = entry
 
 	entry.healthFailures = 5
 	o.runHealthChecks()
@@ -2769,6 +2800,8 @@ func TestRunHealthChecks_PerProbeTimeout(t *testing.T) {
 		logger: newServiceLogger("fast", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, slow, fast)
+	o.nameIndex[slow.name] = slow
+	o.nameIndex[fast.name] = fast
 
 	o.runHealthChecks()
 
@@ -2820,6 +2853,7 @@ func TestRunHealthChecks_NonRunningSkipped(t *testing.T) {
 		logger: newServiceLogger("registered", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
+	o.nameIndex[entry.name] = entry
 
 	o.runHealthChecks()
 
@@ -2878,6 +2912,7 @@ func TestRunHealthChecks_ThresholdWithoutSelfHeal(t *testing.T) {
 		logger: newServiceLogger("sick", logCh, nil, LogLevelDebug),
 	}
 	o.entries = append(o.entries, entry)
+	o.nameIndex[entry.name] = entry
 
 	entry.healthFailures = 2
 	o.runHealthChecks()
@@ -4573,8 +4608,140 @@ func TestValidate(t *testing.T) {
 	})
 }
 
-// ── BeforeHealthCheck / AfterHealthCheck ──
+// blockingValidator blocks inside Validate (outside the orchestrator lock) until
+// released, so a test can race Start/Stop against a static Validator.
+type blockingValidator struct {
+	testSvc
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
 
+func (b *blockingValidator) Validate() error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return nil
+}
+
+// racingValidator registers a conflicting name during Validate (outside the
+// lock), then blocks until released.
+type racingValidator struct {
+	testSvc
+	o       *Orchestrator
+	inner   Service
+	name    string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *racingValidator) Validate() error {
+	_ = r.o.Register(r.inner, WithName(r.name))
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	return nil
+}
+
+// TestRegister_StaticValidator pins that a pre-Start Validator runs outside the
+// orchestrator lock: it can block or reenter without deadlocking, and a Start or
+// Stop that races it is resolved at commit time.
+func TestRegister_StaticValidator(t *testing.T) {
+	t.Run("duplicate resolved at commit", func(t *testing.T) {
+		o := New()
+		if err := o.Register(&namedSvc{}, WithName("dup")); err != nil {
+			t.Fatal(err)
+		}
+		err := o.Register(&validSvc{testSvc: testSvc{}}, WithName("dup"))
+		if !errors.Is(err, ErrDuplicateName) {
+			t.Fatalf("got %v, want ErrDuplicateName", err)
+		}
+	})
+
+	t.Run("duplicate raced by Start", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		v := &racingValidator{
+			o:       o,
+			inner:   &namedSvc{},
+			name:    "raced",
+			entered: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		regDone := make(chan error, 1)
+		go func() { regDone <- o.Register(v, WithName("raced")) }()
+		<-v.entered // inner "raced" registered while the outer Validate blocks
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		close(v.release)
+		if err := <-regDone; !errors.Is(err, ErrDuplicateName) {
+			t.Fatalf("Register = %v, want ErrDuplicateName", err)
+		}
+		if err := o.Stop(time.Second); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	})
+
+	t.Run("start wins the race", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		v := &blockingValidator{entered: make(chan struct{}), release: make(chan struct{})}
+		regDone := make(chan error, 1)
+		go func() { regDone <- o.Register(v, WithName("raced")) }()
+		<-v.entered
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		close(v.release)
+		if err := <-regDone; err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if s, _ := o.Status("raced"); s != StatusRegistered {
+			t.Errorf("raced hot-add status = %v, want StatusRegistered", s)
+		}
+		if err := o.Stop(time.Second); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	})
+
+	t.Run("stop wins the race", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		stopEntered := make(chan struct{})
+		stopRelease := make(chan struct{})
+		blocker := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			stopFn: func() error {
+				close(stopEntered)
+				<-stopRelease
+				return nil
+			},
+		}
+		if err := o.Register(blocker, WithName("blocker")); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		v := &blockingValidator{entered: make(chan struct{}), release: make(chan struct{})}
+		regDone := make(chan error, 1)
+		go func() { regDone <- o.Register(v, WithName("raced")) }()
+		<-v.entered
+
+		stopDone := make(chan error, 1)
+		go func() { stopDone <- o.Stop(5 * time.Second) }()
+		<-stopEntered // stopping is set while Validate still blocks
+		close(v.release)
+		err := <-regDone
+		if !errors.Is(err, ErrOrchestratorStopping) && !errors.Is(err, ErrOrchestratorStopped) {
+			t.Fatalf("Register racing Stop = %v, want a shutdown sentinel", err)
+		}
+		close(stopRelease)
+		if err := <-stopDone; err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	})
+}
+
+// ── BeforeHealthCheck / AfterHealthCheck ──
 func TestHealthCheckHooks(t *testing.T) {
 	o := New(
 		WithHealthChecks(50*time.Millisecond, WithProbeTimeout(500*time.Millisecond), WithFailureThreshold(3)),
@@ -5093,6 +5260,47 @@ func TestStartGroup_Complete(t *testing.T) {
 			t.Fatalf("StartGroup with empty group should not error: %v", err)
 		}
 	})
+}
+
+// TestStartGroup_PartialFailureRollsBack pins that a mid-group StartGroup failure
+// stops the members already started in earlier levels, so the group is never
+// left partially started.
+func TestStartGroup_PartialFailureRollsBack(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	o.ctx, o.cancel = context.WithCancel(context.Background())
+	o.logCh = make(chan logEntry, 1)
+	o.logQuit = make(chan struct{})
+	o.logPumpDone = make(chan struct{})
+	go o.logPump()
+	defer func() {
+		o.cancel()
+		close(o.logQuit)
+		<-o.logPumpDone
+	}()
+
+	good := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	eGood := &serviceEntry{
+		name: "a-ok", svc: good,
+		cfg: registerConfig{name: "a-ok", group: "g"}, status: StatusRegistered,
+		logger: newServiceLogger("a-ok", o.logCh, nil, LogLevelDebug),
+	}
+	eBad := &serviceEntry{
+		name: "z-bad", svc: &errSvc{err: errors.New("boom")},
+		cfg: registerConfig{name: "z-bad", group: "g", runOnce: true}, status: StatusRegistered,
+		logger: newServiceLogger("z-bad", o.logCh, nil, LogLevelDebug),
+	}
+	o.entries = append(o.entries, eGood, eBad)
+	o.nameIndex = map[string]*serviceEntry{"a-ok": eGood, "z-bad": eBad}
+
+	if err := o.StartGroup("g"); err == nil {
+		t.Fatal("expected StartGroup to fail on the second member")
+	}
+	if s := o.statusOf(eGood); s != StatusStopped {
+		t.Errorf("rolled-back member status = %v, want StatusStopped", s)
+	}
+	if good.stopCalls.Load() == 0 {
+		t.Error("rollback must call Stop() on the already-started member")
+	}
 }
 
 // ── Custom Logger ──

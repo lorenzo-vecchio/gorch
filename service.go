@@ -245,8 +245,17 @@ var (
 	ErrHasDependents        = errors.New("gorch: service has running dependents")
 	ErrOrchestratorStopping = errors.New("gorch: orchestrator is stopping")
 	ErrOrchestratorStopped  = errors.New("gorch: orchestrator already stopped")
-	ErrDependencyNotRunning = errors.New("gorch: dependency not running")
-	ErrDependencyNotFound   = errors.New("gorch: dependency not found")
+	// ErrOrchestratorNotStarted is returned by StartService/StartGroup when the
+	// orchestrator has not been started yet: there is no scheduler or service
+	// context to start into.
+	ErrOrchestratorNotStarted = errors.New("gorch: orchestrator not started")
+	ErrDependencyNotRunning   = errors.New("gorch: dependency not running")
+	ErrDependencyNotFound     = errors.New("gorch: dependency not found")
+	// ErrReentrantMembership is returned when a membership operation is
+	// re-entered from a service's own Start or Stop, or races another
+	// reservation. It is a programming error, not a recoverable state. It is
+	// exported so callers can classify the rejection with errors.Is.
+	ErrReentrantMembership = errors.New("gorch: reentrant membership operation")
 )
 
 // funcService wraps closures as a Service. Used by RegisterFunc.
