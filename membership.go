@@ -281,28 +281,39 @@ func (o *Orchestrator) stopEntry(entry *serviceEntry, deadline time.Time) error 
 		awaited = entry.getDone()
 	}
 
-	err := o.stopOneServiceDeadline(entry, deadline)
-	return waitOrDeadline(err, awaited, deadline)
+	wasActive, completed, err := o.stopOneServiceDeadline(entry, deadline)
+	// The instance goroutine exiting is the other half of a verified stop: a
+	// sequence that returned while the instance still runs (a service that
+	// ignores context cancellation) must not be reported stopped.
+	if !o.awaitDone(awaited, deadline) {
+		err = errors.Join(err, ErrStopTimeout)
+		completed = false
+	}
+	if completed {
+		o.finishStop(entry, wasActive)
+	}
+	return err
 }
 
-// waitOrDeadline blocks on ch (when non-nil) up to deadline, joining
-// ErrStopTimeout on expiry. A zero deadline waits indefinitely.
-func waitOrDeadline(err error, ch <-chan struct{}, deadline time.Time) error {
+// awaitDone blocks until ch closes, at most until deadline. A nil channel has
+// nothing to await, and a zero deadline waits indefinitely. It reports whether
+// the wait finished before the deadline.
+func (o *Orchestrator) awaitDone(ch <-chan struct{}, deadline time.Time) bool {
 	if ch == nil {
-		return err
+		return true
 	}
 	if deadline.IsZero() {
 		<-ch
-		return err
+		return true
 	}
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case <-ch:
+		return true
 	case <-timer.C:
-		err = errors.Join(err, ErrStopTimeout)
+		return false
 	}
-	return err
 }
 
 // removeEntryLocked deletes entry from the registry and marks it removed. The

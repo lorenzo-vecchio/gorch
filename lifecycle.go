@@ -273,10 +273,17 @@ func (o *Orchestrator) setStatusErr(entry *serviceEntry, s ServiceStatus, err er
 }
 
 // stopOneService stops a single service entry with before/after hooks and panic
-// recovery, honoring the entry's per-service stop timeout. It transitions the
-// entry Running/Starting → Stopping → Stopped.
+// recovery, honoring the entry's per-service stop timeout. With no caller
+// deadline available it waits for the sequence, so a completed stop is committed
+// as StatusStopped; a timeout inside the sequence (there is none when the caller
+// deadline is zero, except the per-service WithStopTimeout) leaves the entry
+// StatusStopping rather than claiming it stopped.
 func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
-	return o.stopOneServiceDeadline(entry, time.Time{})
+	wasActive, completed, stopErr := o.stopOneServiceDeadline(entry, time.Time{})
+	if completed {
+		o.finishStop(entry, wasActive)
+	}
+	return stopErr
 }
 
 // stopOneServiceDeadline is stopOneService with an additional hard caller
@@ -290,26 +297,36 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 // hook that blocks forever cannot consume the whole deadline and starve the
 // service's Stop(): the service is always given a chance to release its
 // resources, and a hook that overruns is reported as ErrHookTimeout.
-func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time.Time) error {
+//
+// The entry is left StatusStopping; only a sequence that ran to completion (no
+// caller-deadline expiry, no overrunning hook, no capped-away Stop()) is
+// reported complete. The caller commits the terminal status with finishStop once
+// it has also verified the instance exited, so a timed-out stop never claims
+// StatusStopped for a service that may still be alive.
+func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time.Time) (wasActive, completed bool, stopErr error) {
 	o.statusMu.RLock()
-	wasActive := entry.status == StatusRunning || entry.status == StatusStarting
+	wasActive = entry.status == StatusRunning || entry.status == StatusStarting
 	o.statusMu.RUnlock()
 
 	o.setStatus(entry, StatusStopping)
 
-	// The whole hook+Stop sequence, so the caller's deadline can bound it.
-	sequence := func(hookDeadline time.Time) error {
+	// The whole hook+Stop sequence, so the caller's deadline can bound it. It
+	// reports whether it ran to completion: a hook that overran (ErrHookTimeout)
+	// or a Stop() capped away by the per-service timeout leaves the teardown
+	// unverified even though the sequence function itself returned.
+	sequence := func(hookDeadline time.Time) (error, bool) {
 		hookErr := o.callBeforeStopHook(entry, hookDeadline)
-		stopErr := o.stopServiceBounded(entry)
+		stopErr, stopReturned := o.stopServiceBounded(entry)
 		if afterHook := afterStopHook(entry, o); afterHook != nil {
 			callVoid(func() { afterHook(entry.name, stopErr) })
 		}
-		return errors.Join(hookErr, stopErr)
+		complete := !errors.Is(hookErr, ErrHookTimeout) && stopReturned
+		return errors.Join(hookErr, stopErr), complete
 	}
 
-	var stopErr error
+	completed = true
 	if deadline.IsZero() {
-		stopErr = sequence(time.Time{})
+		stopErr, completed = sequence(time.Time{})
 	} else {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -319,22 +336,39 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 		}
 		// Half the remaining budget for the hook, so Stop() is never starved.
 		hookDeadline := time.Now().Add(remaining / 2)
-		done := make(chan error, 1)
-		go func() { done <- sequence(hookDeadline) }()
+		type seqResult struct {
+			err       error
+			completed bool
+		}
+		done := make(chan seqResult, 1)
+		go func() {
+			err, ok := sequence(hookDeadline)
+			done <- seqResult{err: err, completed: ok}
+		}()
 		timer := time.NewTimer(remaining)
 		defer timer.Stop()
 		select {
-		case stopErr = <-done:
+		case r := <-done:
+			stopErr, completed = r.err, r.completed
 		case <-timer.C:
 			stopErr = fmt.Errorf("stop timeout after %v: %w", remaining, ErrStopTimeout)
+			completed = false
 		}
 	}
+	return wasActive, completed, stopErr
+}
 
+// finishStop commits the terminal StatusStopped — and, for an entry that was
+// Running or Starting when the teardown began, the public Stops accounting. It
+// must only be called once the teardown is verified complete: the sequence
+// finished and the instance goroutine is known to have exited. A timed-out stop
+// leaves the entry StatusStopping instead, so Status() never claims a service
+// stopped while it may still be alive.
+func (o *Orchestrator) finishStop(entry *serviceEntry, wasActive bool) {
 	o.setStatus(entry, StatusStopped)
 	if wasActive {
 		o.accountStop(entry)
 	}
-	return stopErr
 }
 
 // callBeforeStopHook runs the effective before-stop hook. When deadline is zero
@@ -366,19 +400,21 @@ func (o *Orchestrator) callBeforeStopHook(entry *serviceEntry, deadline time.Tim
 
 // stopServiceBounded runs the service's own Stop(), capped by its per-service
 // WithStopTimeout. A zero timeout leaves it unbounded; the caller deadline (when
-// set) bounds it from the outside.
-func (o *Orchestrator) stopServiceBounded(entry *serviceEntry) error {
+// set) bounds it from the outside. It reports whether Stop() actually returned:
+// on the per-service cap it does not, so the teardown is unverified and the
+// entry must not be reported StatusStopped.
+func (o *Orchestrator) stopServiceBounded(entry *serviceEntry) (error, bool) {
 	timeout := entry.cfg.stopTimeout
 	if timeout <= 0 {
-		return o.safeStopWithResult(entry.getSvc())
+		return o.safeStopWithResult(entry.getSvc()), true
 	}
 	done := make(chan error, 1)
 	go func() { done <- o.safeStopWithResult(entry.getSvc()) }()
 	select {
 	case err := <-done:
-		return err
+		return err, true
 	case <-time.After(timeout):
-		return fmt.Errorf("stop timeout after %v", timeout)
+		return fmt.Errorf("stop timeout after %v", timeout), false
 	}
 }
 
@@ -490,6 +526,11 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 			}
 		}
 		switch {
+		case entry.removing.Load():
+			// A StopService/Unregister teardown owns this entry. It commits the
+			// terminal status via finishStop only once the stop is verified
+			// complete, so the instance exiting mid-teardown must not claim
+			// StatusStopped while Stop() may still be running.
 		case entry.teardownActive():
 			// A teardown that began before this exit wins: the entry ends
 			// StatusStopped, not StatusCrashed. accountStop dedupes against the
@@ -539,11 +580,15 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	// Check maxRetries.
 	if entry.cfg.maxRetries > 0 && entry.getRetryCount() >= entry.cfg.maxRetries {
 		entry.getLogger().Error("max retries reached, giving up", "retries", entry.getRetryCount())
-		if entry.teardownActive() {
+		switch {
+		case entry.removing.Load():
+			// A StopService/Unregister teardown owns the terminal status; leave
+			// it to finishStop rather than claiming Stopped early.
+		case entry.teardownActive():
 			// StopService/Unregister cancelled this entry as it reached the
 			// retry limit: the teardown wins, so leave it StatusStopped.
 			o.setStatus(entry, StatusStopped)
-		} else {
+		default:
 			o.setStatusErr(entry, StatusCrashed, exitErr)
 		}
 		o.mu.Lock()
@@ -591,7 +636,9 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	// together the select may pick the timer, and spawning the next instance
 	// under a cancelled context would let it outlive this teardown.
 	if teardown.Err() != nil {
-		o.setStatus(entry, StatusStopped)
+		if !entry.removing.Load() {
+			o.setStatus(entry, StatusStopped)
+		}
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true

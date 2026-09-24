@@ -2324,6 +2324,192 @@ func TestStopService_DeadlineBoundsStop(t *testing.T) {
 	}
 }
 
+// TestStopTimeout_StatusIsNotStopped pins that a stop whose caller deadline
+// expires while Stop() is still blocking must not claim StatusStopped: the
+// service may still be alive holding resources.
+func TestStopTimeout_StatusIsNotStopped(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-release; return nil },
+		stopFn:  func() error { <-release; return nil },
+	}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		close(release)
+		_ = o.Stop(time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	err := o.StopService("s", 50*time.Millisecond)
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("StopService = %v, want ErrStopTimeout", err)
+	}
+	if s, _ := o.Status("s"); s == StatusStopped {
+		t.Fatalf("Status = %s after a timed-out stop; want not stopped (service may still be alive)", s)
+	}
+}
+
+// TestStopTimeout_DoesNotCountStop pins that a stop whose caller deadline
+// expired is not counted in the public Stops metric: the stop did not complete.
+func TestStopTimeout_DoesNotCountStop(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-release; return nil },
+		stopFn:  func() error { <-release; return nil },
+	}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		close(release)
+		_ = o.Stop(time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	before := o.Metrics().Stops
+	err := o.StopService("s", 50*time.Millisecond)
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("StopService = %v, want ErrStopTimeout", err)
+	}
+	if got := o.Metrics().Stops; got != before {
+		t.Fatalf("Stops = %d after a timed-out stop, want %d (unchanged)", got, before)
+	}
+}
+
+// TestStop_HookOverrun_StatusHonest pins that a before-stop hook that overruns
+// its share of the budget leaves the teardown unverified: the stop error reports
+// ErrHookTimeout and the entry is not claimed Stopped, even though the service's
+// own Stop() ran with the remainder.
+func TestStop_HookOverrun_StatusHonest(t *testing.T) {
+	release := make(chan struct{})
+	o := New(
+		WithHealthChecksDisabled(),
+		WithGlobalOnBeforeStop(func(string) error { <-release; return nil }),
+	)
+	svc := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		close(release)
+		_ = o.Stop(time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	before := o.Metrics().Stops
+	err := o.StopService("s", time.Second)
+	if !errors.Is(err, ErrHookTimeout) {
+		t.Fatalf("StopService = %v, want ErrHookTimeout", err)
+	}
+	if s, _ := o.Status("s"); s == StatusStopped {
+		t.Fatalf("Status = %s after an overrunning before-stop hook; want not stopped", s)
+	}
+	if got := o.Metrics().Stops; got != before {
+		t.Fatalf("Stops = %d after an unverified hook overrun, want %d (unchanged)", got, before)
+	}
+}
+
+// TestStopTimeout_PerServiceCap_StatusNotStopped pins that a Stop() capped away
+// by WithStopTimeout (the orchestrator gave up waiting but Stop() is still
+// running) is not reported as a completed stop.
+func TestStopTimeout_PerServiceCap_StatusNotStopped(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		stopFn:  func() error { <-release; return nil },
+	}
+	if err := o.Register(svc, WithName("s"), WithStopTimeout(50*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		close(release)
+		_ = o.Stop(time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	before := o.Metrics().Stops
+	err := o.StopService("s", 5*time.Second)
+	if err == nil {
+		t.Fatal("expected the per-service stop cap to fire")
+	}
+	if errors.Is(err, ErrStopTimeout) {
+		t.Errorf("per-service cap error = %v, must not be the caller's ErrStopTimeout", err)
+	}
+	if s, _ := o.Status("s"); s == StatusStopped {
+		t.Fatalf("Status = %s after the per-service cap fired; want not stopped", s)
+	}
+	if got := o.Metrics().Stops; got != before {
+		t.Fatalf("Stops = %d after a capped stop, want %d (unchanged)", got, before)
+	}
+}
+
+// TestStopService_InstanceExitedBeforeStopReturns_StatusStopping pins the
+// teardown-ownership rule: while StopService is still blocked in Stop(), an
+// instance that already exited on context cancellation must not by itself flip
+// the status to Stopped. The stop path owns the terminal status.
+func TestStopService_InstanceExitedBeforeStopReturns_StatusStopping(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	exited := make(chan struct{})
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error {
+			<-ctx.Done()
+			close(exited)
+			return ctx.Err()
+		},
+		stopFn: func() error { <-release; return nil },
+	}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		releaseAll()
+		_ = o.Stop(time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- o.StopService("s", 5*time.Second) }()
+
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("service Start did not exit on context cancellation")
+	}
+	if s, _ := o.Status("s"); s == StatusStopped {
+		t.Fatalf("Status = %s while Stop() is still blocked; want Stopping", s)
+	}
+	releaseAll() // let Stop() return; from here on the stop may commit
+	if err := <-done; err != nil {
+		t.Fatalf("StopService = %v, want nil once Stop() returned", err)
+	}
+	if s, _ := o.Status("s"); s != StatusStopped {
+		t.Fatalf("Status = %s after a completed stop, want Stopped", s)
+	}
+}
+
 // TestStopOneService_PastDeadline covers the boundary where the caller deadline
 // has already elapsed: the hook+Stop sequence is bounded to a sliver instead of
 // running unbounded, so StopService reports ErrStopTimeout promptly.
@@ -2335,7 +2521,7 @@ func TestStopOneService_PastDeadline(t *testing.T) {
 		cfg:    registerConfig{name: "s"},
 		status: StatusRunning,
 	}
-	err := o.stopOneServiceDeadline(entry, time.Now().Add(-time.Second))
+	_, _, err := o.stopOneServiceDeadline(entry, time.Now().Add(-time.Second))
 	if !errors.Is(err, ErrStopTimeout) {
 		t.Fatalf("past-deadline stop = %v, want ErrStopTimeout", err)
 	}
@@ -2664,15 +2850,19 @@ func TestHandleServiceDone_ReleasesInstanceSubs(t *testing.T) {
 		entry := o.nameIndex["s"]
 		o.mu.RUnlock()
 		if entry.currentOwner() == 0 {
+			// Owner bookkeeping and the Messenger drain happen back to back, so
+			// the subscription channel may close a moment after the owner count
+			// drops to zero. Wait for the close rather than racing it.
 			select {
 			case _, ok := <-svc.channel():
 				if ok {
 					t.Error("a naturally exited instance's subscription must be drained")
 				}
-			default:
+				return
+			case <-deadline:
 				t.Error("a naturally exited instance's channel must be closed")
+				return
 			}
-			return
 		}
 		select {
 		case <-deadline:

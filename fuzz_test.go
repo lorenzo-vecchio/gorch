@@ -46,6 +46,24 @@ func (s *fuzzCronSvc) Start(ctx ServiceContext) error {
 
 func (s *fuzzCronSvc) Stop() error { return nil }
 
+// fuzzStubbornSvc ignores context cancellation and blocks in Start until
+// released, while Stop() returns immediately. It is the service that exposes a
+// dishonest status: a stop that times out with the instance goroutine still live
+// must never be reported stopped.
+type fuzzStubbornSvc struct {
+	release chan struct{}
+	running atomic.Int32
+}
+
+func (s *fuzzStubbornSvc) Start(ctx ServiceContext) error {
+	s.running.Add(1)
+	<-s.release
+	s.running.Add(-1)
+	return nil
+}
+
+func (s *fuzzStubbornSvc) Stop() error { return nil }
+
 // FuzzMembershipTransitions drives a random add/start/stop/remove/crash/restart
 // sequence against a small dependency graph. Besides asserting no panic or
 // deadlock and no goroutine leak, it checks semantic properties grep-style
@@ -170,6 +188,59 @@ func FuzzMembershipTransitions(f *testing.F) {
 				t.Fatalf("entry %s still StatusStarting after shutdown", name)
 			}
 		}
+		select {
+		case <-o.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatal("goroutines did not wind down after Stop")
+		}
+	})
+}
+
+// FuzzStopTimeoutStatus drives a stop against a service that ignores context
+// cancellation, so the stop times out with the instance goroutine still live. It
+// asserts the semantic obligation the deadline path must never break: while the
+// instance is live, the entry is never reported StatusStopped. The first input
+// byte picks a bounded timeout and the second picks whole-orchestrator Stop
+// versus StopService.
+func FuzzStopTimeoutStatus(f *testing.F) {
+	f.Add([]byte{1})
+	f.Add([]byte{50, 0})
+	f.Add([]byte{200, 1})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) == 0 {
+			return
+		}
+		timeout := time.Duration(int(data[0])%200+1) * time.Millisecond
+		whole := len(data) > 1 && data[1]%2 == 1
+
+		release := make(chan struct{})
+		svc := &fuzzStubbornSvc{release: release}
+		o := New(WithHealthChecksDisabled())
+		_ = o.Register(svc, WithName("s"))
+		_ = o.Start()
+
+		// Wait until the instance goroutine is actually live before stopping.
+		live := time.After(time.Second)
+		for svc.running.Load() == 0 {
+			select {
+			case <-live:
+				t.Fatal("service did not start")
+			case <-time.After(time.Millisecond):
+			}
+		}
+
+		if whole {
+			_ = o.Stop(timeout)
+		} else {
+			_ = o.StopService("s", timeout)
+		}
+		if s, ok := o.Status("s"); ok && s == StatusStopped && svc.running.Load() != 0 {
+			t.Fatalf("entry reported Stopped while its instance goroutine is still live")
+		}
+
+		// Release the instance and let everything wind down.
+		close(release)
+		_ = o.Stop(2 * time.Second)
 		select {
 		case <-o.Done():
 		case <-time.After(2 * time.Second):

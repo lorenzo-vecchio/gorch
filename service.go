@@ -234,9 +234,14 @@ func WithCascadeStop() StopOption {
 var (
 	ErrAlreadyStarted = errors.New("gorch: orchestrator already started")
 	ErrInvalidCron    = errors.New("gorch: invalid cron expression")
-	ErrStopTimeout    = errors.New("gorch: stop timed out waiting for services")
-	ErrDuplicateName  = errors.New("gorch: duplicate service name")
-	ErrNilService     = errors.New("gorch: nil service")
+	// ErrStopTimeout reports that a stop did not finish within the caller's
+	// timeout: the before/after-stop hooks, the service's own Stop(), or the
+	// wait for its instance to exit was still in flight. The service is left
+	// StatusStopping, not StatusStopped, and the stop is not counted in
+	// Metrics().Stops, because its teardown is unverified.
+	ErrStopTimeout   = errors.New("gorch: stop timed out waiting for services")
+	ErrDuplicateName = errors.New("gorch: duplicate service name")
+	ErrNilService    = errors.New("gorch: nil service")
 	// ErrHookTimeout is joined into the stop error when a before-stop hook
 	// overran the budget reserved for it. It always accompanies ErrStopTimeout,
 	// so a caller can tell a hook that would not return from a service whose
