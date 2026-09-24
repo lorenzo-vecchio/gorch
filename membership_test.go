@@ -164,8 +164,8 @@ func TestRegisterDynamic_Cron(t *testing.T) {
 	if err := o.Register(cron, WithName("c"), WithCron("* * * * * *", CronParallel)); err != nil {
 		t.Fatalf("hot cron: %v", err)
 	}
-	// Register does not auto-start: the cron entry is scheduled but the service
-	// stays StatusRegistered until StartService (D1).
+	// Register neither starts nor schedules the service: it stays
+	// StatusRegistered with no live schedule until StartService (D1).
 	if s, _ := o.Status("c"); s != StatusRegistered {
 		t.Errorf("hot cron status = %v, want StatusRegistered", s)
 	}
@@ -173,17 +173,14 @@ func TestRegisterDynamic_Cron(t *testing.T) {
 	o.mu.Lock()
 	entry := o.nameIndex["c"]
 	o.mu.Unlock()
-	if entry.cronID == 0 {
-		t.Error("hot-added cron entry has no cron ID")
+	if entry.cronID != 0 {
+		t.Error("hot-added cron entry must not be scheduled before StartService")
 	}
 
-	deadline := time.After(3 * time.Second)
-	for calls.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("hot-added cron service never ticked")
-		case <-time.After(20 * time.Millisecond):
-		}
+	// Give the scheduler a full second: with no live schedule nothing ticks.
+	time.Sleep(1100 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("unscheduled hot cron ticked %d times, want 0", got)
 	}
 
 	if err := o.StartService("c"); err != nil {
@@ -192,6 +189,21 @@ func TestRegisterDynamic_Cron(t *testing.T) {
 	if s, _ := o.Status("c"); s != StatusRunning {
 		t.Errorf("status after StartService = %v, want StatusRunning", s)
 	}
+	o.mu.Lock()
+	if entry.cronID == 0 {
+		t.Error("StartService must schedule the hot-added cron entry")
+	}
+	o.mu.Unlock()
+
+	deadline := time.After(3 * time.Second)
+	for calls.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("started cron service never ticked")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
 	// Already running: StartService is a no-op.
 	if err := o.StartService("c"); err != nil {
 		t.Fatalf("StartService on running cron: %v", err)
@@ -524,10 +536,29 @@ func TestStartService(t *testing.T) {
 
 		entry.starting.Store(true)
 		defer entry.starting.Store(false)
-		if err := o.StartService("r"); !errors.Is(err, errReentrantMembership) {
+		if err := o.StartService("r"); !errors.Is(err, ErrReentrantMembership) {
 			t.Fatalf("got %v, want reentrant membership error", err)
 		}
 	})
+}
+
+// TestStartService_NotStarted pins that starting a service before the
+// orchestrator has started returns a sentinel instead of panicking on a nil
+// context or scheduler (a cron entry would otherwise reach a nil scheduler).
+func TestStartService_NotStarted(t *testing.T) {
+	o := New()
+	if err := o.Register(&namedSvc{}, WithName("n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("n"); !errors.Is(err, ErrOrchestratorNotStarted) {
+		t.Fatalf("persistent StartService before Start = %v, want ErrOrchestratorNotStarted", err)
+	}
+	if err := o.Register(&testSvc{}, WithName("c"), WithCron("* * * * * *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("c"); !errors.Is(err, ErrOrchestratorNotStarted) {
+		t.Fatalf("cron StartService before Start = %v, want ErrOrchestratorNotStarted", err)
+	}
 }
 
 // TestStartService_ReentrantFromOwnStart verifies that a service starting
@@ -547,7 +578,7 @@ func TestStartService_ReentrantFromOwnStart(t *testing.T) {
 	}
 	defer o.Stop(1 * time.Second)
 
-	if !errors.Is(innerErr, errReentrantMembership) {
+	if !errors.Is(innerErr, ErrReentrantMembership) {
 		t.Fatalf("nested StartService = %v, want reentrant membership error", innerErr)
 	}
 }
@@ -1298,10 +1329,10 @@ func TestTearDown_Reentrant(t *testing.T) {
 
 	entry.starting.Store(true)
 	defer entry.starting.Store(false)
-	if err := o.StopService("r", time.Second); !errors.Is(err, errReentrantMembership) {
+	if err := o.StopService("r", time.Second); !errors.Is(err, ErrReentrantMembership) {
 		t.Errorf("StopService = %v, want reentrant membership error", err)
 	}
-	if err := o.Unregister("r", time.Second); !errors.Is(err, errReentrantMembership) {
+	if err := o.Unregister("r", time.Second); !errors.Is(err, ErrReentrantMembership) {
 		t.Errorf("Unregister = %v, want reentrant membership error", err)
 	}
 }
@@ -1536,7 +1567,7 @@ func TestMembershipTransitions(t *testing.T) {
 // StartGroup/StopGroup and membership ops serialize their *selection*, so
 // concurrent calls never interleave on entry selection. Now that user code runs
 // outside the lock, a call that loses the race against an in-flight group
-// start or teardown is rejected with errReentrantMembership rather than
+// start or teardown is rejected with ErrReentrantMembership rather than
 // blocking; run under -race, this asserts no interleaving tears an entry
 // mid-operation.
 func TestGroupOps_SerializedWithMembership(t *testing.T) {
@@ -1563,7 +1594,7 @@ func TestGroupOps_SerializedWithMembership(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := fn(); err != nil && !errors.Is(err, errReentrantMembership) {
+			if err := fn(); err != nil && !errors.Is(err, ErrReentrantMembership) {
 				t.Errorf("serialized op failed: %v", err)
 			}
 		}()
@@ -1783,8 +1814,8 @@ func TestMembership_ReentrantFromStart(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("reentrant StopService from Start deadlocked")
 		}
-		if !errors.Is(innerErr, errReentrantMembership) {
-			t.Errorf("self StopService = %v, want errReentrantMembership", innerErr)
+		if !errors.Is(innerErr, ErrReentrantMembership) {
+			t.Errorf("self StopService = %v, want ErrReentrantMembership", innerErr)
 		}
 	})
 
@@ -1846,8 +1877,8 @@ func TestMembership_ReentrantFromStart(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("reentrant StopService inside StartGroup deadlocked")
 		}
-		if !errors.Is(innerErr, errReentrantMembership) {
-			t.Errorf("self StopService = %v, want errReentrantMembership", innerErr)
+		if !errors.Is(innerErr, ErrReentrantMembership) {
+			t.Errorf("self StopService = %v, want ErrReentrantMembership", innerErr)
 		}
 	})
 
@@ -2290,6 +2321,23 @@ func TestStopService_DeadlineBoundsStop(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*budget {
 		t.Errorf("StopService took %v; the deadline did not bound Stop()", elapsed)
+	}
+}
+
+// TestStopOneService_PastDeadline covers the boundary where the caller deadline
+// has already elapsed: the hook+Stop sequence is bounded to a sliver instead of
+// running unbounded, so StopService reports ErrStopTimeout promptly.
+func TestStopOneService_PastDeadline(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	entry := &serviceEntry{
+		name:   "s",
+		svc:    &testSvc{stopFn: func() error { time.Sleep(50 * time.Millisecond); return nil }},
+		cfg:    registerConfig{name: "s"},
+		status: StatusRunning,
+	}
+	err := o.stopOneServiceDeadline(entry, time.Now().Add(-time.Second))
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("past-deadline stop = %v, want ErrStopTimeout", err)
 	}
 }
 

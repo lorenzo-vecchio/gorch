@@ -152,6 +152,16 @@ func (o *Orchestrator) runHealthChecks() {
 		if o.cfg.AfterHealthCheck != nil {
 			o.cfg.AfterHealthCheck(e.name, healthErr)
 		}
+		// Re-validate membership after the (possibly slow) probe, exactly as
+		// Health does: a concurrent Unregister may have removed or replaced this
+		// entry, and acting on the stale snapshot would cancel an instance the
+		// graph no longer tracks (C5).
+		o.mu.RLock()
+		current := o.nameIndex[e.name]
+		o.mu.RUnlock()
+		if current != e || e.removing.Load() {
+			continue
+		}
 		failures := e.getHealthFailures()
 		if healthErr != nil {
 			failures++

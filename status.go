@@ -146,17 +146,33 @@ func (o *Orchestrator) StartGroup(group string) error {
 	for _, e := range reserved {
 		startable[e] = true
 	}
+	var started []*serviceEntry
 	for _, level := range levels {
 		for _, entry := range level {
 			if !startable[entry] {
 				continue
 			}
 			if err := o.startOneService(entry); err != nil {
+				// Roll back the members already started in earlier levels so a
+				// mid-group failure leaves no partially started group.
+				o.rollbackGroupStart(started)
 				return err
 			}
+			started = append(started, entry)
 		}
 	}
 	return nil
+}
+
+// rollbackGroupStart stops the members a failed StartGroup already started, in
+// reverse start order. It is best-effort: the caller reports the original start
+// failure, and a rollback error must not mask it.
+func (o *Orchestrator) rollbackGroupStart(started []*serviceEntry) {
+	for i := len(started) - 1; i >= 0; i-- {
+		e := started[i]
+		_ = o.stopEntry(e, time.Time{})
+		o.drainService(e)
+	}
 }
 
 // clearStarting releases the StartGroup reservation on entries whose start never

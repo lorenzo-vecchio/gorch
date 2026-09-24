@@ -73,6 +73,10 @@ type serviceEntry struct {
 	done chan struct{}
 	// CronSkip / CronQueue gate
 	running atomic.Bool
+	// stopsCounted latches the per-instance stop metric: a teardown and the
+	// instance's own exit handler can both observe the same stop, but only one
+	// of them may count it.
+	stopsCounted atomic.Bool
 	// CronQueue serialization lock (serialize ticks mode)
 	cronMu sync.Mutex
 	// cronTrack guards the per-schedule tick accounting below. All ticks of one
@@ -488,26 +492,59 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 		o.mu.Unlock()
 		return o.registerDynamic(svc, opts)
 	}
+
+	// Static registration is pre-Start. Validate is user code: it must never run
+	// under o.mu (a blocking or reentrant Validator would deadlock), matching the
+	// dynamic path. The common no-validator case stays entirely under the lock.
+	if _, ok := svc.(Validator); !ok {
+		cfg, err := o.parseRegisterOptions(opts, false)
+		if err != nil {
+			o.mu.Unlock()
+			return err
+		}
+		o.appendStaticEntryLocked(svc, cfg)
+		o.mu.Unlock()
+		return nil
+	}
+
+	// Resolve the requested name for the validation error without touching the
+	// graph, then run Validate outside the lock.
+	var pre registerConfig
+	for _, opt := range opts {
+		opt(&pre)
+	}
+	o.mu.Unlock()
+
+	if err := svc.(Validator).Validate(); err != nil {
+		return fmt.Errorf("gorch: service %s validation failed: %w", pre.name, err)
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	// Start may have won the race while Validate ran: the service is now a live
+	// hot add, appended as StatusRegistered (never auto-started). Validation has
+	// already run, so it is not repeated.
+	if o.started {
+		cfg, err := o.parseRegisterOptions(opts, true)
+		if err != nil {
+			return err
+		}
+		return o.commitDynamicLocked(svc, cfg)
+	}
 	cfg, err := o.parseRegisterOptions(opts, false)
 	if err != nil {
-		o.mu.Unlock()
 		return err
 	}
+	o.appendStaticEntryLocked(svc, cfg)
+	return nil
+}
 
-	// Static registration happens under the lock (historical behavior); the
-	// dynamic path deliberately moves Validate outside it.
-	if v, ok := svc.(Validator); ok {
-		if err := v.Validate(); err != nil {
-			o.mu.Unlock()
-			return fmt.Errorf("gorch: service %s validation failed: %w", cfg.name, err)
-		}
-	}
-
+// appendStaticEntryLocked adds a pre-Start entry to the registry. The caller
+// must hold o.mu and have parsed cfg via parseRegisterOptions.
+func (o *Orchestrator) appendStaticEntryLocked(svc Service, cfg registerConfig) {
 	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
 	o.entries = append(o.entries, entry)
 	o.nameIndex[cfg.name] = entry
-	o.mu.Unlock()
-	return nil
 }
 
 // parseRegisterOptions applies opts and performs the structural validation that
@@ -598,12 +635,6 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 		o.mu.Unlock()
 		return err
 	}
-	// Capture the log fields under o.mu: a concurrent Start publishes them in
-	// one critical section, so reading them here without the lock would race.
-	customLogger := o.cfg.Logger
-	logCh := o.logCh
-	logQuit := o.logQuit
-	logLevel := o.cfg.LogLevel
 	o.mu.Unlock()
 
 	// Validate is user code: never invoke it while holding the orchestrator lock.
@@ -613,27 +644,38 @@ func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error
 		}
 	}
 
-	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
-	if customLogger != nil {
-		entry.setLogger(newServiceLoggerWith(entry.name, customLogger))
-	} else {
-		entry.setLogger(newServiceLogger(entry.name, logCh, logQuit, logLevel))
-	}
-
 	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.commitDynamicLocked(svc, cfg)
+}
+
+// commitDynamicLocked appends a hot-added entry to a running orchestrator. The
+// caller must hold o.mu; Validator.Validate (if any) must already have run
+// outside the lock. The entry stays StatusRegistered and is never auto-started
+// (D1); a cron entry is only validated here, not scheduled, so its schedule and
+// status stay consistent until StartService.
+func (o *Orchestrator) commitDynamicLocked(svc Service, cfg registerConfig) error {
+	if err := o.membershipGateLocked(); err != nil {
+		return err
+	}
 	if _, exists := o.nameIndex[cfg.name]; exists {
-		o.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrDuplicateName, cfg.name)
 	}
 	if cfg.cronSpec != "" {
-		if err := o.scheduleEntry(entry); err != nil {
-			o.mu.Unlock()
+		if err := validateCronSpec(cfg.cronSpec); err != nil {
 			return err
 		}
 	}
+	// Read the log fields under o.mu: a concurrent Start publishes them in one
+	// critical section, so reading them without the lock would race.
+	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
+	if o.cfg.Logger != nil {
+		entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
+	} else {
+		entry.setLogger(newServiceLogger(entry.name, o.logCh, o.logQuit, o.cfg.LogLevel))
+	}
 	o.entries = append(o.entries, entry)
 	o.nameIndex[cfg.name] = entry
-	o.mu.Unlock()
 	return nil
 }
 
@@ -728,7 +770,12 @@ func (o *Orchestrator) Start() error {
 		// therefore either lands before the snapshot (and is included) or sees a
 		// live orchestrator and appends on the dynamic path under o.mu. Start then
 		// operates only on the snapshot, so it never reads a field a hot
-		// Register is mutating.
+		// Register is mutating. membershipMu reserves every snapshotted entry
+		// (starting=true) so a StopService/Unregister racing the gap before
+		// startOneService is rejected rather than tearing an entry down mid-start
+		// (D16). The subscription is released by clearStarting once Start's
+		// synchronous work is done.
+		o.membershipMu.Lock()
 		o.mu.Lock()
 		o.started = true
 		// A no-op Stop() before Start() is harmless but consumes stopOnce; clear it
@@ -746,7 +793,12 @@ func (o *Orchestrator) Start() error {
 		for name, e := range o.nameIndex {
 			nameIndex[name] = e
 		}
+		for _, e := range entries {
+			e.starting.Store(true)
+		}
 		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		defer o.clearStarting(entries)
 
 		// Assign loggers keyed by the service name (WithName or auto "$N"), so
 		// log output correlates with Status/name lookups.
@@ -934,9 +986,10 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry) {
 	o.stopOnce = sync.Once{}
 }
 
-// Stop shuts down the orchestrator, waiting up to timeout for services to
-// finish. Returns aggregated errors from all Stop failures, or ErrStopTimeout
-// if services don't all stop within the timeout.
+// Stop shuts down the orchestrator, bounding the whole shutdown by timeout:
+// every service's before/after-stop hooks and Stop() call, plus the wait for
+// goroutines to exit, share the one budget. Returns aggregated errors from all
+// Stop failures, or ErrStopTimeout if the deadline is exceeded.
 // Thread-safe. Safe to call on an orchestrator that was never started (no-op).
 // The whole-orchestrator lifecycle is single-shot: after a successful Stop it
 // cannot be restarted, and a subsequent Start returns ErrAlreadyStarted.
@@ -957,6 +1010,13 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		o.stopping = true
 		o.mu.Unlock()
 
+		// One deadline for the whole shutdown: the per-service stop sequence and
+		// the final wait share it, so a blocking hook cannot outlast the caller.
+		var stopDeadline time.Time
+		if timeout > 0 {
+			stopDeadline = time.Now().Add(timeout)
+		}
+
 		// Stop health-check loop.
 		if o.healthCancel != nil {
 			o.healthCancel()
@@ -976,7 +1036,7 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		levels, _ := o.topoSort(persistent) // ignore error, graph already validated
 		for i := len(levels) - 1; i >= 0; i-- {
 			for _, entry := range levels[i] {
-				err := o.stopOneService(entry)
+				err := o.stopOneServiceDeadline(entry, stopDeadline)
 				if err != nil {
 					stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
 				}
@@ -985,7 +1045,7 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		// Also stop any remaining entries not in levels (e.g., cron-only, runOnce that failed).
 		for _, entry := range o.entries {
 			if entry.cfg.runOnce || entry.cfg.cronSpec != "" {
-				err := o.stopOneService(entry)
+				err := o.stopOneServiceDeadline(entry, stopDeadline)
 				if err != nil {
 					stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
 				}
@@ -1000,7 +1060,7 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 		// 5. Clean up messenger subscriptions.
 		o.messenger.Drain()
 
-		// 6. Wait for all services + log-pump with timeout.
+		// 6. Wait for all services + log-pump with whatever budget is left.
 		done := make(chan struct{})
 		go func() {
 			o.wg.Wait()
@@ -1009,9 +1069,13 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 			}
 			close(done)
 		}()
+		remaining := timeout
+		if !stopDeadline.IsZero() {
+			remaining = max(time.Until(stopDeadline), 0)
+		}
 		select {
 		case <-done:
-		case <-time.After(timeout):
+		case <-time.After(remaining):
 			stopErr = errors.Join(stopErr, ErrStopTimeout)
 		}
 

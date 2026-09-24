@@ -17,6 +17,8 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	// nested StartService on this entry is rejected rather than recursing (C17).
 	entry.starting.Store(true)
 	defer entry.starting.Store(false)
+	// A fresh instance gets a fresh stop-metric latch.
+	entry.stopsCounted.Store(false)
 
 	// --- before-start hook ---
 	hook := entry.cfg.onBeforeStart
@@ -270,10 +272,12 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 	return o.stopOneServiceDeadline(entry, time.Time{})
 }
 
-// stopOneServiceDeadline is stopOneService with an additional hard deadline on
-// the service's own Stop() call: the effective cap is the smaller of the
-// per-service WithStopTimeout and the time remaining before deadline. A zero
-// deadline leaves the per-service timeout in charge.
+// stopOneServiceDeadline is stopOneService with an additional hard caller
+// deadline that bounds the whole stop — the before/after hooks and the service's
+// own Stop() — not only Stop(). The effective Stop() cap remains the smaller of
+// the per-service WithStopTimeout and the time left before the deadline. A zero
+// deadline leaves the per-service timeout in charge and runs the sequence
+// synchronously.
 func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time.Time) error {
 	o.statusMu.RLock()
 	wasActive := entry.status == StatusRunning || entry.status == StatusStarting
@@ -281,65 +285,89 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 
 	o.setStatus(entry, StatusStopping)
 
-	// --- before-stop hook ---
-	hook := entry.cfg.onBeforeStop
-	if hook == nil {
-		hook = o.cfg.OnBeforeStop
-	}
-	var hookErr error
-	if hook != nil {
-		hookErr = hook(entry.name)
+	// The whole hook+Stop sequence, so the caller's deadline can bound it.
+	sequence := func() error {
+		var hookErr error
+		if hook := stopHook(entry, o); hook != nil {
+			hookErr = hook(entry.name)
+		}
+		stopErr := o.stopServiceBounded(entry)
+		if afterHook := afterStopHook(entry, o); afterHook != nil {
+			afterHook(entry.name, stopErr)
+		}
+		return errors.Join(hookErr, stopErr)
 	}
 
-	// --- stop ---
 	var stopErr error
-	timeout := entry.cfg.stopTimeout
-	// deadlineCapped records that the caller's deadline (rather than the
-	// per-service WithStopTimeout) determined the stop budget, so the caller can
-	// recognise the failure as its own ErrStopTimeout.
-	deadlineCapped := false
-	if !deadline.IsZero() {
+	if deadline.IsZero() {
+		stopErr = sequence()
+	} else {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			// The deadline already passed: do not fall through to an unbounded
-			// synchronous Stop().
+			// The deadline already passed: bound the sequence to a sliver so a
+			// blocking hook or Stop() cannot hang past it.
 			remaining = time.Nanosecond
 		}
-		if timeout <= 0 || remaining < timeout {
-			timeout = remaining
-			deadlineCapped = true
-		}
-	}
-	if timeout > 0 {
 		done := make(chan error, 1)
-		go func() { done <- o.safeStopWithResult(entry.getSvc()) }()
+		go func() { done <- sequence() }()
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
 		select {
 		case stopErr = <-done:
-		case <-time.After(timeout):
-			if deadlineCapped {
-				stopErr = fmt.Errorf("stop timeout after %v: %w", timeout, ErrStopTimeout)
-			} else {
-				stopErr = fmt.Errorf("stop timeout after %v", timeout)
-			}
+		case <-timer.C:
+			stopErr = fmt.Errorf("stop timeout after %v: %w", remaining, ErrStopTimeout)
 		}
-	} else {
-		stopErr = o.safeStopWithResult(entry.getSvc())
-	}
-
-	// --- after-stop hook ---
-	afterHook := entry.cfg.onAfterStop
-	if afterHook == nil {
-		afterHook = o.cfg.OnAfterStop
-	}
-	if afterHook != nil {
-		afterHook(entry.name, stopErr)
 	}
 
 	o.setStatus(entry, StatusStopped)
 	if wasActive {
+		o.accountStop(entry)
+	}
+	return stopErr
+}
+
+// stopServiceBounded runs the service's own Stop(), capped by its per-service
+// WithStopTimeout. A zero timeout leaves it unbounded; the caller deadline (when
+// set) bounds it from the outside.
+func (o *Orchestrator) stopServiceBounded(entry *serviceEntry) error {
+	timeout := entry.cfg.stopTimeout
+	if timeout <= 0 {
+		return o.safeStopWithResult(entry.getSvc())
+	}
+	done := make(chan error, 1)
+	go func() { done <- o.safeStopWithResult(entry.getSvc()) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("stop timeout after %v", timeout)
+	}
+}
+
+// accountStop records one stop for entry at most once per instance. The teardown
+// path (stopOneServiceDeadline) and the instance's own exit path
+// (handleServiceDone) can both observe the same stop; the latch makes the public
+// Stops metric count it exactly once.
+func (o *Orchestrator) accountStop(entry *serviceEntry) {
+	if entry.stopsCounted.CompareAndSwap(false, true) {
 		o.metricsStops.Add(1)
 	}
-	return errors.Join(hookErr, stopErr)
+}
+
+// stopHook resolves the effective before-stop hook (per-service over global).
+func stopHook(entry *serviceEntry, o *Orchestrator) func(string) error {
+	if entry.cfg.onBeforeStop != nil {
+		return entry.cfg.onBeforeStop
+	}
+	return o.cfg.OnBeforeStop
+}
+
+// afterStopHook resolves the effective after-stop hook (per-service over global).
+func afterStopHook(entry *serviceEntry, o *Orchestrator) func(string, error) {
+	if entry.cfg.onAfterStop != nil {
+		return entry.cfg.onAfterStop
+	}
+	return o.cfg.OnAfterStop
 }
 
 // safeStopWithResult calls Stop with panic recovery, returning any error.
@@ -426,14 +454,15 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 		switch {
 		case entry.teardownActive():
 			// A teardown that began before this exit wins: the entry ends
-			// StatusStopped, not StatusCrashed.
+			// StatusStopped, not StatusCrashed. accountStop dedupes against the
+			// teardown path's own accounting.
 			o.setStatus(entry, StatusStopped)
-			o.metricsStops.Add(1)
+			o.accountStop(entry)
 		case exitErr != nil && !errors.Is(exitErr, context.Canceled):
 			o.setStatusErr(entry, StatusCrashed, exitErr)
 		default:
 			o.setStatus(entry, StatusStopped)
-			o.metricsStops.Add(1)
+			o.accountStop(entry)
 		}
 		o.mu.Lock()
 		if !entry.wgDone {
@@ -537,6 +566,8 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	}
 
 	o.safeStop(entry) // best-effort cleanup of old instance
+	// The restarted instance gets its own stop-metric latch.
+	entry.stopsCounted.Store(false)
 
 	newSvc := entry.cfg.factory()
 	entry.setSvc(newSvc)
