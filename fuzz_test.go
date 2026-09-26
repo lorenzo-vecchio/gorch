@@ -74,7 +74,20 @@ func FuzzMembershipTransitions(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 4, 5, 6, 7})
 	f.Add([]byte{5, 5, 4, 3, 2, 1, 0, 2, 2, 0})
 	f.Fuzz(func(t *testing.T, data []byte) {
-		o := New(WithHealthChecksDisabled())
+		// A self-heal crash must be observable on every surface at once: each
+		// OnCrash call and each Running→Crashed transition has a matching Crashes
+		// increment, however the membership ops interleave. Count them atomically
+		// and reconcile at the end, once every goroutine has wound down.
+		var onCrash, crashTransitions atomic.Int64
+		o := New(
+			WithHealthChecksDisabled(),
+			WithOnCrash(func(string, error) { onCrash.Add(1) }),
+			WithOnStateChange(func(_ string, _, to ServiceStatus) {
+				if to == StatusCrashed {
+					crashTransitions.Add(1)
+				}
+			}),
+		)
 		_ = o.Register(&namedSvc{}, WithName("a"))
 		_ = o.Register(&namedSvc{}, WithName("b"), DependsOn("a"))
 		_ = o.Register(&crashSignalSvc{sig: make(chan struct{})}, WithName("c"),
@@ -192,6 +205,16 @@ func FuzzMembershipTransitions(f *testing.F) {
 		case <-o.Done():
 		case <-time.After(2 * time.Second):
 			t.Fatal("goroutines did not wind down after Stop")
+		}
+
+		// Reconcile the crash surfaces: a crash is counted exactly once, and
+		// never observed on one surface without the other.
+		crashes := o.Metrics().Crashes
+		if onCrash.Load() != crashes {
+			t.Fatalf("OnCrash calls = %d, Crashes = %d: crash observability diverged", onCrash.Load(), crashes)
+		}
+		if crashTransitions.Load() > crashes {
+			t.Fatalf("Crashed transitions = %d, Crashes = %d: a transition was reported without a crash count", crashTransitions.Load(), crashes)
 		}
 	})
 }

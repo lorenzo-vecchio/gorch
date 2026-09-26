@@ -48,6 +48,10 @@
 //   - A stop that times out is reported honestly: the entry stays
 //     StatusStopping rather than StatusStopped, and the incomplete stop is not
 //     counted in Metrics().Stops.
+//   - A self-heal crash is observable before the restart: the entry transitions
+//     StatusRunning to StatusCrashed (firing OnCrash and incrementing
+//     Metrics().Crashes) and is returned to StatusRunning once the new instance
+//     is live.
 //
 // See the README for the concurrency table and the per-method guarantees.
 package gorch

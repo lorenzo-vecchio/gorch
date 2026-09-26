@@ -389,6 +389,8 @@ orch.Register(svc, gorch.WithOnBeforeStart(func(name string) error {
 
 Self-heal restarts crashed services with backoff, retry limits, and a stability window.
 
+A crash is observable before the restart: the entry transitions `Running -> Crashed`, `OnCrash` fires with the real exit error, and `Metrics().Crashes` increments. The restart then re-establishes `Running` once the new instance is live, so `Status`/`Statuses` never advertise a self-healed service as dead.
+
 ```go
 orch.Register(svc,
     gorch.WithSelfHeal(func() gorch.Service { return &MyService{} }),
