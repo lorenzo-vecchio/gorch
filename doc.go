@@ -33,6 +33,12 @@
 //     and remove services while it runs. Only the whole-orchestrator lifecycle
 //     is single-shot: after a successful Stop the orchestrator cannot be
 //     restarted.
+//   - Done is a shutdown-completed signal: its channel closes once Stop (or
+//     Run, which calls Stop) has returned, and not before. It is not a "every
+//     goroutine has exited" guarantee — a timed-out Stop still closes it while
+//     an abandoned teardown goroutine may run — so it stays open before Stop,
+//     including after a failed Start and across a successful retry. A no-op
+//     Stop on a never-started orchestrator closes it.
 //   - StartService is idempotent on a Running persistent/cron service (a no-op)
 //     and never restarts a live instance: replacing one is the explicit
 //     StopService + StartService. Its start decision and reservation are claimed
@@ -57,9 +63,10 @@
 //   - A teardown goroutine abandoned because a deadline won — a before-stop
 //     hook or Stop() that did not return in time, or a failed-Start wait that
 //     outlived its rollback budget — is logged at Error level naming the
-//     service and counted in the monotonic Metrics().AbandonedGoroutines. The
-//     goroutine is not registered with Done(), so the counter is the only
-//     visibility into a leak user code can cause by ignoring the contract.
+//     service and counted in the monotonic Metrics().AbandonedGoroutines.
+//     Done() closes as soon as Stop returns even while such a goroutine still
+//     runs, so the counter is the only visibility into a leak user code can
+//     cause by ignoring the contract.
 //   - Messenger subscriptions are scoped to the instance or cron tick that
 //     created them, and their owner is released on every exit path. Teardown
 //     drains every live owner id of an entry, so an owner whose goroutine is
