@@ -167,6 +167,7 @@ Sentinel errors returned by the orchestrator:
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
 | `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is not `StatusRunning`. |
 | `ErrDependencyRemoving` | `Register` | A hot-added service names a hard dependency that is being torn down (being stopped/removed concurrently); retry after the teardown completes. |
+| `ErrDependencyDepthExceeded` | `Register` | A dependency walk needed to check for a cycle ran deeper than the 10 000-edge limit. The registered graph is a bounded, startup-sized acyclic graph; reaching this depth means an unbounded registration/reload loop has grown it. The walk stops with this sentinel instead of overflowing the goroutine stack (a fatal error). Free or prune the graph and retry. |
 | `ErrOrchestratorStopping` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` is in progress. |
 | `ErrOrchestratorStopped` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` has completed. |
 

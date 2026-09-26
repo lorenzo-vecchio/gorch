@@ -123,3 +123,26 @@ func BenchmarkNamesChurn(b *testing.B) {
 		_ = o.Names()
 	}
 }
+
+// BenchmarkRegister_ReloadChurn measures Register on a live graph under
+// register/unregister churn — the shape a supervisor reload loop produces. Each
+// churn registration names the top of a pre-built 500-entry chain, so it pays a
+// dependency walk over that chain; with the visited set the walk is O(V+E).
+func BenchmarkRegister_ReloadChurn(b *testing.B) {
+	o := New(WithHealthChecksDisabled())
+	top := insertDepChain(o, 500)
+	if err := o.Start(); err != nil {
+		b.Fatal(err)
+	}
+	defer o.Stop(5 * time.Second)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		name := fmt.Sprintf("churn-%d", i)
+		if err := o.Register(&namedSvc{}, WithName(name), DependsOn(top)); err != nil {
+			b.Fatal(err)
+		}
+		if err := o.Unregister(name, time.Second); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
