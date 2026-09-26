@@ -5250,6 +5250,167 @@ func TestRegister_StaticValidator(t *testing.T) {
 	})
 }
 
+// countingRegisterOption returns a RegisterOption that increments calls each
+// time it is applied. It is non-idempotent on purpose: Register must apply it
+// exactly once.
+func countingRegisterOption(calls *atomic.Int32) RegisterOption {
+	return func(*registerConfig) { calls.Add(1) }
+}
+
+// TestRegister_OptionsAppliedExactlyOnce pins that RegisterOption closures run
+// once per Register call, on the static and hot-add paths alike and whether or
+// not the service implements Validator.
+func TestRegister_OptionsAppliedExactlyOnce(t *testing.T) {
+	t.Run("plain static", func(t *testing.T) {
+		var calls atomic.Int32
+		o := New()
+		if err := o.Register(&namedSvc{}, countingRegisterOption(&calls), WithName("plain")); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("option applied %d times, want 1", got)
+		}
+	})
+
+	t.Run("validator static", func(t *testing.T) {
+		var calls atomic.Int32
+		o := New()
+		if err := o.Register(&validSvc{}, countingRegisterOption(&calls), WithName("valid")); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("option applied %d times, want 1", got)
+		}
+	})
+
+	t.Run("plain dynamic", func(t *testing.T) {
+		var calls atomic.Int32
+		o := New()
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+		if err := o.Register(&namedSvc{}, countingRegisterOption(&calls), WithName("plain")); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("option applied %d times, want 1", got)
+		}
+	})
+
+	t.Run("validator dynamic", func(t *testing.T) {
+		var calls atomic.Int32
+		o := New()
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+		if err := o.Register(&validSvc{}, countingRegisterOption(&calls), WithName("valid")); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("option applied %d times, want 1", got)
+		}
+	})
+}
+
+// sameRegisterConfig reports whether two configs built from the same options
+// are equivalent. factory holds a function value, which reflect.DeepEqual never
+// compares equal, so it is checked for presence and then cleared.
+func sameRegisterConfig(a, b registerConfig) bool {
+	if (a.factory == nil) != (b.factory == nil) {
+		return false
+	}
+	a.factory, b.factory = nil, nil
+	return reflect.DeepEqual(a, b)
+}
+
+// TestRegister_ValidatorPath_And_PlainPath_ProduceSameConfig pins that the same
+// options yield the same registerConfig and entry whether the service
+// implements Validator or not, across static option sets.
+func TestRegister_ValidatorPath_And_PlainPath_ProduceSameConfig(t *testing.T) {
+	optionSets := []struct {
+		name string
+		opts func() []RegisterOption
+	}{
+		{"name only", func() []RegisterOption {
+			return []RegisterOption{WithName("target")}
+		}},
+		{"hard dependency", func() []RegisterOption {
+			return []RegisterOption{WithName("target"), DependsOn("dep")}
+		}},
+		{"soft dependency", func() []RegisterOption {
+			return []RegisterOption{WithName("target"), DependsOnSoft("ghost")}
+		}},
+		{"group", func() []RegisterOption {
+			return []RegisterOption{WithName("target"), WithGroup("g")}
+		}},
+		{"cron", func() []RegisterOption {
+			return []RegisterOption{WithName("target"), WithCron("* * * * * *", CronParallel)}
+		}},
+		{"run once", func() []RegisterOption {
+			return []RegisterOption{WithName("target"), WithRunOnce()}
+		}},
+		{"self heal", func() []RegisterOption {
+			return []RegisterOption{WithName("target"), WithSelfHeal(func() Service { return &namedSvc{} })}
+		}},
+	}
+
+	for _, tc := range optionSets {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts()
+
+			po := New()
+			if err := po.Register(&namedSvc{name: "dep"}, WithName("dep")); err != nil {
+				t.Fatal(err)
+			}
+			if err := po.Register(&namedSvc{}, opts...); err != nil {
+				t.Fatalf("plain Register: %v", err)
+			}
+			po.mu.Lock()
+			plainEntry := po.nameIndex["target"]
+			plainCfg, plainStatus := plainEntry.cfg, plainEntry.status
+			po.mu.Unlock()
+
+			vo := New()
+			if err := vo.Register(&namedSvc{name: "dep"}, WithName("dep")); err != nil {
+				t.Fatal(err)
+			}
+			if err := vo.Register(&validSvc{}, opts...); err != nil {
+				t.Fatalf("validator Register: %v", err)
+			}
+			vo.mu.Lock()
+			validEntry := vo.nameIndex["target"]
+			validCfg, validStatus := validEntry.cfg, validEntry.status
+			vo.mu.Unlock()
+
+			if plainEntry.name != validEntry.name {
+				t.Errorf("entry names differ: plain %q, validator %q", plainEntry.name, validEntry.name)
+			}
+			if plainStatus != validStatus {
+				t.Errorf("statuses differ: plain %v, validator %v", plainStatus, validStatus)
+			}
+			if !sameRegisterConfig(plainCfg, validCfg) {
+				t.Errorf("configs differ:\nplain:     %+v\nvalidator: %+v", plainCfg, validCfg)
+			}
+		})
+	}
+}
+
+// TestRegister_OptionAppliedBeforeValidation pins that the name set by a
+// RegisterOption is visible in the Validator failure message: the option runs
+// once, before Validate.
+func TestRegister_OptionAppliedBeforeValidation(t *testing.T) {
+	o := New()
+	err := o.Register(&validSvc{validateErr: errors.New("rejected")}, WithName("boom"))
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("validation error %q does not contain the option-set name %q", err, "boom")
+	}
+}
+
 // ── BeforeHealthCheck / AfterHealthCheck ──
 func TestHealthCheckHooks(t *testing.T) {
 	o := New(

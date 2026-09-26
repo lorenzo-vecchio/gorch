@@ -518,22 +518,32 @@ func New(opts ...Option) *Orchestrator {
 // being removed (stopped/removed concurrently): a retryable "not now"
 // condition, distinct from ErrHasDependents.
 // Returns ErrNilService if svc is nil.
+//
+// The caller's RegisterOption closures are applied exactly once, outside the
+// orchestrator lock, before any structural validation. A non-idempotent option
+// therefore runs once whether or not svc implements Validator.
 // Thread-safe.
 func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	if svc == nil {
 		return fmt.Errorf("%w: Register called with a nil Service", ErrNilService)
 	}
+	// Apply caller options exactly once, before taking any lock. RegisterOption
+	// is an arbitrary user closure over mutable state, so it must run once and
+	// under no orchestrator lock. The graph-dependent validation happens later
+	// in validateRegisterConfigLocked.
+	cfg := applyRegisterOptions(opts)
+
 	o.mu.Lock()
 	if o.started {
 		o.mu.Unlock()
-		return o.registerDynamic(svc, opts)
+		return o.registerDynamicCfg(svc, cfg)
 	}
 
 	// Static registration is pre-Start. Validate is user code: it must never run
 	// under o.mu (a blocking or reentrant Validator would deadlock), matching the
 	// dynamic path. The common no-validator case stays entirely under the lock.
 	if _, ok := svc.(Validator); !ok {
-		cfg, err := o.parseRegisterOptions(opts)
+		cfg, err := o.validateRegisterConfigLocked(cfg)
 		if err != nil {
 			o.mu.Unlock()
 			return err
@@ -542,17 +552,10 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 		o.mu.Unlock()
 		return nil
 	}
-
-	// Resolve the requested name for the validation error without touching the
-	// graph, then run Validate outside the lock.
-	var pre registerConfig
-	for _, opt := range opts {
-		opt(&pre)
-	}
 	o.mu.Unlock()
 
 	if err := callErr(svc.(Validator).Validate); err != nil {
-		return fmt.Errorf("gorch: service %s validation failed: %w", pre.name, err)
+		return fmt.Errorf("gorch: service %s validation failed: %w", cfg.name, err)
 	}
 
 	o.mu.Lock()
@@ -561,13 +564,13 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 	// hot add, appended as StatusRegistered (never auto-started). Validation has
 	// already run, so it is not repeated.
 	if o.started {
-		cfg, err := o.parseRegisterOptions(opts)
+		cfg, err := o.validateRegisterConfigLocked(cfg)
 		if err != nil {
 			return err
 		}
 		return o.commitDynamicLocked(svc, cfg)
 	}
-	cfg, err := o.parseRegisterOptions(opts)
+	cfg, err := o.validateRegisterConfigLocked(cfg)
 	if err != nil {
 		return err
 	}
@@ -576,26 +579,35 @@ func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
 }
 
 // appendStaticEntryLocked adds a pre-Start entry to the registry. The caller
-// must hold o.mu and have parsed cfg via parseRegisterOptions.
+// must hold o.mu and have validated cfg via validateRegisterConfigLocked.
 func (o *Orchestrator) appendStaticEntryLocked(svc Service, cfg registerConfig) {
 	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
 	o.entries = append(o.entries, entry)
 	o.nameIndex[cfg.name] = entry
 }
 
-// parseRegisterOptions applies opts and performs the structural validation that
-// does not call user code: the self-heal combination check, auto-naming,
-// duplicate-name detection, hard-dependency existence and cycle detection, and
-// soft-dependency cycle detection. The caller must hold o.mu, because the graph
-// is inspected via lookupEntry/dependsOnRecursive. A missing hard dependency is
-// reported with ErrDependencyNotFound on both the static and the dynamic path,
-// so callers can classify it with errors.Is regardless of when they register.
-func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption) (registerConfig, error) {
+// applyRegisterOptions applies opts to a fresh registerConfig in order, exactly
+// once. It is deliberately lock-free and graph-free: RegisterOption is an
+// arbitrary user closure over mutable state, so it must not run more than once
+// nor under o.mu. The structural validation that needs the graph runs later in
+// validateRegisterConfigLocked.
+func applyRegisterOptions(opts []RegisterOption) registerConfig {
 	cfg := registerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	return cfg
+}
 
+// validateRegisterConfigLocked performs the structural validation of an
+// already-applied registerConfig: the self-heal combination check, auto-naming,
+// duplicate-name detection, hard-dependency existence and cycle detection, and
+// soft-dependency cycle detection. It does not call user code. The caller must
+// hold o.mu, because the graph is inspected via lookupEntry/dependsOnRecursive.
+// A missing hard dependency is reported with ErrDependencyNotFound on both the
+// static and the dynamic path, so callers can classify it with errors.Is
+// regardless of when they register.
+func (o *Orchestrator) validateRegisterConfigLocked(cfg registerConfig) (registerConfig, error) {
 	// Self-heal is only wired into the persistent-service path. A cron tick and a
 	// runOnce gate never consume the factory, so reject the combination instead
 	// of silently ignoring it.
@@ -650,20 +662,21 @@ func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption) (registerConf
 	return cfg, nil
 }
 
-// registerDynamic adds a service to a running orchestrator. The entry is
-// appended as StatusRegistered and is never auto-started (D1); persistent and
-// runOnce services wait for StartService. A cron entry is added to the live
-// scheduler immediately (so the schedule is live) but still reports
-// StatusRegistered until StartService marks it running. Validate runs without
-// the orchestrator lock held, so user code can never deadlock against a
-// membership op (the structural graph checks above it run under the lock).
-func (o *Orchestrator) registerDynamic(svc Service, opts []RegisterOption) error {
+// registerDynamicCfg adds a service to a running orchestrator using an
+// already-applied cfg. The entry is appended as StatusRegistered and is never
+// auto-started (D1); persistent and runOnce services wait for StartService. A
+// cron entry is added to the live scheduler immediately (so the schedule is
+// live) but still reports StatusRegistered until StartService marks it running.
+// Validate runs without the orchestrator lock held, so user code can never
+// deadlock against a membership op (the structural graph checks above it run
+// under the lock).
+func (o *Orchestrator) registerDynamicCfg(svc Service, cfg registerConfig) error {
 	o.mu.Lock()
 	if err := o.membershipGateLocked(); err != nil {
 		o.mu.Unlock()
 		return err
 	}
-	cfg, err := o.parseRegisterOptions(opts)
+	cfg, err := o.validateRegisterConfigLocked(cfg)
 	if err != nil {
 		o.mu.Unlock()
 		return err

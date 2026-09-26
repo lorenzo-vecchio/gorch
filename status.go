@@ -353,7 +353,7 @@ func (o *Orchestrator) topoSort(entries []*serviceEntry) ([][]*serviceEntry, err
 	// (e.g. Start skips cron/runOnce gates, StopGroup selects one group), and a
 	// dependency outside the subset is never visited, so counting it would leave
 	// a dangling in-degree and report a phantom ErrDependencyCycle. Hard-dep
-	// existence is already enforced by parseRegisterOptions, so ignoring the
+	// existence is already enforced by validateRegisterConfigLocked, so ignoring the
 	// out-of-subset edge cannot mask a real config error.
 	for _, e := range entries {
 		name := e.name
