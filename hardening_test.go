@@ -870,7 +870,7 @@ func onlyNames(order []string, names ...string) []string {
 // TestFailedStart_RollbackOrderIsReverseTopological pins that the failed-Start
 // rollback unwinds in reverse topological order, not reverse registration
 // order. The graph registers the dependent before its dependency — via a soft
-// dependency, since parseRegisterOptions rejects a hard dependency that is not
+// dependency, since validateRegisterConfigLocked rejects a hard dependency that is not
 // yet registered — so registration order is a, b, c while topological order is
 // b, a, c. c (hard-dependent on a) fails to start, so the rollback must stop a
 // before b; reverse registration would stop b first.
