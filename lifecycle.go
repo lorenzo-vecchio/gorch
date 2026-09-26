@@ -336,6 +336,11 @@ func (o *Orchestrator) runStopSequence(entry *serviceEntry, hookDeadline time.Ti
 // reported complete. The caller commits the terminal status with finishStop once
 // it has also verified the instance exited, so a timed-out stop never claims
 // StatusStopped for a service that may still be alive.
+//
+// When the caller deadline wins, the sequence goroutine is abandoned, logged at
+// Error level and counted in Metrics().AbandonedGoroutines. An inner hook or
+// Stop() abandoned earlier in the same sequence is counted separately, once per
+// genuinely-abandoned goroutine.
 func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time.Time) (wasActive, completed bool, stopErr error) {
 	o.statusMu.RLock()
 	wasActive = entry.status == StatusRunning || entry.status == StatusStarting
@@ -370,6 +375,7 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 		case r := <-done:
 			stopErr, completed = r.err, r.completed
 		case <-timer.C:
+			o.recordAbandoned(entry, "abandoning stop sequence: it did not return before the deadline")
 			stopErr = fmt.Errorf("stop timeout after %v: %w", remaining, ErrStopTimeout)
 			completed = false
 		}
@@ -397,6 +403,11 @@ func (o *Orchestrator) finishStop(entry *serviceEntry, wasActive bool) {
 // working). A panic in the hook becomes an error, never an unwind. Running the
 // hook in its own goroutine is what lets the caller proceed to Stop() after an
 // overrun instead of abandoning the service mid-teardown.
+//
+// The trade-off is explicit: a hook that ignores the deadline is abandoned in
+// its goroutine, logged at Error level and counted in
+// Metrics().AbandonedGoroutines. The library cannot force user code to return,
+// so the leak is made visible rather than prevented.
 func (o *Orchestrator) callBeforeStopHook(entry *serviceEntry, deadline time.Time) error {
 	hook := stopHook(entry, o)
 	if hook == nil {
@@ -413,7 +424,23 @@ func (o *Orchestrator) callBeforeStopHook(entry *serviceEntry, deadline time.Tim
 	case err := <-done:
 		return err
 	case <-timer.C:
+		o.recordAbandoned(entry, "abandoning before-stop hook: it did not return before the deadline")
 		return fmt.Errorf("%w: before-stop hook did not return before the deadline: %w", ErrHookTimeout, ErrStopTimeout)
+	}
+}
+
+// recordAbandoned notes that a teardown goroutine was abandoned because its
+// deadline won: it increments the monotonic Metrics().AbandonedGoroutines
+// counter (never decremented, because there is no reliable signal that the
+// goroutine later returned) and logs an Error against entry when one is known,
+// so the leak is attributable to a named service. The counter is the only
+// visibility into a goroutine that is otherwise invisible to Done() and -race.
+func (o *Orchestrator) recordAbandoned(entry *serviceEntry, msg string) {
+	o.metricsAbandoned.Add(1)
+	if entry != nil {
+		if lg := entry.getLogger(); lg != nil {
+			lg.Error(msg)
+		}
 	}
 }
 
@@ -422,6 +449,10 @@ func (o *Orchestrator) callBeforeStopHook(entry *serviceEntry, deadline time.Tim
 // set) bounds it from the outside. It reports whether Stop() actually returned:
 // on the per-service cap it does not, so the teardown is unverified and the
 // entry must not be reported StatusStopped.
+//
+// A Stop() that runs past the cap is abandoned in its goroutine, logged at
+// Error level and counted in Metrics().AbandonedGoroutines, like an overrunning
+// hook.
 func (o *Orchestrator) stopServiceBounded(entry *serviceEntry) (error, bool) {
 	timeout := entry.cfg.stopTimeout
 	if timeout <= 0 {
@@ -433,6 +464,7 @@ func (o *Orchestrator) stopServiceBounded(entry *serviceEntry) (error, bool) {
 	case err := <-done:
 		return err, true
 	case <-time.After(timeout):
+		o.recordAbandoned(entry, "abandoning Stop: it did not return before the per-service timeout")
 		return fmt.Errorf("stop timeout after %v", timeout), false
 	}
 }

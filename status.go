@@ -14,6 +14,13 @@ type Metrics struct {
 	Crashes     int64
 	Restarts    int64
 	HealthFails int64
+	// AbandonedGoroutines counts teardown goroutines abandoned because a
+	// deadline won: a before-stop hook or Stop() that did not return within its
+	// budget, or a failed-Start wait that outlived its rollback budget. A
+	// non-zero value means user code may be leaked for the process lifetime. The
+	// counter is monotonic — it is never decremented if the abandoned goroutine
+	// later returns.
+	AbandonedGoroutines int64
 }
 
 // Status returns the current lifecycle status of a named service.
@@ -299,11 +306,12 @@ func (o *Orchestrator) WaitFor(name string, target ServiceStatus, timeout time.D
 // Metrics returns a snapshot of orchestrator-level event counters.
 func (o *Orchestrator) Metrics() Metrics {
 	return Metrics{
-		Starts:      o.metricsStarts.Load(),
-		Stops:       o.metricsStops.Load(),
-		Crashes:     o.metricsCrashes.Load(),
-		Restarts:    o.metricsRestarts.Load(),
-		HealthFails: o.metricsHealthFails.Load(),
+		Starts:              o.metricsStarts.Load(),
+		Stops:               o.metricsStops.Load(),
+		Crashes:             o.metricsCrashes.Load(),
+		Restarts:            o.metricsRestarts.Load(),
+		HealthFails:         o.metricsHealthFails.Load(),
+		AbandonedGoroutines: o.metricsAbandoned.Load(),
 	}
 }
 

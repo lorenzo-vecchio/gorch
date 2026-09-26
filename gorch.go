@@ -441,6 +441,10 @@ type Orchestrator struct {
 	metricsCrashes     atomic.Int64
 	metricsRestarts    atomic.Int64
 	metricsHealthFails atomic.Int64
+	// metricsAbandoned counts teardown goroutines walked away from because a
+	// deadline won. It is monotonic: there is no signal that an abandoned
+	// goroutine later returned, so it is never decremented.
+	metricsAbandoned atomic.Int64
 }
 
 // New creates a new Orchestrator. Each call returns a fresh, independent instance.
@@ -1021,6 +1025,12 @@ func (o *Orchestrator) failedStartDeadline() time.Time {
 // is therefore best-effort: a goroutine that ignores cancellation and outlives
 // the failed Start may keep running, but the orchestrator is left restartable so
 // Start can be retried.
+//
+// Each wait that outlives the deadline abandons a goroutine (the wait's helper
+// for the instance group, the log-pump for the log wait); each is logged at
+// Error level and counted once in Metrics().AbandonedGoroutines. The log is
+// attributed to the first snapshotted entry — the wait is orchestrator-wide, so
+// there is no single service to name.
 func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline time.Time) error {
 	var resetErr error
 
@@ -1028,17 +1038,23 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline 
 	// orchestrator-wide, not just the Start snapshot: a StartService that ran
 	// during the failing Start also fed o.wg, so one instance ignoring
 	// cancellation must not hang the reset.
+	var reporter *serviceEntry
+	if len(entries) > 0 {
+		reporter = entries[0]
+	}
 	wgDone := make(chan struct{})
 	go func() {
 		o.wg.Wait()
 		close(wgDone)
 	}()
 	if !o.awaitDone(wgDone, deadline) {
+		o.recordAbandoned(reporter, "abandoning failed-Start wait: instance goroutines did not exit before the deadline")
 		resetErr = errors.Join(resetErr, ErrStopTimeout)
 	}
 	// logPumpDone is nil when a custom Logger is set; awaitDone treats that as
 	// already done.
 	if !o.awaitDone(o.logPumpDone, deadline) {
+		o.recordAbandoned(reporter, "abandoning failed-Start wait: log-pump did not exit before the deadline")
 		resetErr = errors.Join(resetErr, ErrStopTimeout)
 	}
 
