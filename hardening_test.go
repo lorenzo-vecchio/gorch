@@ -721,3 +721,273 @@ func TestHookTimeout_DoesNotStarveServiceStop(t *testing.T) {
 		t.Errorf("StopService took %v; the hook sub-budget did not bound it", elapsed)
 	}
 }
+
+// TestFailedStart_RollbackIsBounded pins that the failed-Start rollback is
+// bounded: a service already running when a later level fails whose Stop()
+// blocks forever must not hang Start. Start returns within a generous bound and
+// the error matches ErrStopTimeout.
+func TestFailedStart_RollbackIsBounded(t *testing.T) {
+	o := New(WithHealthChecksDisabled(), WithFailedStartTimeout(300*time.Millisecond))
+
+	stopEntered := make(chan struct{})
+	stopRelease := make(chan struct{})
+	startRelease := make(chan struct{})
+	t.Cleanup(func() {
+		close(stopRelease)
+		close(startRelease)
+	})
+
+	a := &testSvc{
+		// Ignore cancellation: the instance outlives the rollback on purpose.
+		startFn: func(context.Context) error { <-startRelease; return errors.New("a exited") },
+		stopFn: func() error {
+			close(stopEntered)
+			<-stopRelease
+			return nil
+		},
+	}
+	if err := o.Register(a, WithName("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&testSvc{}, WithName("b"), DependsOn("a"),
+		WithOnBeforeStart(func(string) error { return errors.New("b cannot start") })); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- o.Start() }()
+
+	// Prove the rollback actually reached the blocking Stop() before bounding
+	// Start, so the assertion is not merely about the earlier failure.
+	select {
+	case <-stopEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback never reached the blocking Stop()")
+	}
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start hung instead of returning a bounded rollback error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Start took %v, want a bounded rollback", elapsed)
+	}
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("Start error = %v, want ErrStopTimeout from the bounded rollback", err)
+	}
+}
+
+// TestFailedStart_RollbackHooksBounded pins that an overrunning before-stop hook
+// during the failed-Start rollback is bounded too: Start returns within the
+// budget and the error matches both ErrHookTimeout and ErrStopTimeout.
+func TestFailedStart_RollbackHooksBounded(t *testing.T) {
+	o := New(WithHealthChecksDisabled(), WithFailedStartTimeout(300*time.Millisecond))
+
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
+	t.Cleanup(func() { close(hookRelease) })
+
+	a := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(a, WithName("a"), WithOnBeforeStop(func(string) error {
+		close(hookEntered)
+		<-hookRelease
+		return nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&testSvc{}, WithName("b"), DependsOn("a"),
+		WithOnBeforeStart(func(string) error { return errors.New("b cannot start") })); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- o.Start() }()
+
+	select {
+	case <-hookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback never ran the blocking before-stop hook")
+	}
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start hung instead of bounding the overrunning hook")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Start took %v, want a bounded rollback", elapsed)
+	}
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("Start error = %v, want ErrStopTimeout", err)
+	}
+	if !errors.Is(err, ErrHookTimeout) {
+		t.Fatalf("Start error = %v, want ErrHookTimeout for the overrunning hook", err)
+	}
+}
+
+// TestFailedStart_ThenRetry_Succeeds pins that an ordinary failed Start with a
+// non-blocking rollback leaves the orchestrator genuinely reusable.
+func TestFailedStart_ThenRetry_Succeeds(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	failing := true
+	hook := func(string) error {
+		if failing {
+			return errors.New("gate closed")
+		}
+		return nil
+	}
+	if err := o.Register(&testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+		WithName("a"), WithOnBeforeStart(hook)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+		WithName("b"), DependsOn("a")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.Start(); err == nil {
+		_ = o.Stop(time.Second)
+		t.Fatal("first Start must fail")
+	}
+	failing = false
+	if err := o.Start(); err != nil {
+		t.Fatalf("retry Start: %v", err)
+	}
+	defer func() { _ = o.Stop(time.Second) }()
+	waitForStatus(t, o, "a", StatusRunning)
+	waitForStatus(t, o, "b", StatusRunning)
+}
+
+// TestFailedStart_ConcurrentHotAdd_DoesNotHangReset pins that a service
+// hot-added and started through StartService while a Start is failing — and so
+// feeding the orchestrator-wide wait group — does not block the reset, and that
+// the orchestrator is still reusable afterwards.
+func TestFailedStart_ConcurrentHotAdd_DoesNotHangReset(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+
+	bHookEntered := make(chan struct{})
+	hotAddDone := make(chan struct{})
+	var hookOnce sync.Once
+	failFirst := true
+
+	a := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(a, WithName("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&testSvc{}, WithName("b"), DependsOn("a"),
+		WithOnBeforeStart(func(string) error {
+			if !failFirst {
+				return nil
+			}
+			hookOnce.Do(func() { close(bHookEntered) })
+			<-hotAddDone
+			return errors.New("b cannot start")
+		})); err != nil {
+		t.Fatal(err)
+	}
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- o.Start() }()
+
+	// Wait until b's hook is holding the failing Start, then hot-add and start a
+	// service that contributes to o.wg before the failure cleanup runs.
+	select {
+	case <-bHookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("b's before-start hook never ran")
+	}
+	hot := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(hot, WithName("hot")); err != nil {
+		t.Fatalf("hot Register: %v", err)
+	}
+	if err := o.StartService("hot"); err != nil {
+		t.Fatalf("hot StartService: %v", err)
+	}
+	close(hotAddDone)
+
+	select {
+	case err := <-startDone:
+		if err == nil {
+			t.Fatal("first Start must fail")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start hung after a concurrent hot add")
+	}
+
+	// The hot service honoured cancellation and has wound down; drop it and
+	// retry to prove the orchestrator was left reusable.
+	if err := o.Unregister("hot", time.Second); err != nil {
+		t.Fatalf("Unregister hot: %v", err)
+	}
+	failFirst = false
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- o.Start() }()
+	select {
+	case err := <-restartDone:
+		if err != nil {
+			t.Fatalf("retry Start: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry Start hung")
+	}
+	defer func() { _ = o.Stop(time.Second) }()
+	waitForStatus(t, o, "a", StatusRunning)
+}
+
+// TestFailedStartTimeout_DefaultAndOverride pins the configurable rollback
+// budget: New defaults it to 30s, WithFailedStartTimeout overrides it, and a
+// negative value removes the bound (a zero deadline).
+func TestFailedStartTimeout_DefaultAndOverride(t *testing.T) {
+	t.Run("default is 30s", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if got := o.cfg.failedStartTimeout; got != 30*time.Second {
+			t.Fatalf("failedStartTimeout = %v, want 30s", got)
+		}
+		if o.failedStartDeadline().IsZero() {
+			t.Fatal("default failed-start deadline must be set")
+		}
+	})
+	t.Run("override", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled(), WithFailedStartTimeout(2*time.Second))
+		if got := o.cfg.failedStartTimeout; got != 2*time.Second {
+			t.Fatalf("failedStartTimeout = %v, want 2s", got)
+		}
+		if o.failedStartDeadline().IsZero() {
+			t.Fatal("overridden failed-start deadline must be set")
+		}
+	})
+	t.Run("negative disables the bound", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled(), WithFailedStartTimeout(-1))
+		if !o.failedStartDeadline().IsZero() {
+			t.Fatal("a negative failed-start timeout must produce no deadline")
+		}
+	})
+}
+
+// TestResetAfterStartFailure_BoundsWaits pins that both waits in the reset are
+// bounded by the deadline and surface ErrStopTimeout: the instance wait group
+// and the nil-safe log-pump wait. It is a white-box check of the timeout
+// branches, which an integration test cannot reach deterministically.
+func TestResetAfterStartFailure_BoundsWaits(t *testing.T) {
+	t.Run("instance wait", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		o.wg.Add(1) // an instance that never exits
+		err := o.resetAfterStartFailure(nil, time.Now().Add(100*time.Millisecond))
+		if !errors.Is(err, ErrStopTimeout) {
+			t.Fatalf("reset with a live instance = %v, want ErrStopTimeout", err)
+		}
+	})
+	t.Run("log pump wait", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		o.logPumpDone = make(chan struct{}) // never closed
+		err := o.resetAfterStartFailure(nil, time.Now().Add(100*time.Millisecond))
+		if !errors.Is(err, ErrStopTimeout) {
+			t.Fatalf("reset with a stuck log-pump = %v, want ErrStopTimeout", err)
+		}
+	})
+}
