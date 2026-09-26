@@ -42,7 +42,7 @@ Requires Go 1.25+.
 - **State-change hooks** — `OnStateChange` + `OnCrash` callbacks for external observability without polling.
 - **WaitFor** — Block until a service reaches a target status.
 - **TypedRequest** — Typed request-reply without losing type safety: `TypedRequest[TReq, TResp](messenger, ctx, req, topic)`.
-- **Metrics** — atomic int64 counters (`Starts`, `Stops`, `Crashes`, `Restarts`, `HealthFails`), exposed via `Metrics()` snapshot.
+- **Metrics** — atomic int64 counters (`Starts`, `Stops`, `Crashes`, `Restarts`, `HealthFails`, `AbandonedGoroutines`), exposed via `Metrics()` snapshot.
 - **Validator interface** — `Validate() error` called at `Register` for early config checks.
 - **WithStartCondition** — Skip a service at runtime via a `func() bool`.
 - **Per-service stop timeout** — `WithStopTimeout` controls how long to wait for `Stop()`.
@@ -303,6 +303,16 @@ budget — a hook overran, `Stop()` was capped away, or the instance had not yet
 exited — leaves the entry `StatusStopping` rather than `StatusStopped`, and is
 not counted in `Metrics().Stops`; `StatusStopped` is committed only once the
 teardown is verified complete.
+
+Bounding a stop means walking away from user code that will not return. A
+before-stop hook or a `Stop()` that outlives its budget is abandoned in its
+goroutine, logged at `Error` level naming the service, and counted in
+`Metrics().AbandonedGoroutines`; the same applies to each wait a failed `Start`
+abandons when its rollback budget expires. The goroutine is not registered with
+`Done()`, so the counter is the only visibility into it. The library cannot
+force user code to return — the contract is that a hook returns and `Stop()`
+does not block past `WithStopTimeout` — so a non-zero counter means user code
+may be leaked for the process lifetime.
 
 A membership operation can be blocked by an in-flight reservation on the target,
 and the sentinel tells the caller which situation it is in. A genuine
@@ -679,12 +689,12 @@ No manual gob encoding is required anywhere in user code.
 
 ### Metrics
 
-`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency. Each stop of an instance is counted exactly once, even when a teardown and the instance's own exit race. `Stops` counts only stops that completed; a stop that timed out (`ErrStopTimeout`/`ErrHookTimeout`, or a `WithStopTimeout` cap that fired) is not counted, matching its unverified `StatusStopping`.
+`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency. Each stop of an instance is counted exactly once, even when a teardown and the instance's own exit race. `Stops` counts only stops that completed; a stop that timed out (`ErrStopTimeout`/`ErrHookTimeout`, or a `WithStopTimeout` cap that fired) is not counted, matching its unverified `StatusStopping`. `AbandonedGoroutines` counts teardown goroutines abandoned because a deadline won: a blocking hook or `Stop()`, or a failed-`Start` wait that outlived its rollback budget. It is monotonic — never decremented, since there is no reliable signal that an abandoned goroutine later returned — so a non-zero value means user code may be leaked for the process lifetime.
 
 ```go
 stats := orch.Metrics()
-fmt.Printf("starts=%d stops=%d crashes=%d restarts=%d healthFails=%d\n",
-    stats.Starts, stats.Stops, stats.Crashes, stats.Restarts, stats.HealthFails)
+fmt.Printf("starts=%d stops=%d crashes=%d restarts=%d healthFails=%d abandonedGoroutines=%d\n",
+    stats.Starts, stats.Stops, stats.Crashes, stats.Restarts, stats.HealthFails, stats.AbandonedGoroutines)
 ```
 
 ### Validator

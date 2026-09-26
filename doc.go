@@ -48,6 +48,12 @@
 //   - A stop that times out is reported honestly: the entry stays
 //     StatusStopping rather than StatusStopped, and the incomplete stop is not
 //     counted in Metrics().Stops.
+//   - A teardown goroutine abandoned because a deadline won — a before-stop
+//     hook or Stop() that did not return in time, or a failed-Start wait that
+//     outlived its rollback budget — is logged at Error level naming the
+//     service and counted in the monotonic Metrics().AbandonedGoroutines. The
+//     goroutine is not registered with Done(), so the counter is the only
+//     visibility into a leak user code can cause by ignoring the contract.
 //   - A self-heal crash is observable before the restart: the entry transitions
 //     StatusRunning to StatusCrashed (firing OnCrash and incrementing
 //     Metrics().Crashes) and is returned to StatusRunning once the new instance

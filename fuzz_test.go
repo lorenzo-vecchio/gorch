@@ -1,6 +1,7 @@
 package gorch
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -115,12 +116,28 @@ func FuzzMembershipTransitions(f *testing.F) {
 			}
 		}
 
+		// runOp drives one operation and asserts the abandoned-goroutine counter
+		// did not move when the operation completed without an overrun. A leaked
+		// teardown goroutine must only ever follow ErrStopTimeout/ErrHookTimeout,
+		// never the happy path; a non-timeout error (busy, not found, ...) is
+		// still held to that bar.
+		runOp := func(op func() error) error {
+			before := o.Metrics().AbandonedGoroutines
+			err := op()
+			if !errors.Is(err, ErrStopTimeout) && !errors.Is(err, ErrHookTimeout) {
+				if after := o.Metrics().AbandonedGoroutines; after != before {
+					t.Fatalf("abandoned-goroutine count grew from %d to %d without a timeout error: %v", before, after, err)
+				}
+			}
+			return err
+		}
+
 		// stopChecked runs a stop op and, when it succeeds, asserts the public
 		// status is honest and the Stops metric moved by at most maxDelta, so a
 		// teardown/done race cannot double-count one stop.
 		stopChecked := func(name string, maxDelta int64, stop func() error) {
 			before := o.Metrics().Stops
-			if err := stop(); err != nil {
+			if err := runOp(stop); err != nil {
 				return
 			}
 			if delta := o.Metrics().Stops - before; delta > maxDelta {
@@ -136,14 +153,14 @@ func FuzzMembershipTransitions(f *testing.F) {
 		for _, b := range data {
 			switch b % 9 {
 			case 0:
-				_ = o.StartService("a")
+				_ = runOp(func() error { return o.StartService("a") })
 			case 1:
 				stopChecked("a", 1, func() error { return o.StopService("a", 50*time.Millisecond) })
 			case 2:
 				stopChecked("b", 3, func() error { return o.StopService("b", 50*time.Millisecond, WithCascadeStop()) })
 			case 3:
 				before := o.Metrics().Stops
-				if err := o.Unregister("c", 50*time.Millisecond); err == nil {
+				if err := runOp(func() error { return o.Unregister("c", 50*time.Millisecond) }); err == nil {
 					if _, ok := o.Status("c"); ok {
 						t.Fatal("Unregister returned nil but c is still registered")
 					}
@@ -160,11 +177,15 @@ func FuzzMembershipTransitions(f *testing.F) {
 				if late < maxLate {
 					late++
 					name := fmt.Sprintf("late-%d", late)
-					_ = o.Register(&namedSvc{}, WithName(name), DependsOn("a"))
-					_ = o.StartService(name)
+					_ = runOp(func() error {
+						if err := o.Register(&namedSvc{}, WithName(name), DependsOn("a")); err != nil {
+							return err
+						}
+						return o.StartService(name)
+					})
 				}
 			case 5:
-				_ = o.StartService("c")
+				_ = runOp(func() error { return o.StartService("c") })
 			case 6:
 				// c self-heals, so allow one background restart's accounting.
 				stopChecked("c", 2, func() error { return o.StopService("c", 50*time.Millisecond) })
@@ -182,7 +203,7 @@ func FuzzMembershipTransitions(f *testing.F) {
 				}
 				go o.invokeCron(e, e.cronGeneration())
 				time.Sleep(2 * time.Millisecond)
-				if err := o.StopService("cron", 50*time.Millisecond); err == nil {
+				if err := runOp(func() error { return o.StopService("cron", 50*time.Millisecond) }); err == nil {
 					if v := cronSvc.running.Load(); v != 0 {
 						t.Fatalf("cron tick survived StopService: %d still running", v)
 					}
@@ -190,11 +211,11 @@ func FuzzMembershipTransitions(f *testing.F) {
 						t.Fatalf("cron status after stop = %v, want StatusStopped", s)
 					}
 				}
-				_ = o.StartService("cron")
+				_ = runOp(func() error { return o.StartService("cron") })
 			}
 			assertNoReservationLeak()
 		}
-		_ = o.Stop(2 * time.Second)
+		_ = runOp(func() error { return o.Stop(2 * time.Second) })
 		assertNoReservationLeak()
 		for name, s := range o.Statuses() {
 			if s == StatusStarting {

@@ -981,6 +981,9 @@ func TestResetAfterStartFailure_BoundsWaits(t *testing.T) {
 		if !errors.Is(err, ErrStopTimeout) {
 			t.Fatalf("reset with a live instance = %v, want ErrStopTimeout", err)
 		}
+		if got := o.Metrics().AbandonedGoroutines; got != 1 {
+			t.Fatalf("AbandonedGoroutines = %d, want 1 for the abandoned instance wait", got)
+		}
 	})
 	t.Run("log pump wait", func(t *testing.T) {
 		o := New(WithHealthChecksDisabled())
@@ -989,5 +992,242 @@ func TestResetAfterStartFailure_BoundsWaits(t *testing.T) {
 		if !errors.Is(err, ErrStopTimeout) {
 			t.Fatalf("reset with a stuck log-pump = %v, want ErrStopTimeout", err)
 		}
+		if got := o.Metrics().AbandonedGoroutines; got != 1 {
+			t.Fatalf("AbandonedGoroutines = %d, want 1 for the abandoned log-pump wait", got)
+		}
 	})
+}
+
+// hasErrorForService reports whether the recording logger captured an Error
+// entry whose key-value args name the given service.
+func hasErrorForService(tl *testLogger, service string) bool {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	for _, c := range tl.calls {
+		if c.level != "ERROR" {
+			continue
+		}
+		for i := 0; i+1 < len(c.args); i += 2 {
+			if c.args[i] == "service" && c.args[i+1] == service {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestHookOverrun_LeaksExactlyOneGoroutine pins the abandoned-goroutine
+// accounting for an overrunning before-stop hook: a bounded StopService returns
+// ErrHookTimeout and the counter moves by exactly one, as a delta (not an
+// absolute), so an earlier abandonment elsewhere cannot mask the leak. The hook
+// stays blocked until cleanup; the service's Stop() returns promptly, so no Stop
+// goroutine is leaked by this test.
+func TestHookOverrun_LeaksExactlyOneGoroutine(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { close(hookRelease) })
+
+	if err := o.Register(
+		&testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+		WithName("s"),
+		WithOnBeforeStop(func(string) error {
+			once.Do(func() { close(hookEntered) })
+			<-hookRelease
+			return nil
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	before := o.Metrics().AbandonedGoroutines
+	done := make(chan error, 1)
+	go func() { done <- o.StopService("s", 200*time.Millisecond) }()
+
+	select {
+	case <-hookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("before-stop hook never ran")
+	}
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopService hung instead of bounding the overrunning hook")
+	}
+	if !errors.Is(err, ErrHookTimeout) {
+		t.Fatalf("StopService = %v, want ErrHookTimeout", err)
+	}
+	if got := o.Metrics().AbandonedGoroutines - before; got != 1 {
+		t.Fatalf("abandoned goroutines delta = %d, want exactly 1", got)
+	}
+}
+
+// TestStopTimeout_LeakedGoroutineIsLogged pins that an abandoned teardown
+// goroutine is logged at Error level naming the service, for both the
+// before-stop hook and the service's own Stop().
+func TestStopTimeout_LeakedGoroutineIsLogged(t *testing.T) {
+	t.Run("before-stop hook", func(t *testing.T) {
+		tl := &testLogger{}
+		o := New(WithHealthChecksDisabled(), WithLogger(tl))
+
+		hookEntered := make(chan struct{})
+		hookRelease := make(chan struct{})
+		var once sync.Once
+		t.Cleanup(func() { close(hookRelease) })
+
+		if err := o.Register(
+			&testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+			WithName("s"),
+			WithOnBeforeStop(func(string) error {
+				once.Do(func() { close(hookEntered) })
+				<-hookRelease
+				return nil
+			}),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- o.StopService("s", 200*time.Millisecond) }()
+
+		select {
+		case <-hookEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("before-stop hook never ran")
+		}
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrHookTimeout) {
+				t.Fatalf("StopService = %v, want ErrHookTimeout", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("StopService hung instead of bounding the overrunning hook")
+		}
+		if !hasErrorForService(tl, "s") {
+			t.Fatal("abandoned before-stop hook was not logged at Error level for service s")
+		}
+	})
+
+	t.Run("service Stop", func(t *testing.T) {
+		tl := &testLogger{}
+		o := New(WithHealthChecksDisabled(), WithLogger(tl))
+
+		stopEntered := make(chan struct{})
+		stopRelease := make(chan struct{})
+		var once sync.Once
+		t.Cleanup(func() { close(stopRelease) })
+
+		svc := &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			stopFn: func() error {
+				once.Do(func() { close(stopEntered) })
+				<-stopRelease
+				return nil
+			},
+		}
+		if err := o.Register(svc, WithName("s"), WithStopTimeout(50*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- o.StopService("s", 5*time.Second) }()
+
+		select {
+		case <-stopEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("service Stop() never ran")
+		}
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("StopService = nil, want the per-service timeout surfaced")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("StopService hung instead of surfacing the per-service cap")
+		}
+		if !hasErrorForService(tl, "s") {
+			t.Fatal("abandoned Stop() was not logged at Error level for service s")
+		}
+	})
+}
+
+// TestStopOverrun_PerServiceTimeoutCountsAbandoned pins that the service's own
+// Stop() abandoned by a per-service WithStopTimeout increments the counter by
+// exactly one.
+func TestStopOverrun_PerServiceTimeoutCountsAbandoned(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+
+	stopEntered := make(chan struct{})
+	stopRelease := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { close(stopRelease) })
+
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		stopFn: func() error {
+			once.Do(func() { close(stopEntered) })
+			<-stopRelease
+			return nil
+		},
+	}
+	if err := o.Register(svc, WithName("s"), WithStopTimeout(50*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	before := o.Metrics().AbandonedGoroutines
+	done := make(chan error, 1)
+	go func() { done <- o.StopService("s", 5*time.Second) }()
+
+	select {
+	case <-stopEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("service Stop() never ran")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopService hung instead of surfacing the per-service cap")
+	}
+	if got := o.Metrics().AbandonedGoroutines - before; got != 1 {
+		t.Fatalf("abandoned goroutines delta = %d, want exactly 1", got)
+	}
+}
+
+// TestAbandonedGoroutines_HappyPathStaysZero pins that a normal stop with no
+// overrun leaves the counter at zero, so a non-zero value always means a
+// genuine abandonment rather than incidental accounting.
+func TestAbandonedGoroutines_HappyPathStaysZero(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Register(
+		&testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+		WithName("s"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StopService("s", time.Second); err != nil {
+		t.Fatalf("StopService = %v, want nil", err)
+	}
+	if got := o.Metrics().AbandonedGoroutines; got != 0 {
+		t.Fatalf("AbandonedGoroutines = %d on the happy path, want 0", got)
+	}
+	_ = o.Stop(time.Second)
 }
