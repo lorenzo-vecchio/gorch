@@ -485,13 +485,39 @@ func (o *Orchestrator) safeStop(entry *serviceEntry) {
 	_ = o.stopOneService(entry)
 }
 
-// persistentEntries returns non-cron, non-runOnce entries.
-func (o *Orchestrator) persistentEntries() []*serviceEntry {
+// entriesSnapshot returns a copy of the current entry slice, taken under
+// o.mu so callers can iterate it while running user code (hooks, Stop) without
+// holding the lock. The copy is what makes the read safe: a concurrent
+// membership op replaces o.entries, and the snapshot must not observe that
+// mutation partway through an iteration.
+func (o *Orchestrator) entriesSnapshot() []*serviceEntry {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
+	out := make([]*serviceEntry, len(o.entries))
+	copy(out, o.entries)
+	return out
+}
+
+// persistentEntries returns non-cron, non-runOnce entries.
+func (o *Orchestrator) persistentEntries() []*serviceEntry {
 	var out []*serviceEntry
-	for _, e := range o.entries {
+	for _, e := range o.entriesSnapshot() {
 		if e.cfg.cronSpec == "" && !e.cfg.runOnce {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// nonPersistentEntries returns cron-only and runOnce entries. Its predicate
+// (cronSpec != "" || runOnce) is the exact complement of persistentEntries'
+// (cronSpec == "" && !runOnce), so the two lists are disjoint and together
+// cover every registry entry. Whole-orchestrator Stop relies on that to stop
+// each entry exactly once across its two teardown passes.
+func (o *Orchestrator) nonPersistentEntries() []*serviceEntry {
+	var out []*serviceEntry
+	for _, e := range o.entriesSnapshot() {
+		if e.cfg.runOnce || e.cfg.cronSpec != "" {
 			out = append(out, e)
 		}
 	}

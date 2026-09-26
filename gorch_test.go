@@ -3329,6 +3329,158 @@ func TestStop_StopsCronAndRunOnce(t *testing.T) {
 	}
 }
 
+// TestStop_EntrySliceReadIsSynchronised drives a concurrent mutation of the
+// entry registry while Stop is reading it, and must not trip the race detector
+// under -race: Stop's teardown passes read a snapshot taken under o.mu. The
+// writer models a membership op that replaces o.entries under the lock. A start
+// barrier puts both goroutines in flight together without an ordering edge
+// between their accesses, which is exactly what a data race needs; a Stop that
+// read o.entries unsynchronised would report one.
+func TestStop_EntrySliceReadIsSynchronised(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	// Non-persistent entries give the second teardown pass (the one that used to
+	// read o.entries unsynchronised) real work to do over a wide window.
+	for i := 0; i < 128; i++ {
+		svc := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+		if err := o.Register(svc, WithName(fmt.Sprintf("once-%d", i)), WithRunOnce()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	stopDone := make(chan error, 1)
+	go func() {
+		<-start
+		stopDone <- o.Stop(5 * time.Second)
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		// Replace the registry slice under the lock, the way a membership op
+		// would. The contents are unchanged; only the slice header is rewritten,
+		// which is precisely the unsynchronised read Stop used to perform.
+		for i := 0; i < 500; i++ {
+			o.mu.Lock()
+			next := make([]*serviceEntry, len(o.entries))
+			copy(next, o.entries)
+			o.entries = next
+			o.mu.Unlock()
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestStop_RunOnceAndCronEntriesAreStoppedExactlyOnce pins that Stop's two
+// teardown passes are disjoint: the reverse-topological pass handles persistent
+// entries, the remaining pass handles cron-only and runOnce entries, and their
+// predicates are complements, so every service's Stop() runs exactly once.
+func TestStop_RunOnceAndCronEntriesAreStoppedExactlyOnce(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	persistent := &testSvc{}
+	once := &testSvc{startFn: func(ctx context.Context) error { return nil }}
+	cronSvc := &testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }}
+	if err := o.Register(persistent, WithName("persistent")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(once, WithName("once"), WithRunOnce()); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(cronSvc, WithName("cron"), WithCron("* * * * * *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Stop(2 * time.Second); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		svc  *testSvc
+	}{
+		{"persistent", persistent},
+		{"once", once},
+		{"cron", cronSvc},
+	} {
+		if got := tc.svc.stopCalls.Load(); got != 1 {
+			t.Errorf("%s Stop() called %d times, want exactly 1", tc.name, got)
+		}
+	}
+}
+
+// TestStop_ConcurrentDoubleStop_NoDoubleHooks runs two overlapping Stop calls on
+// the same entry and asserts the teardown runs once: the before/after-stop hooks
+// and the service's Stop() must not fire twice. The stopOnce latch makes one
+// caller the owner while the other waits and then no-ops.
+func TestStop_ConcurrentDoubleStop_NoDoubleHooks(t *testing.T) {
+	var beforeStop, afterStop atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	svc := &testSvc{stopFn: func() error {
+		close(entered)
+		<-release
+		return nil
+	}}
+	o := New(WithHealthChecksDisabled(),
+		WithGlobalOnBeforeStop(func(string) error { beforeStop.Add(1); return nil }),
+		WithGlobalOnAfterStop(func(string, error) { afterStop.Add(1) }),
+	)
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	ready := make(chan struct{}, 2)
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			results <- o.Stop(2 * time.Second)
+		}()
+	}
+	<-ready
+	<-ready
+	close(start)
+	<-entered // One Stop owns the teardown and is now blocked inside svc.Stop.
+	close(release)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}
+
+	if got := svc.stopCalls.Load(); got != 1 {
+		t.Errorf("service Stop() called %d times, want exactly 1", got)
+	}
+	if got := beforeStop.Load(); got != 1 {
+		t.Errorf("before-stop hook ran %d times, want exactly 1", got)
+	}
+	if got := afterStop.Load(); got != 1 {
+		t.Errorf("after-stop hook ran %d times, want exactly 1", got)
+	}
+}
+
 // TestCronStatusLifecycle verifies cron services transition to running at Start
 // and to stopped at Stop (they are no longer stuck in StatusRegistered).
 func TestCronStatusLifecycle(t *testing.T) {

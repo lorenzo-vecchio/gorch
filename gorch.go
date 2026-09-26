@@ -1133,6 +1133,12 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 				stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
 			}
 		}
+		// The persistent and non-persistent sets are complements
+		// (persistentEntries vs nonPersistentEntries), so the reverse-topological
+		// pass and the remaining pass are disjoint and every entry is stopped
+		// exactly once. Both take their snapshot under o.mu before iterating, so a
+		// concurrent membership op cannot mutate the slice mid-read and no user
+		// code (hook or Stop) runs while the lock is held.
 		persistent := o.persistentEntries()
 		levels, topoErr := o.topoSortForStop(persistent)
 		// A cyclic subset still stops every persistent entry (registration-order
@@ -1143,11 +1149,10 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 				stopOne(entry)
 			}
 		}
-		// Also stop any remaining entries not in levels (e.g., cron-only, runOnce that failed).
-		for _, entry := range o.entries {
-			if entry.cfg.runOnce || entry.cfg.cronSpec != "" {
-				stopOne(entry)
-			}
+		// Cron-only and runOnce entries were excluded from the persistent snapshot
+		// above, so this pass completes the teardown without overlapping it.
+		for _, entry := range o.nonPersistentEntries() {
+			stopOne(entry)
 		}
 
 		// 4. Signal log-pump to drain and exit.
