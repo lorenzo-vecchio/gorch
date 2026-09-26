@@ -54,6 +54,18 @@
 //     into membership operations without deadlocking.
 //   - A hot-added cron service is staged by Register and only scheduled by
 //     StartService, so it never ticks while reporting StatusRegistered.
+//   - Introspection reports what is registered, not what is live: Count, Names,
+//     and Statuses include an entry from the moment it is registered, so a
+//     hot-added, not-yet-started service and a staged cron entry are both
+//     present and both read StatusRegistered. CountRunning and RunningNames are
+//     the StatusRunning subset ("N of M running"). A start reservation is not
+//     encoded in status: an entry actively starting still reports its prior
+//     status until startOneService commits StatusStarting, so poll Busy(name)
+//     for an in-flight reservation. For a cron entry StatusRunning means the
+//     schedule is installed, not that a tick is working: a tick that returns an
+//     error only logs, and IsReady and Health inherit that scheduling-fact
+//     reading. Tick failures are not observable through the public API yet (see
+//     the metrics-semantics issue); only the log records them.
 //   - A panic from a lifecycle hook, Validator, start condition, or probe is
 //     recovered and reported as an error (or as unhealthy/unready), so a
 //     misbehaving callback never unwinds through a public entry point.

@@ -29,7 +29,7 @@ Requires Go 1.25+.
 - **Backoff & retry** — `ExponentialBackoff` and `ConstantBackoff` strategies, max retries, stability-window retry reset.
 - **One-shot services** — init/gate tasks that run once before persistent services; `Stop()` is called at shutdown.
 - **Lifecycle hooks** — `OnBeforeStart`, `OnAfterStart`, `OnBeforeStop`, `OnAfterStop` (global or per-service overrides).
-- **Status introspection** — `Status`, `Statuses`, `Names`, `Count`, and `Busy(name)` for runtime observability (the last polls an in-flight membership reservation).
+- **Status introspection** — `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, and `Busy(name)` for runtime observability. `Count`/`Names`/`Statuses` report every *registered* entry; `CountRunning`/`RunningNames` report the `StatusRunning` subset; `Busy(name)` polls an in-flight membership reservation, which status does not encode.
 - **Error aggregation** — `errors.Join` in `Start`/`Stop` so all failures are reported, not just the first.
 - **Nestable orchestrators** — a service can create its own gorch for sub-services.
 - **Structured logging** — channel-based log-pump writes to stderr; services call `Info/Error/Debug/Warn` on a `ServiceLogger`.
@@ -62,7 +62,7 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 | `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning`; an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). It never restarts a live instance: to replace one, `StopService` and then `StartService` — and `StopService` is itself refused with `ErrHasDependents` while a hard dependent is `Running` or `Starting`, unless `WithCascadeStop` is used, so restarting a depended-on service bounces those dependents first. The start decision and its reservation are claimed atomically under the membership lock (released before any user code), so concurrent `StartService` calls cannot double-start or orphan an instance. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with another goroutine's reservation returns the transient `ErrMembershipBusy` (poll `Busy`); re-entering from the entry's own `Start` returns `ErrReentrantMembership`. |
 | `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents`, and the error names each blocker with its status (e.g. `api (starting)`); every other dependent status — `Stopping`, `Registered`, `Crashed`, `Stopped`, `Succeeded` — does not block, so a plain stop proceeds and leaves the dependent untouched. With `WithCascadeStop`, every transitive hard dependent is stopped/removed in reverse topological order, except one already `Stopping`, which is left to its own in-flight teardown rather than stopped a second time (no double `Stop()` or hooks). A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
 | `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the **whole-orchestrator lifecycle** is single-shot, so after a successful `Stop` neither can run again. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
-| `Status`, `Statuses`, `Names`, `Count`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation. |
+| `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation, and is the only observable for the reservation window. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
 | `Metrics`, `Done` | Yes — atomic counters and a shutdown-completed channel created once in `New` and returned unchanged. |
 | `StartGroup`, `StopGroup` | Drive one group per orchestrator. Serialized with `StopService`/`Unregister` by the membership lock; a group start reserves each member and rolls back the members it already started if a later one fails, and a group stop honours a concurrent start's reservation by skipping that entry. Both are gated by shutdown (`ErrOrchestratorStopping`/`ErrOrchestratorStopped`). Group ops are not synchronized with the whole-orchestrator `Start`/`Stop` beyond that shutdown gate: do not drive them from inside a concurrent `Start`/`Stop`. |
@@ -342,19 +342,33 @@ own `Start` or `Stop` — is a programming error and returns
 reservation held by *another* goroutine's in-flight `Start`/`Stop`/group
 operation is benign and transient, and returns `ErrMembershipBusy`: the
 reservation is released when that operation returns, so poll `Busy(name)` (or
-retry) instead of racing. `Status` reports `StatusStarting` while a service's
-`Start` runs, so a reserved entry is observable there too; a reservation taken
-by `StopService`/`Unregister`/`StopGroup` is visible as `StatusStopping`.
+retry) instead of racing.
+
+**Status reports the lifecycle, `Busy` reports the reservation.** The two are
+deliberately separate, and the gap between them is the reservation window:
+`Start`/`StartGroup` claim an entry's reservation (`Busy(name) == true`) *before*
+`startOneService` commits `StatusStarting`. During that window — the entry's
+before-start hook and start condition run — `Status`/`Statuses` still report the
+entry's previous status (typically `StatusRegistered` for a hot add), so an entry
+actively being started can read as `Registered`. `StatusStarting` means
+"`startOneService` has committed the start", not merely "a start was claimed";
+`StatusStopping` covers a `StopService`/`Unregister`/`StopGroup` teardown. Poll
+`Busy(name)` for "is anything in flight?", and `Statuses()` for what the entry
+is. No `ServiceStatus` value encodes the reservation: a new value would make
+`ServiceStatus` an unstable surface for a transient internal state.
 
 Hard dependencies must be registered before the service that names them, both
 statically and on a hot add: `Register` rejects an unknown hard dependency
 immediately (dynamically with `ErrDependencyNotFound`). `Count`, `Names`, and
-`Statuses` include an entry the moment it is registered, including one reserved
-mid-`Start` and a staged cron entry, so their status is `StatusStarting`/
-`StatusStopped`/`StatusRegistered` as appropriate. `Done()` is a
-shutdown-completed signal: it closes once `Stop` returns — even if every service
-was unregistered first, or a timed-out stop abandoned a goroutine — and stays
-open until then.
+`Statuses` include an entry the moment it is **registered** — not when it starts:
+a hot-added, not-yet-started persistent service and a staged (registered,
+unscheduled) cron entry both count and both read `StatusRegistered`, so
+`Count()` is "registered", not "live". For "N of M running", use the
+`StatusRunning` subset: `CountRunning()` of `Count()`, or `RunningNames()`. For a
+cron entry `StatusRunning` means the schedule is installed, not that a tick is
+working (see [Cron modes](#cron-modes)). `Done()` is a shutdown-completed signal:
+it closes once `Stop` returns — even if every service was unregistered first, or
+a timed-out stop abandoned a goroutine — and stays open until then.
 
 #### Naming policy
 
@@ -408,23 +422,52 @@ orch := gorch.New(gorch.WithFailedStartTimeout(5 * time.Second))
 Each tick receives a fresh `ServiceContext` whose context is cancelled when that
 tick returns; `StopService`/`Unregister` cancel every in-flight tick through it
 and wait for them to return.
+
+**For a cron entry, `StatusRunning` means "schedule installed", not "working".**
+Scheduling and health are separate facts, and the status reports only the first:
+a tick whose `Start` returns an error is logged at Error level by `invokeCron`
+and nothing else — the status stays `StatusRunning`, the entry is not restarted,
+and the error never crashes the orchestrator. `Health()` and `IsReady()` inherit
+this: a cron entry in `StatusRunning` is eligible for a health probe exactly like
+a persistent one, but neither a failing tick nor a successful one is reflected in
+its `ServiceStatus`. Tick failures are **not** currently observable through the
+public API (only via the log, which the library's log contract does not promise
+to parse); a tick-failure counter in `Metrics()` is tracked by
+[#30](https://github.com/lorenzo-vecchio/gorch/issues/30) and is not part of this
+contract.
+
 A statically registered cron entry starts as `StatusRunning`; a hot-added one is
 staged by `Register` (spec validated, no schedule installed) and reports
 `StatusRegistered` until `StartService` schedules it and marks it running.
 `StopService` removes the schedule and a later `StartService` re-creates it,
-while `Unregister` drops the entry itself.
+while `Unregister` drops the entry itself. A staged cron entry and a persistent
+entry awaiting `StartService` both report `StatusRegistered`, so status alone
+does not tell them apart: the distinction is the registration mode the caller
+itself chose (`WithCron` vs not), which introspection does not expose. A staged
+cron entry never ticks before `StartService`.
 
 ### Status introspection
 
 ```go
 status, ok := orch.Status("db")            // ServiceStatus, bool
-all := orch.Statuses()                     // map[string]ServiceStatus
-names := orch.Names()                      // []string in registration order
-count := orch.Count()                      // total registered services
+all := orch.Statuses()                     // map[string]ServiceStatus (all registered)
+names := orch.Names()                      // []string in registration order (all registered)
+count := orch.Count()                      // total registered services (not live)
+runningCount := orch.CountRunning()        // number of StatusRunning services ("N of M running")
+runningNames := orch.RunningNames()        // []string of StatusRunning services
 busy := orch.Busy("db")                    // true if an in-flight reservation blocks membership ops
 ```
 
-`ServiceStatus` values: `StatusRegistered`, `StatusStarting`, `StatusRunning`, `StatusStopping`, `StatusStopped`, `StatusCrashed`, `StatusSucceeded`. Each has a `String()` method. `StatusSucceeded` marks a one-shot service whose `Start` completed without error (a successful gate); dependents are not aborted by it.
+`Count`, `Names`, and `Statuses` are the **registered** surface: an entry appears
+the moment `Register` accepts it, so a hot-added, not-yet-started persistent
+service and a staged cron entry are both present and both read
+`StatusRegistered`. `CountRunning` and `RunningNames` are the `StatusRunning`
+subset, backed by the same `Statuses` snapshot. The reservation window is not
+part of either: a start claimed but not yet committed to `StatusStarting` still
+reads as the previous status, so poll `Busy(name)` to see an in-flight
+reservation.
+
+`ServiceStatus` values: `StatusRegistered`, `StatusStarting`, `StatusRunning`, `StatusStopping`, `StatusStopped`, `StatusCrashed`, `StatusSucceeded`. Each has a `String()` method. `StatusSucceeded` marks a one-shot service whose `Start` completed without error (a successful gate); dependents are not aborted by it. For a cron entry, `StatusRunning` means the schedule is installed, not that a tick is working or healthy.
 
 ### One-shot / init services
 

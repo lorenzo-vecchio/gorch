@@ -819,6 +819,12 @@ func (o *Orchestrator) lookupEntry(name string) *serviceEntry {
 // poll to decide whether StartService/StopService/Unregister would be rejected
 // with the transient ErrMembershipBusy, instead of racing and retrying blind. It
 // returns false for an unknown name and for a registered but idle entry.
+//
+// Busy is the observable for the reservation, which Status/Statuses do not
+// encode: a reserved entry still reports its prior lifecycle status (typically
+// StatusRegistered) until startOneService commits StatusStarting. That window is
+// the answer to "is anything in flight?" — Statuses reports what the entry is,
+// Busy reports that a membership operation has claimed it.
 // Thread-safe.
 func (o *Orchestrator) Busy(name string) bool {
 	o.mu.RLock()
