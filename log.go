@@ -39,18 +39,21 @@ type logEntry struct {
 	args    []any
 }
 
-// serviceEntry tracks a registered service with its options and runtime state.
-func (o *Orchestrator) logPump() {
-	defer close(o.logPumpDone)
+// logPump drains the log channel until logQuit is closed, then signals done.
+// The channels are passed in rather than read from the Orchestrator so a
+// best-effort reset that clears the orchestrator's fields while the pump is
+// still winding down cannot race the pump.
+func (o *Orchestrator) logPump(logCh chan logEntry, logQuit, done chan struct{}) {
+	defer close(done)
 	for {
 		select {
-		case entry := <-o.logCh:
+		case entry := <-logCh:
 			o.emitLog(entry)
-		case <-o.logQuit:
+		case <-logQuit:
 			// Drain remaining buffered entries, then exit.
 			for {
 				select {
-				case entry := <-o.logCh:
+				case entry := <-logCh:
 					o.emitLog(entry)
 				default:
 					return

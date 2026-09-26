@@ -17,6 +17,12 @@ type config struct {
 	// 0 means no timeout (use WithStartTimeout per-service).
 	DefaultStartTimeout time.Duration
 
+	// failedStartTimeout bounds the whole rollback of a failed Start: the
+	// per-service stop sequences and the final wait for instance and log-pump
+	// goroutines share it. 0 means the default (30s); a negative value disables
+	// the bound.
+	failedStartTimeout time.Duration
+
 	// Health check configuration.
 	// HealthInterval: how often to probe. Default: 30s.
 	// HealthTimeout: per-probe deadline. Default: 5s.
@@ -60,6 +66,18 @@ func WithLogLevel(lvl LogLevel) Option {
 // 0 means no timeout (use WithStartTimeout per-service).
 func WithDefaultStartTimeout(d time.Duration) Option {
 	return func(c *config) { c.DefaultStartTimeout = d }
+}
+
+// WithFailedStartTimeout bounds the whole rollback of a failed Start: the
+// per-service stop sequences (before/after-stop hooks and Stop()) and the final
+// wait for instance and log-pump goroutines all share one budget, mirroring
+// Stop's shutdown contract. Zero means the default (30s); a negative value
+// removes the bound, which is not recommended because a service that blocks in
+// Stop() could then hang Start forever. When the budget is exceeded the returned
+// error matches ErrStopTimeout, and the reset is best-effort so Start can still
+// be retried.
+func WithFailedStartTimeout(d time.Duration) Option {
+	return func(c *config) { c.failedStartTimeout = d }
 }
 
 // HealthCheckOption refines the periodic health-check loop configured by

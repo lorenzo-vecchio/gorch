@@ -227,9 +227,13 @@ func (o *Orchestrator) callAfterStartHook(entry *serviceEntry, err error) {
 
 // stopStartedServices stops all running services (used for cleanup on start
 // failure). It works on the Start snapshot rather than o.entries, so a
-// concurrent hot Register cannot race the cleanup.
+// concurrent hot Register cannot race the cleanup. The deadline bounds the whole
+// rollback and is shared unchanged by every entry, so a service that blocks in a
+// hook or Stop() cannot hang Start past it; a zero deadline means no bound. The
+// returned error aggregates every unverified teardown, including
+// ErrStopTimeout/ErrHookTimeout.
 // ponytail: sequential stop; parallel Stop is premature.
-func (o *Orchestrator) stopStartedServices(entries []*serviceEntry) {
+func (o *Orchestrator) stopStartedServices(entries []*serviceEntry, deadline time.Time) error {
 	// Cancel context.
 	if o.cancel != nil {
 		o.cancel()
@@ -239,19 +243,23 @@ func (o *Orchestrator) stopStartedServices(entries []*serviceEntry) {
 		<-o.cronSched.Stop().Done()
 	}
 	// Stop services in reverse registration order.
+	var stopErr error
 	for i := len(entries) - 1; i >= 0; i-- {
 		entry := entries[i]
 		o.statusMu.RLock()
 		s := entry.status
 		o.statusMu.RUnlock()
 		if s == StatusRunning || s == StatusStarting {
-			o.safeStop(entry)
+			if _, _, err := o.stopOneServiceDeadline(entry, deadline); err != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+			}
 		}
 	}
 	// Stop log-pump: signal it to drain buffered entries and exit.
 	if o.logQuit != nil {
 		close(o.logQuit)
 	}
+	return stopErr
 }
 
 // setStatus updates the service status (thread-safe).

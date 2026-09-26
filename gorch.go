@@ -446,7 +446,8 @@ type Orchestrator struct {
 // New creates a new Orchestrator. Each call returns a fresh, independent instance.
 // Orchestrators can be nested: a service may create its own gorch to manage
 // sub-services. Configure via Option functions; the zero-option call uses the
-// defaults (LogLevelInfo, health checks every 30s with a 5s probe timeout).
+// defaults (LogLevelInfo, health checks every 30s with a 5s probe timeout, a 30s
+// failed-Start rollback budget).
 func New(opts ...Option) *Orchestrator {
 	cfg := config{}
 	for _, opt := range opts {
@@ -468,6 +469,11 @@ func New(opts ...Option) *Orchestrator {
 		if cfg.HealthThreshold == 0 {
 			cfg.HealthThreshold = 3
 		}
+	}
+	// A failed Start's rollback is bounded by default so a service that blocks in
+	// Stop() cannot hang Start; 0 selects the 30s default, negative disables it.
+	if cfg.failedStartTimeout == 0 {
+		cfg.failedStartTimeout = 30 * time.Second
 	}
 	o := &Orchestrator{
 		cfg:       cfg,
@@ -771,7 +777,10 @@ func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bo
 
 // Start begins the orchestrator lifecycle. Returns ErrAlreadyStarted if already started.
 // If Start fails, the orchestrator is reset and may be started again (e.g. to retry
-// after a transient dependency failure).
+// after a transient dependency failure). The rollback is bounded by
+// WithFailedStartTimeout (default 30s) and shares one budget across every stop and
+// the final wait, so a service that blocks in Stop() cannot hang Start; an overrun
+// is reported as ErrStopTimeout and the reset is best-effort.
 // A persistent service that returns an error synchronously aborts Start only when a
 // start timeout is set; without one its launch is fire-and-forget by construction.
 // The whole-orchestrator lifecycle is single-shot: after a successful Stop it cannot
@@ -787,6 +796,10 @@ func (o *Orchestrator) Start() error {
 	o.mu.Unlock()
 
 	var startErr error
+	// rollbackDeadline bounds the failed-Start cleanup. It is captured at the
+	// moment of failure (not at Start's beginning) so the synchronous startup
+	// work that preceded the failure does not consume the reset budget.
+	var rollbackDeadline time.Time
 	// entries is the graph this Start owns; it is set under o.mu inside the
 	// startOnce closure and reused by resetAfterStartFailure on a failed start.
 	var entries []*serviceEntry
@@ -849,18 +862,21 @@ func (o *Orchestrator) Start() error {
 
 		// Spawn log-pump goroutine (default logger only).
 		if o.cfg.Logger == nil {
-			go o.logPump()
+			go o.logPump(logCh, logQuit, logPumpDone)
 		}
 
 		// Set up and start the cron scheduler.
 		if err := o.setupCron(entries); err != nil {
 			cancel()
+			rollbackDeadline = o.failedStartDeadline()
 			if logQuit != nil {
 				close(logQuit)
-				<-logPumpDone
+				// Bounded wait: the reset below repeats it and surfaces
+				// ErrStopTimeout if the log-pump is still stuck.
+				_ = o.awaitDone(logPumpDone, rollbackDeadline)
 			}
 			o.cronSched.Stop()
-			startErr = err
+			startErr = errors.Join(startErr, err)
 			return
 		}
 
@@ -882,7 +898,8 @@ func (o *Orchestrator) Start() error {
 			if err := o.startOneService(entry); err != nil {
 				startErr = errors.Join(startErr, fmt.Errorf("%s: %w", entry.name, err))
 				// runOnce failure aborts — do not start persistent services.
-				o.stopStartedServices(entries)
+				rollbackDeadline = o.failedStartDeadline()
+				startErr = errors.Join(startErr, o.stopStartedServices(entries, rollbackDeadline))
 				return
 			}
 		}
@@ -891,7 +908,8 @@ func (o *Orchestrator) Start() error {
 		levels, topoErr := o.topoSort(persistent)
 		if topoErr != nil {
 			startErr = errors.Join(startErr, topoErr)
-			o.stopStartedServices(entries)
+			rollbackDeadline = o.failedStartDeadline()
+			startErr = errors.Join(startErr, o.stopStartedServices(entries, rollbackDeadline))
 			return
 		}
 
@@ -962,7 +980,8 @@ func (o *Orchestrator) Start() error {
 
 			// If any in this level failed, stop all and skip remaining levels.
 			if len(failed) > 0 {
-				o.stopStartedServices(entries)
+				rollbackDeadline = o.failedStartDeadline()
+				startErr = errors.Join(startErr, o.stopStartedServices(entries, rollbackDeadline))
 				return
 			}
 		}
@@ -977,9 +996,19 @@ func (o *Orchestrator) Start() error {
 		}
 	})
 	if startErr != nil {
-		o.resetAfterStartFailure(entries)
+		startErr = errors.Join(startErr, o.resetAfterStartFailure(entries, rollbackDeadline))
 	}
 	return startErr
+}
+
+// failedStartDeadline computes the deadline for a failed-Start rollback from the
+// configured failedStartTimeout. It returns the zero time.Time when the
+// effective budget is non-positive, meaning the rollback is unbounded.
+func (o *Orchestrator) failedStartDeadline() time.Time {
+	if o.cfg.failedStartTimeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(o.cfg.failedStartTimeout)
 }
 
 // resetAfterStartFailure rolls back all state mutated by a failed Start so the
@@ -987,11 +1016,30 @@ func (o *Orchestrator) Start() error {
 // snapshotted: a service hot-added while the failing Start ran keeps its
 // registration state and logger. It first waits for all service goroutines and
 // the log-pump to fully wind down (they were signalled by stopStartedServices or
-// the cron-error path) before resetting.
-func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry) {
-	o.wg.Wait()
-	if o.logPumpDone != nil {
-		<-o.logPumpDone
+// the cron-error path); both waits share deadline, and on expiry it joins
+// ErrStopTimeout into the returned error and still performs the reset. The reset
+// is therefore best-effort: a goroutine that ignores cancellation and outlives
+// the failed Start may keep running, but the orchestrator is left restartable so
+// Start can be retried.
+func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline time.Time) error {
+	var resetErr error
+
+	// Bound the orchestrator-wide wait for instance goroutines. It is
+	// orchestrator-wide, not just the Start snapshot: a StartService that ran
+	// during the failing Start also fed o.wg, so one instance ignoring
+	// cancellation must not hang the reset.
+	wgDone := make(chan struct{})
+	go func() {
+		o.wg.Wait()
+		close(wgDone)
+	}()
+	if !o.awaitDone(wgDone, deadline) {
+		resetErr = errors.Join(resetErr, ErrStopTimeout)
+	}
+	// logPumpDone is nil when a custom Logger is set; awaitDone treats that as
+	// already done.
+	if !o.awaitDone(o.logPumpDone, deadline) {
+		resetErr = errors.Join(resetErr, ErrStopTimeout)
 	}
 
 	o.mu.Lock()
@@ -1021,6 +1069,7 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry) {
 	o.mu.Unlock()
 	o.startOnce = sync.Once{}
 	o.stopOnce = sync.Once{}
+	return resetErr
 }
 
 // Stop shuts down the orchestrator, bounding the whole shutdown by timeout:
