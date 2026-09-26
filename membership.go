@@ -70,6 +70,24 @@ func (o *Orchestrator) StartService(name string) error {
 		return nil
 	}
 
+	// A persistent instance can be live while its status is momentarily not
+	// Running: the self-heal handler reports Crashed before it restarts, and a
+	// restart in backoff is not Running either. The live instance is what the
+	// idempotence guard must key on, not the status, or a concurrent StartService
+	// would start a second instance behind the first and leak the wait group
+	// (each instance adds one, but the entry's exit latch releases only one).
+	// entry.done is open from the moment an instance starts until its goroutine
+	// has fully exited, so it covers both windows. Cron (no instance channel) and
+	// runOnce (deliberately re-runnable) keep the status-only guard above.
+	if done := entry.getDone(); done != nil {
+		select {
+		case <-done:
+			// No live instance: fall through and (re)start.
+		default:
+			return nil
+		}
+	}
+
 	switch {
 	case entry.cfg.cronSpec != "":
 		return o.startCronEntry(entry)

@@ -3593,9 +3593,14 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 	// Ensure the maxRetries block sets StatusCrashed and forwards the real error.
 	var crashName string
 	var crashErr error
+	var crashCalls atomic.Int32
 	o := New(
 		WithLogLevel(LogLevelWarn),
-		WithOnCrash(func(name string, err error) { crashName = name; crashErr = err }),
+		WithOnCrash(func(name string, err error) {
+			crashName = name
+			crashErr = err
+			crashCalls.Add(1)
+		}),
 	)
 	ctx := context.Background()
 	o.ctx = ctx
@@ -3631,6 +3636,52 @@ func TestHandleServiceDone_SelfHealMaxRetriesReached(t *testing.T) {
 	}
 	if !errors.Is(crashErr, exitErr) {
 		t.Errorf("expected OnCrash to receive real error %v, got %v", exitErr, crashErr)
+	}
+	// The terminal crash must be reported exactly once: the pre-restart report
+	// and the maxRetries branch must not both count it.
+	if crashCalls.Load() != 1 {
+		t.Errorf("OnCrash fired %d times, want exactly 1", crashCalls.Load())
+	}
+	if got := o.Metrics().Crashes; got != 1 {
+		t.Errorf("Crashes = %d, want exactly 1", got)
+	}
+	done := make(chan struct{})
+	go func() { o.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wg.Wait did not complete")
+	}
+}
+
+// TestHandleServiceDone_SelfHealMaxRetries_TeardownContextWins covers the
+// teardown-owned terminal exit on the self-heal path: a cancelled per-entry
+// teardown context (without the removing flag) wins over the crash report, so
+// the entry ends StatusStopped and nothing is counted as a crash.
+func TestHandleServiceDone_SelfHealMaxRetries_TeardownContextWins(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	o.ctx = context.Background()
+
+	entry := &serviceEntry{
+		svc:        &errSvc{err: errors.New("boom")},
+		cfg:        registerConfig{name: "x", factory: func() Service { return &errSvc{err: errors.New("boom")} }, maxRetries: 1},
+		name:       "x",
+		status:     StatusRunning,
+		logger:     newServiceLogger("x", make(chan logEntry, 1), nil, LogLevelDebug),
+		retryCount: 1, // already at max
+	}
+	teardown, cancel := context.WithCancel(context.Background())
+	cancel() // the teardown context is dead, but removing is not set
+	entry.setTeardown(teardown, cancel)
+
+	o.wg.Add(1)
+	o.handleServiceDone(entry, ServiceContext{Context: o.ctx}, errors.New("boom"), 0)
+
+	if s := o.statusOf(entry); s != StatusStopped {
+		t.Errorf("status = %v, want StatusStopped (teardown wins the crash race)", s)
+	}
+	if got := o.Metrics().Crashes; got != 0 {
+		t.Errorf("Crashes = %d, want 0: a teardown-owned exit is not a crash", got)
 	}
 	done := make(chan struct{})
 	go func() { o.wg.Wait(); close(done) }()
@@ -5255,6 +5306,204 @@ func TestCrashSemantics_CleanExit(t *testing.T) {
 	if o.Metrics().Crashes != 0 {
 		t.Errorf("clean exit should not increment Crashes, got %d", o.Metrics().Crashes)
 	}
+}
+
+// assertStatusSequence fails when got does not equal want element by element.
+func assertStatusSequence(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("status sequence = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("status sequence = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestSelfHeal_CrashIsObserved pins the crash-observability contract for a
+// self-healing service: a crash produces a Running→Crashed transition, an
+// OnCrash call carrying the real error, and exactly one Crashes metric
+// increment, even though the service is immediately restarted.
+func TestSelfHeal_CrashIsObserved(t *testing.T) {
+	crashErr := errors.New("self-heal boom")
+	crashCh := make(chan error, 1)
+	var transitions []string
+	var mu sync.Mutex
+	secondStarted := make(chan struct{})
+
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithHealthChecksDisabled(),
+		WithOnCrash(func(name string, err error) { crashCh <- err }),
+		WithOnStateChange(func(name string, from, to ServiceStatus) {
+			mu.Lock()
+			transitions = append(transitions, fmt.Sprintf("%s->%s", from, to))
+			mu.Unlock()
+		}),
+	)
+	factory := func() Service {
+		return &testSvc{startFn: func(ctx context.Context) error {
+			close(secondStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+	}
+	if err := o.Register(&testSvc{startFn: func(ctx context.Context) error { return crashErr }},
+		WithName("healer"),
+		WithSelfHeal(factory),
+		WithBackoff(ConstantBackoff{Delay: time.Millisecond}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer o.Stop(time.Second)
+
+	if got := <-crashCh; !errors.Is(got, crashErr) {
+		t.Errorf("OnCrash err = %v, want the real exit error %v", got, crashErr)
+	}
+	if got := o.Metrics().Crashes; got != 1 {
+		t.Errorf("Crashes = %d, want exactly 1", got)
+	}
+
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("self-heal never restarted the service")
+	}
+	if got, _ := o.Status("healer"); got != StatusRunning {
+		t.Errorf("status after restart = %v, want StatusRunning while the new instance is live", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	seen := false
+	for _, tr := range transitions {
+		if tr == "running->crashed" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("no running->crashed transition observed; got %v", transitions)
+	}
+}
+
+// TestSelfHeal_CrashThenRestart_StatusSequence pins the exact status sequence a
+// self-heal crash and restart produces, so the crash is never silent and the
+// restart re-establishes Running.
+func TestSelfHeal_CrashThenRestart_StatusSequence(t *testing.T) {
+	crashErr := errors.New("boom")
+	var transitions []string
+	var mu sync.Mutex
+	secondStarted := make(chan struct{})
+
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithHealthChecksDisabled(),
+		WithOnStateChange(func(name string, from, to ServiceStatus) {
+			mu.Lock()
+			transitions = append(transitions, fmt.Sprintf("%s->%s", from, to))
+			mu.Unlock()
+		}),
+	)
+	factory := func() Service {
+		return &testSvc{startFn: func(ctx context.Context) error {
+			close(secondStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+	}
+	if err := o.Register(&testSvc{startFn: func(ctx context.Context) error { return crashErr }},
+		WithName("healer"),
+		WithSelfHeal(factory),
+		WithBackoff(ConstantBackoff{Delay: time.Millisecond}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer o.Stop(time.Second)
+
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("self-heal never restarted the service")
+	}
+
+	mu.Lock()
+	got := append([]string(nil), transitions...)
+	mu.Unlock()
+	assertStatusSequence(t, got, []string{
+		"registered->starting",
+		"starting->running",
+		"running->crashed",
+		"crashed->running",
+	})
+}
+
+// TestSelfHeal_CleanExit_StatusSequence pins that a cleanly-exiting self-heal
+// service is reported Stopped during the backoff and Running after the restart,
+// without being mislabelled a crash.
+func TestSelfHeal_CleanExit_StatusSequence(t *testing.T) {
+	var transitions []string
+	var mu sync.Mutex
+	var crashCalls atomic.Int32
+	secondStarted := make(chan struct{})
+
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithHealthChecksDisabled(),
+		WithOnCrash(func(name string, err error) { crashCalls.Add(1) }),
+		WithOnStateChange(func(name string, from, to ServiceStatus) {
+			mu.Lock()
+			transitions = append(transitions, fmt.Sprintf("%s->%s", from, to))
+			mu.Unlock()
+		}),
+	)
+	factory := func() Service {
+		return &testSvc{startFn: func(ctx context.Context) error {
+			close(secondStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+	}
+	if err := o.Register(&testSvc{startFn: func(ctx context.Context) error { return nil }},
+		WithName("clean"),
+		WithSelfHeal(factory),
+		WithBackoff(ConstantBackoff{Delay: time.Millisecond}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer o.Stop(time.Second)
+
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("self-heal never restarted the cleanly-exited service")
+	}
+
+	if crashCalls.Load() != 0 {
+		t.Errorf("OnCrash fired %d times for a clean exit, want 0", crashCalls.Load())
+	}
+	if got := o.Metrics().Crashes; got != 0 {
+		t.Errorf("Crashes = %d for a clean exit, want 0", got)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), transitions...)
+	mu.Unlock()
+	assertStatusSequence(t, got, []string{
+		"registered->starting",
+		"starting->running",
+		"running->stopped",
+		"stopped->running",
+	})
 }
 
 func TestSetStatusErr_NilError_FabricatesMessage(t *testing.T) {

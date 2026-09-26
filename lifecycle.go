@@ -286,6 +286,22 @@ func (o *Orchestrator) stopOneService(entry *serviceEntry) error {
 	return stopErr
 }
 
+// runStopSequence runs the before-stop hook, the service's own Stop() (bounded
+// by its per-service WithStopTimeout) and the after-stop hook. It reports
+// whether the sequence ran to completion: a hook that overran (ErrHookTimeout)
+// or a Stop() capped away leaves it unverified. It never touches the entry's
+// status or metrics, so the crash-restart cleanup can reuse it without driving
+// the entry back through the teardown state machine.
+func (o *Orchestrator) runStopSequence(entry *serviceEntry, hookDeadline time.Time) (error, bool) {
+	hookErr := o.callBeforeStopHook(entry, hookDeadline)
+	stopErr, stopReturned := o.stopServiceBounded(entry)
+	if afterHook := afterStopHook(entry, o); afterHook != nil {
+		callVoid(func() { afterHook(entry.name, stopErr) })
+	}
+	complete := !errors.Is(hookErr, ErrHookTimeout) && stopReturned
+	return errors.Join(hookErr, stopErr), complete
+}
+
 // stopOneServiceDeadline is stopOneService with an additional hard caller
 // deadline that bounds the whole stop — the before/after hooks and the service's
 // own Stop() — not only Stop(). The effective Stop() cap remains the smaller of
@@ -310,23 +326,9 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 
 	o.setStatus(entry, StatusStopping)
 
-	// The whole hook+Stop sequence, so the caller's deadline can bound it. It
-	// reports whether it ran to completion: a hook that overran (ErrHookTimeout)
-	// or a Stop() capped away by the per-service timeout leaves the teardown
-	// unverified even though the sequence function itself returned.
-	sequence := func(hookDeadline time.Time) (error, bool) {
-		hookErr := o.callBeforeStopHook(entry, hookDeadline)
-		stopErr, stopReturned := o.stopServiceBounded(entry)
-		if afterHook := afterStopHook(entry, o); afterHook != nil {
-			callVoid(func() { afterHook(entry.name, stopErr) })
-		}
-		complete := !errors.Is(hookErr, ErrHookTimeout) && stopReturned
-		return errors.Join(hookErr, stopErr), complete
-	}
-
 	completed = true
 	if deadline.IsZero() {
-		stopErr, completed = sequence(time.Time{})
+		stopErr, completed = o.runStopSequence(entry, time.Time{})
 	} else {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -342,7 +344,7 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 		}
 		done := make(chan seqResult, 1)
 		go func() {
-			err, ok := sequence(hookDeadline)
+			err, ok := o.runStopSequence(entry, hookDeadline)
 			done <- seqResult{err: err, completed: ok}
 		}()
 		timer := time.NewTimer(remaining)
@@ -577,6 +579,17 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 		}
 	}
 
+	// Classify the exit before the restart decision. A real error (not a
+	// deliberate context cancellation, which the health threshold uses to
+	// trigger a restart) is a crash: report it now, so observers see the
+	// Running→Crashed transition, OnCrash and the Crashes metric even when
+	// self-heal immediately restarts the service. A teardown owns the terminal
+	// status instead, so it must not be pre-empted by a crash report.
+	isCrash := exitErr != nil && !errors.Is(exitErr, context.Canceled)
+	if isCrash && !entry.teardownActive() {
+		o.setStatusErr(entry, StatusCrashed, exitErr)
+	}
+
 	// Check maxRetries.
 	if entry.cfg.maxRetries > 0 && entry.getRetryCount() >= entry.cfg.maxRetries {
 		entry.getLogger().Error("max retries reached, giving up", "retries", entry.getRetryCount())
@@ -589,7 +602,12 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 			// retry limit: the teardown wins, so leave it StatusStopped.
 			o.setStatus(entry, StatusStopped)
 		default:
-			o.setStatusErr(entry, StatusCrashed, exitErr)
+			// A real crash was already reported above (once); a clean or
+			// cancelled exit reaching the retry limit is labelled here, so the
+			// crash that ends the retry budget is still reported exactly once.
+			if !isCrash {
+				o.setStatusErr(entry, StatusCrashed, exitErr)
+			}
 		}
 		o.mu.Lock()
 		if !entry.wgDone {
@@ -603,6 +621,14 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	}
 
 	entry.setRetryCount(entry.getRetryCount() + 1)
+
+	// A clean or cancelled exit that self-heals is not a crash, but the instance
+	// is gone until the restart: report it Stopped so the backoff wait does not
+	// advertise a dead instance as Running. A crashed exit was already reported
+	// Crashed above and keeps that status until the restart.
+	if !isCrash && !entry.teardownActive() {
+		o.setStatus(entry, StatusStopped)
+	}
 
 	// Compute backoff delay.
 	backoff := entry.cfg.backoff
@@ -650,7 +676,12 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 		return
 	}
 
-	o.safeStop(entry) // best-effort cleanup of old instance
+	// Best-effort cleanup of the old instance: its Stop() releases resources.
+	// The status was already resolved for the exit (Crashed for a real crash,
+	// Stopped for a clean or cancelled one) and must not be driven back through
+	// the teardown state machine, which would emit a spurious Stopping→Stopped
+	// and report a self-heal restart as an ordinary stop.
+	_, _ = o.runStopSequence(entry, time.Time{})
 	// The restarted instance gets its own stop-metric latch.
 	entry.stopsCounted.Store(false)
 
@@ -677,6 +708,11 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	// waits for the current run rather than the crashed one.
 	newDone := make(chan struct{})
 	entry.setDone(newDone)
+	// The new instance is live: re-establish StatusRunning so Status()/Statuses()
+	// do not keep reporting the previous crash (or a clean exit's Stopped) while
+	// the service is actually up. Set before the goroutine starts, so a
+	// concurrent StartService sees a running entry and stays idempotent.
+	o.setStatus(entry, StatusRunning)
 	go o.runService(entry, newSc, newDone, restartOwner.id)
 	o.metricsRestarts.Add(1)
 }

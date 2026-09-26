@@ -2945,6 +2945,47 @@ func TestSelfHeal_RestartDrainsCrashedSubs(t *testing.T) {
 	}
 }
 
+// TestStartService_SelfHealBackoff_IsNoOp pins that StartService does not start
+// a second instance behind a live self-heal service whose status is Crashed
+// during a pending restart. The idempotence guard must key on the live instance
+// (entry.done), not on the transient status, or it leaks the wait group: each
+// duplicate adds one, but the entry's exit latch releases only one.
+func TestStartService_SelfHealBackoff_IsNoOp(t *testing.T) {
+	crashErr := errors.New("boom")
+	crashSeen := make(chan struct{}, 1)
+	o := New(
+		WithLogLevel(LogLevelWarn),
+		WithHealthChecksDisabled(),
+		WithOnCrash(func(name string, err error) { crashSeen <- struct{}{} }),
+	)
+	initial := &testSvc{startFn: func(ctx context.Context) error { return crashErr }}
+	if err := o.Register(initial, WithName("healer"),
+		WithSelfHeal(func() Service { return &namedSvc{} }),
+		WithBackoff(ConstantBackoff{Delay: 2 * time.Second}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer o.Stop(time.Second)
+
+	// The crash has been observed, so the status is Crashed and a long backoff
+	// is pending; the instance goroutine is still live (entry.done is open).
+	<-crashSeen
+	startsBefore := o.Metrics().Starts
+
+	if err := o.StartService("healer"); err != nil {
+		t.Fatalf("StartService during self-heal backoff = %v, want nil (no-op)", err)
+	}
+	if got := initial.startCalls.Load(); got != 1 {
+		t.Errorf("StartService started a second instance: startCalls = %d, want 1", got)
+	}
+	if got := o.Metrics().Starts; got != startsBefore {
+		t.Errorf("StartService during backoff changed Starts: %d -> %d", startsBefore, got)
+	}
+}
+
 // TestMessenger_RequestOnDrainedOwner covers the refusal path: Request,
 // RequestAsync and TypedRequest must report an error, never a nil reply.
 func TestMessenger_RequestOnDrainedOwner(t *testing.T) {
