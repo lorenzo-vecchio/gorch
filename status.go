@@ -315,12 +315,22 @@ func (o *Orchestrator) Metrics() Metrics {
 	}
 }
 
-// Done returns a channel that closes when all managed goroutines (services,
-// log-pump, health-check loop) have exited. The orchestrator must be stopped
-// (via Stop or Run returning) before the channel closes. The channel is
-// created lazily and cached: repeated calls return the same channel.
+// Done returns a channel that closes once a Stop call has completed — that is,
+// once Stop (or Run, which calls Stop on the way out) has returned. It is a
+// shutdown-completed signal, not an "all goroutines have exited" signal:
+//
+//   - The orchestrator must be stopped before the channel closes. A hot add or
+//     a restart while running does not close it, and a failed Start — which
+//     never calls Stop — leaves it open.
+//   - The channel is created once in New and is the same on every call; it is
+//     never recreated, so a caller holding it across a failed-Start retry sees
+//     it close only at the eventual Stop.
+//   - A Stop that times out still closes it, even though an abandoned teardown
+//     goroutine may still be running (see Metrics().AbandonedGoroutines). Only
+//     Stop's completion is guaranteed, not that every goroutine has exited.
+//   - A no-op Stop on an orchestrator that was never started closes it too.
 func (o *Orchestrator) Done() <-chan struct{} {
-	return o.doneCh()
+	return o.shutdownDone
 }
 
 // ── Topological sort ──

@@ -49,7 +49,7 @@ Requires Go 1.25+.
 - **Configurable channel buffer** — `SubscribeWithBuffer` for the Messenger.
 - **Health check hooks** — `BeforeHealthCheck` / `AfterHealthCheck` for instrumenting probes.
 - **Messenger.Drain** — Gracefully close all subscriber channels and clear subscriptions.
-- **Done() channel** — Non-blocking shutdown notification; closes when all goroutines finish.
+- **Done() channel** — Non-blocking shutdown notification; closes once `Stop`/`Run` returns (a shutdown-completed signal, not a goroutine count).
 
 ## Concurrency
 
@@ -327,8 +327,9 @@ Bounding a stop means walking away from user code that will not return. A
 before-stop hook or a `Stop()` that outlives its budget is abandoned in its
 goroutine, logged at `Error` level naming the service, and counted in
 `Metrics().AbandonedGoroutines`; the same applies to each wait a failed `Start`
-abandons when its rollback budget expires. The goroutine is not registered with
-`Done()`, so the counter is the only visibility into it. The library cannot
+abandons when its rollback budget expires. `Done()` closes as soon as `Stop`
+returns even while such a goroutine still runs, so the counter is the only
+visibility into it. The library cannot
 force user code to return — the contract is that a hook returns and `Stop()`
 does not block past `WithStopTimeout` — so a non-zero counter means user code
 may be leaked for the process lifetime.
@@ -350,8 +351,10 @@ statically and on a hot add: `Register` rejects an unknown hard dependency
 immediately (dynamically with `ErrDependencyNotFound`). `Count`, `Names`, and
 `Statuses` include an entry the moment it is registered, including one reserved
 mid-`Start` and a staged cron entry, so their status is `StatusStarting`/
-`StatusStopped`/`StatusRegistered` as appropriate. `Done()` closes only after
-`Stop` has wound everything down, even if every service was unregistered first.
+`StatusStopped`/`StatusRegistered` as appropriate. `Done()` is a
+shutdown-completed signal: it closes once `Stop` returns — even if every service
+was unregistered first, or a timed-out stop abandoned a goroutine — and stays
+open until then.
 
 #### Naming policy
 
@@ -792,7 +795,7 @@ orch := gorch.New(
 
 ### Drain and Done
 
-`Drain()` closes all subscriber channels and clears subscriptions. `Done()` returns a channel that closes when all goroutines (services, log-pump, health-check loop) have exited — useful for non-blocking shutdown.
+`Drain()` closes all subscriber channels and clears subscriptions. `Done()` returns a channel that closes once `Stop` (or `Run`, which calls `Stop`) has returned — useful for non-blocking shutdown. It is a **shutdown-completed** signal, not a count of live goroutines: it stays open through hot adds and restarts, stays open after a failed `Start`, and a `Stop` that times out still closes it while an abandoned goroutine may be running. The same channel is returned by every call.
 
 A `ServiceContext.Messenger` is a scoped view: its subscriptions are released when the instance or cron tick that created them ends. After that release (or a global `Drain`), `Subscribe` on that same view returns an already-closed channel, and `Request`/`RequestAsync` return an error instead of a nil reply — a goroutine that outlived its service cannot resurrect its subscriptions. A newly created view still subscribes normally.
 
@@ -800,7 +803,10 @@ A `ServiceContext.Messenger` is a scoped view: its subscriptions are released wh
 // Gracefully flush pending messages before shutdown.
 messenger.Drain()
 
-// Non-blocking wait for full shutdown.
+// Non-blocking wait for shutdown to complete (Stop/Run returned).
+// Done() is not a guarantee that every goroutine has exited: on a
+// timed-out Stop an abandoned goroutine may still be running. Watch
+// Metrics().AbandonedGoroutines for that.
 select {
 case <-orch.Done():
 case <-time.After(10 * time.Second):

@@ -485,8 +485,12 @@ type Orchestrator struct {
 	stopOnce  sync.Once
 	startOnce sync.Once
 
-	// doneCh lazily caches the Done() channel via sync.OnceValue.
-	doneCh func() <-chan struct{}
+	// shutdownDone is closed exactly once, by signalShutdownDone, when a Stop
+	// call completes. Done() returns it directly: unlike the old
+	// sync.OnceValue that wrapped o.wg.Wait, it can never close early when a
+	// hot add or restart reuses the WaitGroup while services are live.
+	shutdownDone     chan struct{}
+	shutdownDoneOnce sync.Once
 
 	metricsStarts      atomic.Int64
 	metricsStops       atomic.Int64
@@ -531,23 +535,19 @@ func New(opts ...Option) *Orchestrator {
 	if cfg.failedStartTimeout == 0 {
 		cfg.failedStartTimeout = 30 * time.Second
 	}
-	o := &Orchestrator{
-		cfg:       cfg,
-		messenger: newMessenger(),
-		nameIndex: make(map[string]*serviceEntry),
+	return &Orchestrator{
+		cfg:          cfg,
+		messenger:    newMessenger(),
+		nameIndex:    make(map[string]*serviceEntry),
+		shutdownDone: make(chan struct{}),
 	}
-	o.doneCh = sync.OnceValue(func() <-chan struct{} {
-		ch := make(chan struct{})
-		go func() {
-			o.wg.Wait()
-			if o.logPumpDone != nil {
-				<-o.logPumpDone
-			}
-			close(ch)
-		}()
-		return ch
-	})
-	return o
+}
+
+// signalShutdownDone closes the Done channel at most once. Stop defers it on
+// every return path — including its never-started no-op — so Done means "a Stop
+// call completed", not "every goroutine exited".
+func (o *Orchestrator) signalShutdownDone() {
+	o.shutdownDoneOnce.Do(func() { close(o.shutdownDone) })
 }
 
 // Register adds a service to the orchestrator.
@@ -1207,6 +1207,12 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline 
 func (o *Orchestrator) Stop(timeout time.Duration) error {
 	var stopErr error
 	o.stopOnce.Do(func() {
+		// Done is a shutdown-completed signal: it closes when this Stop returns,
+		// on every path (including the never-started no-op below and a Stop that
+		// timed out). It deliberately does not wait on o.wg, which a live hot add
+		// or restart reuses and which a timed-out Stop may leave non-zero.
+		defer o.signalShutdownDone()
+
 		o.mu.RLock()
 		if !o.started {
 			o.mu.RUnlock()
