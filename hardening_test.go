@@ -1412,10 +1412,10 @@ func TestFailedStart_HotAddedEntryLoggerStillWorks(t *testing.T) {
 			}
 
 			// Tear the retry down so the pump exits and the pipe can be read.
-			// Issue #26's stale-wgDone leak for a started survivor makes this
-			// whole Stop report ErrStopTimeout, so its error is not asserted:
-			// this test is scoped to the logger concern.
-			_ = o.Stop(200 * time.Millisecond)
+			// With the issue #26 stale-wgDone leak fixed, Stop is clean.
+			if err := o.Stop(time.Second); err != nil {
+				t.Fatalf("retry Stop = %v, want nil", err)
+			}
 			select {
 			case <-o.logPumpDone:
 			case <-time.After(2 * time.Second):
@@ -1459,9 +1459,10 @@ func TestFailedStart_HotAddedEntryLoggerStillWorks(t *testing.T) {
 			t.Fatalf("custom logger recorded %d retry lines, want 1", got)
 		}
 
-		// Cleanup; see the default-logger subtest for why the whole Stop's error
-		// is not asserted.
-		_ = o.Stop(200 * time.Millisecond)
+		// Cleanup: with the stale-wgDone leak fixed the whole Stop is clean.
+		if err := o.Stop(time.Second); err != nil {
+			t.Fatalf("Stop = %v, want nil", err)
+		}
 	})
 }
 
@@ -1469,9 +1470,9 @@ func TestFailedStart_HotAddedEntryLoggerStillWorks(t *testing.T) {
 // full participant in the retried Start, not merely a log destination: it
 // reaches StatusRunning, it is rebound to the retry's logger, and its own Stop
 // lifecycle completes cleanly (Stop() runs, StopService returns nil, status
-// returns to Stopped). Issue #26's stale-wgDone leak for a *started* survivor
-// makes a whole-orchestrator Stop report ErrStopTimeout here, so that path is
-// deliberately not asserted and the test is scoped to the survivor itself.
+// returns to Stopped). The whole-orchestrator Stop is asserted clean too: the
+// issue #26 stale-wgDone leak for a started survivor is fixed, so the wait
+// group reaches zero and Stop returns nil.
 func TestFailedStart_ThenRetry_HotAddedEntryIsUsable(t *testing.T) {
 	o := New(WithHealthChecksDisabled(), WithLogLevel(LogLevelInfo))
 	contexts, retry := startWithHotAddFailure(t, o)
@@ -1515,9 +1516,17 @@ func TestFailedStart_ThenRetry_HotAddedEntryIsUsable(t *testing.T) {
 		t.Fatalf("survivor status after StopService = %v, want StatusStopped", s)
 	}
 
-	// Bound the teardown of the remaining services; the error is expected to be
-	// ErrStopTimeout because of the issue #26 leak, so it is not asserted.
-	_ = o.Stop(200 * time.Millisecond)
+	// The remaining services tear down cleanly: with the issue #26 stale-wgDone
+	// leak fixed there is no outstanding wg.Done, so Stop returns nil and Done()
+	// closes.
+	if err := o.Stop(time.Second); err != nil {
+		t.Fatalf("whole Stop after the survivor's teardown = %v, want nil", err)
+	}
+	select {
+	case <-o.Done():
+	case <-time.After(time.Second):
+		t.Error("Done() did not close after Stop")
+	}
 }
 
 // TestFailedStartTimeout_DefaultAndOverride pins the configurable rollback
@@ -1811,4 +1820,357 @@ func TestAbandonedGoroutines_HappyPathStaysZero(t *testing.T) {
 		t.Fatalf("AbandonedGoroutines = %d on the happy path, want 0", got)
 	}
 	_ = o.Stop(time.Second)
+}
+
+// ── Issue #26: per-entry state destroyed by Unregister and clean re-add ──
+
+// readWgDone reads the wait-group latch under the orchestrator lock.
+func readWgDone(o *Orchestrator, e *serviceEntry) bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return e.wgDone
+}
+
+// TestUnregister_ReleasesAllState pins the full per-entry state set Unregister
+// destroys: the registry slots in both directions, the permanent removed flag,
+// the instance/teardown/cron resources, the counters, and the latch and
+// accounting flags. After Unregister every instance-scoped field is back to the
+// shared "fresh" value resetEntryLocked defines, and no Messenger owner id
+// survives in either map.
+func TestUnregister_ReleasesAllState(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+
+	// A self-heal crasher advances retryCount into the non-zero state the reset
+	// must clear.
+	sig := make(chan struct{})
+	if err := o.Register(&crashSignalSvc{sig: sig}, WithName("heal"),
+		WithSelfHeal(func() Service { return &namedSvc{} }),
+		WithBackoff(ConstantBackoff{Delay: 20 * time.Millisecond}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&namedSvc{}, WithName("p")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&namedSvc{}, WithName("c"), WithCron("0 0 0 1 1 *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	<-sig
+
+	healEntry := entryNamed(t, o, "heal")
+	deadline := time.After(2 * time.Second)
+	for healEntry.getRetryCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("retry counter never advanced on the self-heal entry")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	pEntry := entryNamed(t, o, "p")
+	cEntry := entryNamed(t, o, "c")
+
+	pOwner := pEntry.currentOwner()
+	if pOwner == 0 || !rootHasOwner(o, pOwner) {
+		t.Fatalf("running service owner %d is not registered in the root map", pOwner)
+	}
+	if cEntry.cronID == 0 {
+		t.Fatal("cron entry was not scheduled")
+	}
+	if cEntry.cronGeneration() == 0 {
+		t.Fatal("cron entry has no schedule generation")
+	}
+
+	for _, name := range []string{"heal", "p", "c"} {
+		if err := o.Unregister(name, time.Second); err != nil {
+			t.Fatalf("Unregister(%s): %v", name, err)
+		}
+	}
+
+	if o.Count() != 0 {
+		t.Fatalf("Count = %d after Unregister, want 0", o.Count())
+	}
+	o.mu.RLock()
+	entriesLen := len(o.entries)
+	indexLen := len(o.nameIndex)
+	o.mu.RUnlock()
+	if entriesLen != 0 {
+		t.Errorf("entries = %d after Unregister, want 0", entriesLen)
+	}
+	if indexLen != 0 {
+		t.Errorf("nameIndex = %d after Unregister, want 0", indexLen)
+	}
+	if !entriesRemovedFromSlice(o, "heal", "p", "c") {
+		t.Error("a removed entry survived in o.entries")
+	}
+	if rootHasOwner(o, pOwner) {
+		t.Errorf("owner %d survived Unregister in the root map", pOwner)
+	}
+
+	for _, e := range []*serviceEntry{healEntry, pEntry, cEntry} {
+		checks := []struct {
+			field string
+			ok    bool
+		}{
+			{"removed", e.removed.Load()},
+			{"owner", e.currentOwner() == 0},
+			{"cancel", e.getCancel() == nil},
+			{"done", e.getDone() == nil},
+			{"teardown", e.getTeardown() == nil},
+			{"teardownCancel", e.getTeardownCancel() == nil},
+			{"retryCount", e.getRetryCount() == 0},
+			{"stableSince", e.getStableSince().IsZero()},
+			{"healthFailures", e.getHealthFailures() == 0},
+			{"cronID", e.cronID == 0},
+			{"status", o.statusOf(e) == StatusRegistered},
+			{"starting", !e.starting.Load()},
+			{"removing", !e.removing.Load()},
+			{"running", !e.running.Load()},
+			{"wgDone", !readWgDone(o, e)},
+			{"stopsCounted", !e.stopsCounted.Load()},
+			{"startGoid", e.startGoid.Load() == 0},
+			{"stopGoid", e.stopGoid.Load() == 0},
+		}
+		for _, c := range checks {
+			if !c.ok {
+				t.Errorf("entry %s: %s was not reset by Unregister", e.name, c.field)
+			}
+		}
+		if ids := entryOwnerIDs(e); len(ids) != 0 {
+			t.Errorf("entry %s holds owners %v after Unregister, want none", e.name, ids)
+		}
+	}
+
+	e := cEntry
+	e.cronTrackMu.Lock()
+	cronCtx, cronCancel := e.cronCtx, e.cronCancel
+	cronActive, cronDraining, cronDrained := e.cronActive, e.cronDraining, e.cronDrained
+	e.cronTrackMu.Unlock()
+	if cronCtx != nil || cronCancel != nil || cronActive != 0 || cronDraining || cronDrained != nil {
+		t.Errorf("cron accounting survived Unregister: ctx=%v cancel=%v active=%d draining=%v drained=%v",
+			cronCtx != nil, cronCancel != nil, cronActive, cronDraining, cronDrained != nil)
+	}
+}
+
+// entriesRemovedFromSlice reports whether none of the named entries is still in
+// o.entries.
+func entriesRemovedFromSlice(o *Orchestrator, names ...string) bool {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	for _, e := range o.entries {
+		if want[e.name] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestUnregister_RemovesFromNameIndexAndEntries pins that Unregister drops the
+// entry from both registry slots, so lookupEntry (which reads nameIndex first)
+// cannot resolve a removed entry and registerDynamic's duplicate-name check
+// cannot be defeated by a stale index row.
+func TestUnregister_RemovesFromNameIndexAndEntries(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Register(&namedSvc{}, WithName("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&namedSvc{}, WithName("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	if err := o.Unregister("a", time.Second); err != nil {
+		t.Fatalf("Unregister(a): %v", err)
+	}
+
+	o.mu.RLock()
+	_, inIndex := o.nameIndex["a"]
+	entriesCount := 0
+	for _, e := range o.entries {
+		if e.name == "a" {
+			entriesCount++
+		}
+	}
+	o.mu.RUnlock()
+	if inIndex {
+		t.Error("removed entry is still in nameIndex")
+	}
+	if entriesCount != 0 {
+		t.Errorf("removed entry appears %d times in o.entries, want 0", entriesCount)
+	}
+	names := o.Names()
+	if len(names) != 1 || names[0] != "b" {
+		t.Errorf("Names() = %v after Unregister, want [b]", names)
+	}
+	// The freed name can be re-registered: the duplicate check sees no stale row.
+	if err := o.Register(&namedSvc{}, WithName("a")); err != nil {
+		t.Fatalf("re-register the freed name: %v", err)
+	}
+}
+
+// TestUnregister_ThenHealth_NoStaleKey pins the v0.8.0 guarantee that a removed
+// name never appears in Health()'s result, retested after the per-entry state
+// work: the probe iterates the live graph and re-validates membership after the
+// probe, so neither the snapshot nor the post-probe check may resurrect it.
+func TestUnregister_ThenHealth_NoStaleKey(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Register(&healthSvc{}, WithName("h")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+	waitForStatus(t, o, "h", StatusRunning)
+
+	if _, ok := o.Health()["h"]; !ok {
+		t.Fatal("running service is missing from Health()")
+	}
+	if err := o.Unregister("h", time.Second); err != nil {
+		t.Fatalf("Unregister(h): %v", err)
+	}
+	if err, ok := o.Health()["h"]; ok {
+		t.Errorf("removed name is still in Health() = %v", err)
+	}
+	if _, ok := o.Status("h"); ok {
+		t.Error("removed name still reports a status")
+	}
+}
+
+// TestAutoNaming_NeverReusesName pins the naming policy: the auto-name counter
+// is monotonic, so a freed $N is never handed out again — not even after the
+// entry that held it is unregistered. Unregister frees an explicitly named
+// entry, but the sequence never winds back.
+func TestAutoNaming_NeverReusesName(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	if err := o.Register(&namedSvc{}, WithName("named")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&namedSvc{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := o.Status("$2"); !ok {
+		t.Fatalf("auto-named service is not $2; Names()=%v", o.Names())
+	}
+	if err := o.Unregister("$2", time.Second); err != nil {
+		t.Fatalf("Unregister($2): %v", err)
+	}
+	if err := o.Register(&namedSvc{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := o.Status("$2"); ok {
+		t.Error("$2 was reused after its entry was unregistered")
+	}
+	if _, ok := o.Status("$3"); !ok {
+		t.Errorf("the third registration is not $3; Names()=%v", o.Names())
+	}
+}
+
+// TestFailedStart_ThenRetry_NoStaleWgDone pins the issue #26 stale-wgDone fix:
+// a service hot-added and started while a Start is failing survives the reset
+// outside its snapshot with wgDone still set. The retried Start must start it
+// with a fresh latch, so its exit decrements the wait group, Done() closes, and
+// Stop does not report ErrStopTimeout.
+func TestFailedStart_ThenRetry_NoStaleWgDone(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	contexts, retry := startWithHotAddFailure(t, o)
+
+	select {
+	case <-contexts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hot never started")
+	}
+	if err := retry(); err != nil {
+		t.Fatalf("retry Start: %v", err)
+	}
+	waitForStatus(t, o, "hot", StatusRunning)
+	select {
+	case <-contexts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hot did not restart on the retry")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- o.Stop(time.Second) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop after the retry = %v, want nil (stale wgDone leak)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop hung after the retry")
+	}
+	select {
+	case <-o.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done() did not close after Stop: the wait group did not reach zero")
+	}
+}
+
+// TestFailedStart_ThenRetry_ReschedulesCron pins that the failed-Start reset
+// discards a cron entry's stale schedule id: the scheduler is torn down, so the
+// retried Start must re-schedule the entry instead of treating the dead id as a
+// live schedule (which would leave the service silently never ticking).
+func TestFailedStart_ThenRetry_ReschedulesCron(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	ticks := make(chan struct{}, 8)
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		select {
+		case ticks <- struct{}{}:
+		default:
+		}
+		return nil
+	}}
+	if err := o.Register(svc, WithName("cron"), WithCron("* * * * * *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	fail := true
+	if err := o.Register(&namedSvc{}, WithName("gate"), WithOnBeforeStart(func(string) error {
+		if fail {
+			return errors.New("gate closed")
+		}
+		return nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.Start(); err == nil {
+		_ = o.Stop(time.Second)
+		t.Fatal("first Start must fail")
+	}
+	// A tick from the failed attempt, if any, must not count as the retry's.
+	for {
+		select {
+		case <-ticks:
+			continue
+		default:
+		}
+		break
+	}
+	fail = false
+	if err := o.Start(); err != nil {
+		t.Fatalf("retry Start: %v", err)
+	}
+	defer func() { _ = o.Stop(time.Second) }()
+
+	select {
+	case <-ticks:
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatal("cron entry never ticked after the retry: the stale schedule id was not rescheduled")
+	}
 }

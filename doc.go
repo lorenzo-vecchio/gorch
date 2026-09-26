@@ -106,6 +106,15 @@
 //     reset is best-effort — a goroutine that
 //     ignores cancellation may outlive the failed Start — so the orchestrator is
 //     left restartable and Start can be retried.
+//   - Unregister discards the removed service's per-instance state — instance
+//     and teardown contexts, exit channel, retry and health counters, stability
+//     window, liveness and accounting flags, owner ids, and cron accounting —
+//     and drops it from both the entries slice and the name index. The reset
+//     shares one definition of "fresh" with the failed-Start retry; re-registering
+//     the same name creates a brand-new entry that inherits nothing from the
+//     previous incarnation. The auto-name sequence is monotonic: an omitted
+//     WithName gets the next $N, and a value is never reused, even after its
+//     entry is unregistered.
 //   - A ServiceLogger never blocks: it drops an entry when the log channel is
 //     full or its pump has stopped, so a torn-down log channel cannot stall a
 //     service or a Stop. A service hot-added during a failed Start keeps a
