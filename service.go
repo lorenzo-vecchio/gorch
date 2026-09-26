@@ -223,9 +223,10 @@ type stopConfig struct {
 // WithCascadeStop extends StopService/Unregister to the target's transitive
 // hard dependents (services whose DependsOn chain reaches the target). They are
 // stopped — or removed — in reverse topological order under the one shared
-// timeout. Without it both operations refuse when a running hard dependent
-// exists (ErrHasDependents). Soft dependencies never block and are never
-// cascaded.
+// timeout. Without it both operations refuse when a hard dependent is Running or
+// Starting (ErrHasDependents, with the message naming each blocker and its
+// status). A dependent already Stopping is left to its own in-flight teardown,
+// never stopped twice. Soft dependencies never block and are never cascaded.
 func WithCascadeStop() StopOption {
 	return func(c *stopConfig) { c.cascade = true }
 }
@@ -252,8 +253,12 @@ var (
 	ErrUnsupportedOption = errors.New("gorch: unsupported option combination")
 
 	// Dynamic membership sentinels. See the Contract section of README.md.
-	ErrServiceNotFound      = errors.New("gorch: service not found")
-	ErrHasDependents        = errors.New("gorch: service has running dependents")
+	ErrServiceNotFound = errors.New("gorch: service not found")
+	// ErrHasDependents reports that a plain StopService/Unregister would break a
+	// hard dependent that is Running or Starting. The returned error names each
+	// blocker and its status; pass WithCascadeStop to tear those dependents down
+	// too. Dependents in any other status do not block.
+	ErrHasDependents        = errors.New("gorch: service has active dependents")
 	ErrOrchestratorStopping = errors.New("gorch: orchestrator is stopping")
 	ErrOrchestratorStopped  = errors.New("gorch: orchestrator already stopped")
 	// ErrOrchestratorNotStarted is returned by StartService/StartGroup when the

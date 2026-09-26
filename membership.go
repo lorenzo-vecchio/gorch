@@ -114,16 +114,21 @@ func (o *Orchestrator) StartService(name string) error {
 // in Names()/Statuses(), can be started again with StartService, and its
 // Messenger subscriptions are released on stop.
 //
-// A running hard dependent blocks the stop with ErrHasDependents unless
-// WithCascadeStop() is passed, in which case the target and its transitive hard
-// dependents are stopped in reverse topological order. Soft dependencies never
-// block and are never cascaded. timeout bounds the whole stop — the service's
-// own Stop() and the wait for its instance or in-flight cron ticks to exit — and
-// is shared across a cascade; a non-positive timeout waits indefinitely. A
-// per-service WithStopTimeout still caps Stop() when it is smaller than the
-// remaining budget. Returns ErrServiceNotFound for an unknown name and
-// ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
-// shutdown has begun. Thread-safe.
+// A hard dependent that is Running or Starting blocks the stop with
+// ErrHasDependents, and the error names every blocker with its status (for
+// example "api (starting)"). Every other status — Stopping, Registered,
+// Crashed, Stopped, Succeeded — is non-blocking: the dependent has no instance
+// to break, is already on its way down, or has finished its job. With
+// WithCascadeStop() the target and its transitive hard dependents are stopped
+// in reverse topological order, except a dependent already Stopping, which is
+// left to its own in-flight teardown rather than stopped a second time. Soft
+// dependencies never block and are never cascaded. timeout bounds the whole
+// stop — the service's own Stop() and the wait for its instance or in-flight
+// cron ticks to exit — and is shared across a cascade; a non-positive timeout
+// waits indefinitely. A per-service WithStopTimeout still caps Stop() when it is
+// smaller than the remaining budget. Returns ErrServiceNotFound for an unknown
+// name and ErrOrchestratorStopping/ErrOrchestratorStopped once
+// whole-orchestrator shutdown has begun. Thread-safe.
 func (o *Orchestrator) StopService(name string, timeout time.Duration, opts ...StopOption) error {
 	return o.tearDown(name, false, timeout, opts)
 }
@@ -225,6 +230,14 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 	}
 	var stopErr error
 	for _, e := range set {
+		// A hard dependent already Stopping is mid-teardown (or was left there
+		// by a timed-out stop): running its sequence again would fire its
+		// before/after-stop hooks and Stop() a second time. Skip it and leave it
+		// to finish on its own. The target is always processed, so a caller's
+		// explicit stop is never silently ignored.
+		if e != entry && o.statusOf(e) == StatusStopping {
+			continue
+		}
 		if err := o.stopEntry(e, deadline); err != nil {
 			stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", e.name, err))
 		}
@@ -275,9 +288,13 @@ func (o *Orchestrator) hardDependentsOrderLocked(target *serviceEntry) []*servic
 	return order
 }
 
-// activeDependentsLocked returns the names in set, other than target, that are
-// Running or Starting: the hard dependents a plain stop would break. The caller
-// must hold o.mu.
+// activeDependentsLocked returns the hard dependents in set, other than target,
+// that are Starting or Running: the ones a plain stop would break. Each is
+// rendered as "name (status)" so the caller's error says whether a dependent
+// has an instance (running) or has only been promised one (starting). Every
+// other status is non-blocking: a Stopping dependent is already going down, a
+// Registered one has no instance yet, and Crashed/Stopped/Succeeded are inert.
+// The caller must hold o.mu.
 func (o *Orchestrator) activeDependentsLocked(target *serviceEntry, set []*serviceEntry) []string {
 	var blockers []string
 	for _, e := range set {
@@ -285,7 +302,7 @@ func (o *Orchestrator) activeDependentsLocked(target *serviceEntry, set []*servi
 			continue
 		}
 		if s := o.statusOf(e); s == StatusRunning || s == StatusStarting {
-			blockers = append(blockers, e.name)
+			blockers = append(blockers, fmt.Sprintf("%s (%s)", e.name, s))
 		}
 	}
 	return blockers

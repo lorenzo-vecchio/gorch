@@ -70,7 +70,13 @@
 //     does not implement HealthChecker is reported with a nil error.
 //   - A hot add that names a hard dependency which is being removed fails with
 //     ErrDependencyRemoving: a retryable "not now" condition distinct from
-//     ErrHasDependents, which is only about the target's own running dependents.
+//     ErrHasDependents, which is only about the target's own hard dependents.
+//   - A plain StopService/Unregister is refused with ErrHasDependents when a
+//     hard dependent is Running or Starting, and the error names each blocker
+//     with its status. Dependents in any other status (Stopping, Registered,
+//     Crashed, Stopped, Succeeded) do not block. WithCascadeStop tears the
+//     dependents down in reverse topological order; a dependent already Stopping
+//     is left to its own in-flight teardown rather than stopped a second time.
 //   - The cycle check walks each node once, so a diamond costs O(V+E) rather
 //     than one walk per path. The walk is depth-capped: a chain deeper than
 //     10000 edges fails registration with

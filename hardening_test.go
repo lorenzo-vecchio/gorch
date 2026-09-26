@@ -3,10 +3,12 @@ package gorch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -555,6 +557,139 @@ func TestCascade_StartingDependentBlocks(t *testing.T) {
 	}
 	if s, _ := o.Status("dep"); s != StatusStopped {
 		t.Fatalf("cascaded dependent status = %v, want stopped", s)
+	}
+}
+
+// TestStop_NonRunningDependents_Matrix pins the exact plain-stop decision for a
+// hard dependent in every ServiceStatus. Only Starting and Running block, with
+// ErrHasDependents naming the dependent and its status; each of the other five
+// leaves the dependent untouched and lets the target stop.
+func TestStop_NonRunningDependents_Matrix(t *testing.T) {
+	blocking := map[ServiceStatus]bool{
+		StatusStarting: true,
+		StatusRunning:  true,
+	}
+	statuses := []ServiceStatus{
+		StatusRegistered,
+		StatusStarting,
+		StatusRunning,
+		StatusStopping,
+		StatusStopped,
+		StatusCrashed,
+		StatusSucceeded,
+	}
+	for _, st := range statuses {
+		t.Run(st.String(), func(t *testing.T) {
+			o := New(WithHealthChecksDisabled())
+			dep := &testSvc{}
+			if err := o.Register(&namedSvc{}, WithName("base")); err != nil {
+				t.Fatal(err)
+			}
+			if err := o.Register(dep, WithName("dep"), DependsOn("base")); err != nil {
+				t.Fatal(err)
+			}
+			if err := o.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer o.Stop(time.Second)
+
+			// Set the dependent's status deterministically, white-box, so every
+			// row of the matrix is exercised without racing the lifecycle.
+			o.setStatus(entryNamed(t, o, "dep"), st)
+
+			err := o.StopService("base", time.Second)
+			if blocking[st] {
+				if !errors.Is(err, ErrHasDependents) {
+					t.Fatalf("plain stop with a %s dependent = %v, want ErrHasDependents", st, err)
+				}
+				want := fmt.Sprintf("dep (%s)", st)
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must name the dependent and its status (%q)", err, want)
+				}
+				if s, _ := o.Status("base"); s != StatusRunning {
+					t.Errorf("base status = %v, want Running (stop refused)", s)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("plain stop with a %s dependent = %v, want nil", st, err)
+				}
+				if s, _ := o.Status("base"); s != StatusStopped {
+					t.Errorf("base status = %v, want Stopped", s)
+				}
+				if s, _ := o.Status("dep"); s != st {
+					t.Errorf("dependent status = %v, want %v (untouched)", s, st)
+				}
+			}
+			if n := dep.stopCalls.Load(); n != 0 {
+				t.Errorf("dependent Stop() called %d times, want 0", n)
+			}
+		})
+	}
+}
+
+// TestCascade_SkipsStoppingDependent pins that a cascade does not stop a hard
+// dependent that is already Stopping a second time. Its before/after-stop hooks
+// and Stop() ran once for the in-flight teardown and must not run again, while
+// the target still stops.
+func TestCascade_SkipsStoppingDependent(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	release := make(chan struct{})
+	var beforeStops, afterStops atomic.Int32
+	dep := &testSvc{
+		startFn: func(ctx context.Context) error { <-release; return nil },
+	}
+	if err := o.Register(&namedSvc{}, WithName("base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(dep, WithName("dep"), DependsOn("base"),
+		WithOnBeforeStop(func(string) error { beforeStops.Add(1); return nil }),
+		WithOnAfterStop(func(string, error) { afterStops.Add(1) }),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		close(release)
+		_ = o.Stop(2 * time.Second)
+	})
+
+	// A first stop times out because the instance ignores cancellation: dep is
+	// left StatusStopping, its hooks and Stop() already run exactly once.
+	if err := o.StopService("dep", 30*time.Millisecond); !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("first stop = %v, want ErrStopTimeout", err)
+	}
+	if s, _ := o.Status("dep"); s != StatusStopping {
+		t.Fatalf("dep status = %v, want Stopping after the timed-out stop", s)
+	}
+	if n := dep.stopCalls.Load(); n != 1 {
+		t.Fatalf("dep Stop() ran %d times before the cascade, want 1", n)
+	}
+	if n := beforeStops.Load(); n != 1 {
+		t.Fatalf("dep before-stop ran %d times before the cascade, want 1", n)
+	}
+	if n := afterStops.Load(); n != 1 {
+		t.Fatalf("dep after-stop ran %d times before the cascade, want 1", n)
+	}
+
+	if err := o.StopService("base", time.Second, WithCascadeStop()); err != nil {
+		t.Fatalf("cascade stop = %v", err)
+	}
+	if s, _ := o.Status("base"); s != StatusStopped {
+		t.Errorf("target base status = %v, want Stopped", s)
+	}
+	if s, _ := o.Status("dep"); s != StatusStopping {
+		t.Errorf("dependent status = %v, want Stopping (left to its own teardown)", s)
+	}
+	if n := dep.stopCalls.Load(); n != 1 {
+		t.Errorf("cascade called dep Stop() again: %d total, want 1", n)
+	}
+	if n := beforeStops.Load(); n != 1 {
+		t.Errorf("cascade re-ran the dep before-stop hook: %d total, want 1", n)
+	}
+	if n := afterStops.Load(); n != 1 {
+		t.Errorf("cascade re-ran the dep after-stop hook: %d total, want 1", n)
 	}
 }
 

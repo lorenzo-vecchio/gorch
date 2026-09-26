@@ -60,7 +60,7 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 |--------------|-------------------------------|
 | `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A hot add made while `Start` runs lands either in `Start`'s snapshot or, after it, live as `StatusRegistered` (never auto-started); before `Start` it is part of the static graph. It is rejected with `ErrOrchestratorStopping` while `Stop` runs and `ErrOrchestratorStopped` after `Stop`. |
 | `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning`; an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with another goroutine's reservation returns the transient `ErrMembershipBusy` (poll `Busy`); re-entering from the entry's own `Start` returns `ErrReentrantMembership`. |
-| `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents` unless `WithCascadeStop` is passed; with cascade, every transitive hard dependent is stopped/removed, while non-running ones are marked `Stopped` without blocking. A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
+| `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents`, and the error names each blocker with its status (e.g. `api (starting)`); every other dependent status — `Stopping`, `Registered`, `Crashed`, `Stopped`, `Succeeded` — does not block, so a plain stop proceeds and leaves the dependent untouched. With `WithCascadeStop`, every transitive hard dependent is stopped/removed in reverse topological order, except one already `Stopping`, which is left to its own in-flight teardown rather than stopped a second time (no double `Stop()` or hooks). A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
 | `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the **whole-orchestrator lifecycle** is single-shot, so after a successful `Stop` neither can run again. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
 | `Status`, `Statuses`, `Names`, `Count`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
@@ -97,8 +97,12 @@ These guarantees are part of the public API and are relied upon by callers.
   cannot leak the id. Owner ids are monotonic and never reused, so a drained id
   is never minted into a later view. `Unregister` also drops
   the cron schedule. A stop is refused
-  with `ErrHasDependents` while a hard dependent is running, unless `WithCascadeStop`
-  is passed; soft dependencies never block and are never cascaded. A membership
+  with `ErrHasDependents` while a hard dependent is `Running` or `Starting` (the
+  error names each blocker and its status), unless `WithCascadeStop` is passed;
+  a dependent that is `Stopping`, `Registered`, `Crashed`, `Stopped`, or
+  `Succeeded` does not block, and a cascade leaves an already-`Stopping`
+  dependent to its own teardown instead of stopping it twice. Soft dependencies
+  never block and are never cascaded. A membership
   op re-entered from the target's own `Start`/`Stop` returns
   `ErrReentrantMembership` (a programming error), while one colliding with
   another goroutine's in-flight reservation returns the retryable
@@ -163,7 +167,7 @@ Sentinel errors returned by the orchestrator:
 | `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
 | `ErrMembershipBusy` | `StartService`, `StopService`, `Unregister` | A membership op collided with a reservation held by another goroutine's in-flight `Start`/`Stop`/group operation. Transient: poll `Busy(name)` or retry once the reservation clears. |
 | `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
-| `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break running hard dependents (pass `WithCascadeStop`). |
+| `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break a hard dependent that is `Running` or `Starting`; the message names each blocker and its status. Pass `WithCascadeStop` to tear those dependents down too. Dependents in `Stopping`, `Registered`, `Crashed`, `Stopped`, or `Succeeded` do not block. |
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
 | `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is not `StatusRunning`. |
 | `ErrDependencyRemoving` | `Register` | A hot-added service names a hard dependency that is being torn down (being stopped/removed concurrently); retry after the teardown completes. |
@@ -280,14 +284,15 @@ _ = orch.StopService("late", 5*time.Second)
 _ = orch.Unregister("late", 5*time.Second)
 ```
 
-A plain stop refuses to break a running hard dependent:
+A plain stop refuses to break a hard dependent that is `Running` or `Starting`:
 
 ```go
 _ = orch.StopService("db", 5*time.Second)
-// ErrHasDependents: db is depended on by api
+// ErrHasDependents: service has active dependents: db is depended on by api (running)
 
 // Tear down the target and its transitive hard dependents in reverse
-// topological order, under one shared timeout.
+// topological order, under one shared timeout. A dependent already stopping is
+// left to its own teardown and never stopped twice.
 _ = orch.StopService("db", 5*time.Second, gorch.WithCascadeStop())
 ```
 
