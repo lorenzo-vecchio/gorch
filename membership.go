@@ -370,7 +370,16 @@ func (o *Orchestrator) removeEntryLocked(entry *serviceEntry) {
 
 // newOwner allocates a fresh Messenger owner for a running instance or cron
 // tick, registers its liveness token immediately (so a drain that lands before
-// the view is built still retires it), and records it on the entry.
+// the view is built still retires it), and records it on the entry. The id is
+// drawn from the monotonic ownerSeq and never reused.
+//
+// The owner is released when its instance or tick exits (handleServiceDone or
+// invokeCron) or, if that goroutine is abandoned by a deadline, by drainService
+// sweeping the entry's live ids on teardown. The root registration happens
+// before the entry records the id, and every release path removes from the entry
+// before draining the root, so the root map always holds at least the ids the
+// entries claim: the two maps cannot diverge into a stale entry id the root has
+// already forgotten.
 func (o *Orchestrator) newOwner(entry *serviceEntry) *ownerState {
 	id := o.ownerSeq.Add(1)
 	st := o.messenger.registerOwner(id)
@@ -380,6 +389,8 @@ func (o *Orchestrator) newOwner(entry *serviceEntry) *ownerState {
 
 // releaseOwner drains and forgets one owner of the entry when its instance or
 // tick exits. Owner id 0 is the unowned root registry and is never released.
+// It is idempotent, so a path that also sweeps the owner (or releases it twice,
+// as handleServiceDone's explicit release and its defer do) is safe.
 func (o *Orchestrator) releaseOwner(entry *serviceEntry, id uint64) {
 	if id == 0 {
 		return
@@ -393,6 +404,11 @@ func (o *Orchestrator) releaseOwner(entry *serviceEntry, id uint64) {
 // counterpart of the orchestrator-wide Drain and is used when a service leaves
 // the graph or an instance exits. Repeated calls are a no-op; other services
 // keep their subscriptions and continue to receive Publish. Thread-safe.
+//
+// It is also the teardown safety net for an abandoned goroutine: a cron tick or
+// instance whose deadline expired may never reach its deferred releaseOwner, so
+// takeOwners drains the ids it still owns regardless of whether that goroutine
+// runs again.
 func (o *Orchestrator) drainService(entry *serviceEntry) {
 	for _, id := range entry.takeOwners() {
 		o.messenger.drainOwner(id)

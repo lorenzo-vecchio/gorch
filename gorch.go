@@ -420,7 +420,10 @@ type Orchestrator struct {
 	entries   []*serviceEntry
 	nameIndex map[string]*serviceEntry // name -> entry lookup
 	autoSeq   int                      // auto-name sequence counter
-	ownerSeq  atomic.Uint64            // monotonic Messenger owner-id source
+	// ownerSeq is the monotonic Messenger owner-id source. Ids are never reused
+	// (see ownerState): a reused id could hit a drained ownerState and black-hole
+	// a later view's Subscribe.
+	ownerSeq atomic.Uint64
 
 	// Status tracking
 	statusMu sync.RWMutex

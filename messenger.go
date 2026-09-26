@@ -15,6 +15,12 @@ import (
 // ownerState is the shared liveness token for one subscription owner. A scoped
 // view holds it and drainOwner marks it dead, so a surviving view cannot
 // resurrect subscriptions under an owner that was already drained.
+//
+// Identifiers come from Orchestrator.ownerSeq, which is monotonic and never
+// reuses an id: a drained state is therefore never reminted for a later view.
+// That property is load-bearing — reusing an id would let a stale, marked-dead
+// state black-hole a legitimate later Subscribe — so ownerSeq must stay a
+// monotonic counter and must never be "optimised" into a pool of reusable ids.
 type ownerState struct {
 	id   uint64
 	dead atomic.Bool

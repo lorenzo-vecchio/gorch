@@ -91,7 +91,11 @@ These guarantees are part of the public API and are relied upon by callers.
   started again; `Unregister` removes it from the graph. Both cancel the
   service's context and release its Messenger subscriptions, which are scoped to
   the instance or tick that created them; a persistent service's instance and any
-  in-flight cron ticks are then awaited until they exit. `Unregister` also drops
+  in-flight cron ticks are then awaited until they exit. A tick abandoned for
+  outliving the deadline still has its subscriptions released: teardown drains
+  every live owner id of the entry, so the release its abandoned goroutine skips
+  cannot leak the id. Owner ids are monotonic and never reused, so a drained id
+  is never minted into a later view. `Unregister` also drops
   the cron schedule. A stop is refused
   with `ErrHasDependents` while a hard dependent is running, unless `WithCascadeStop`
   is passed; soft dependencies never block and are never cascaded. A membership
