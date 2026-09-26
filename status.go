@@ -25,6 +25,13 @@ type Metrics struct {
 
 // Status returns the current lifecycle status of a named service.
 // ok is false if no service with that name is registered.
+//
+// Status is the lifecycle fact, not the reservation. While an entry holds an
+// in-flight start reservation but startOneService has not yet committed
+// StatusStarting, it still reports its previous status (typically
+// StatusRegistered). Use Busy(name) to observe that window; it is not encoded in
+// ServiceStatus. A cron entry's StatusRunning means its schedule is installed,
+// not that a tick is working (see Statuses).
 // Thread-safe.
 func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
 	o.mu.RLock()
@@ -39,8 +46,21 @@ func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
 	return s, true
 }
 
-// Statuses returns a map of service name to status for all registered services.
-// Thread-safe.
+// Statuses returns a map of service name to lifecycle status for all registered
+// services, keyed by name.
+//
+// Registered, not running: a hot-added entry is included from the moment it is
+// registered, even before it is started (StatusRegistered), and a staged cron
+// entry is included before it is scheduled (also StatusRegistered). For a cron
+// entry StatusRunning means the schedule is installed, not that a tick is
+// working or healthy; a failing tick only logs and does not change the status,
+// so IsReady and Health inherit that scheduling-fact reading. Use CountRunning
+// and RunningNames for the "live" subset.
+//
+// The reservation is deliberately not reported here: an entry reserved for an
+// in-flight start still shows its prior lifecycle status until startOneService
+// commits StatusStarting, and a teardown shows StatusStopping. Poll Busy(name)
+// for the reservation. Thread-safe.
 func (o *Orchestrator) Statuses() map[string]ServiceStatus {
 	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
@@ -56,7 +76,9 @@ func (o *Orchestrator) Statuses() map[string]ServiceStatus {
 	return result
 }
 
-// Names returns the names of all registered services in registration order.
+// Names returns the names of all registered services in registration order,
+// whether or not they are started. A hot-added and not-yet-started service and a
+// staged cron entry are both included; use RunningNames for the running subset.
 // Thread-safe.
 func (o *Orchestrator) Names() []string {
 	o.mu.RLock()
@@ -68,12 +90,59 @@ func (o *Orchestrator) Names() []string {
 	return names
 }
 
-// Count returns the total number of registered services.
+// Count returns the total number of registered services, whether or not they are
+// started. It is len(Names()), not the number of live services: a hot-added,
+// not-yet-started entry and a staged cron entry both count. Use CountRunning for
+// the number of StatusRunning services ("N of M running").
 // Thread-safe.
 func (o *Orchestrator) Count() int {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	return len(o.entries)
+}
+
+// CountRunning returns the number of registered services currently in
+// StatusRunning. It is the "live" half of Count: a hot-added or staged entry that
+// reports StatusRegistered is excluded, and for a cron entry "running" means its
+// schedule is installed, not that a tick is working. The count is a snapshot
+// taken under the same locks as Statuses, so it is consistent with the
+// StatusRunning entries of that map. Thread-safe.
+func (o *Orchestrator) CountRunning() int {
+	o.mu.RLock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.RUnlock()
+
+	o.statusMu.RLock()
+	defer o.statusMu.RUnlock()
+	n := 0
+	for _, e := range entries {
+		if e.status == StatusRunning {
+			n++
+		}
+	}
+	return n
+}
+
+// RunningNames returns the names of the registered services currently in
+// StatusRunning, in registration order. It is the name list matching
+// CountRunning and the StatusRunning subset of Statuses: registered but
+// not-started entries and staged cron entries are omitted. Thread-safe.
+func (o *Orchestrator) RunningNames() []string {
+	o.mu.RLock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.RUnlock()
+
+	o.statusMu.RLock()
+	defer o.statusMu.RUnlock()
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.status == StatusRunning {
+			names = append(names, e.name)
+		}
+	}
+	return names
 }
 
 // Health probes all registered services that implement HealthChecker.
