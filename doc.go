@@ -64,7 +64,8 @@
 //   - A failed Start rolls back within a bounded budget: the per-service stop
 //     sequences and the final wait for instance and log-pump goroutines share
 //     one failed-start deadline (WithFailedStartTimeout, default 30s), so a
-//     service that blocks in Stop() cannot hang Start. Overrunning the budget
+//     service that blocks in Stop() does not hang Start unless the bound is
+//     removed with a negative WithFailedStartTimeout. Overrunning the budget
 //     reports ErrStopTimeout. The reset is best-effort — a goroutine that
 //     ignores cancellation may outlive the failed Start — so the orchestrator is
 //     left restartable and Start can be retried.

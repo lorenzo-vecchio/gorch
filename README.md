@@ -21,7 +21,7 @@ Requires Go 1.25+.
 - **Run() convenience** — single call starts, blocks on OS signals, then stops.
 - **Dependency ordering** — declare dependencies with `DependsOn`, cycle detection at registration, topological start and reverse-topological stop.
 - **Start timeout** — per-service start deadline via `WithStartTimeout`, with a `DefaultStartTimeout` config default.
-- **Bounded failed-Start rollback** — `WithFailedStartTimeout` bounds the cleanup of a failed `Start` (default 30s), so a service that blocks in `Stop()` cannot hang it.
+- **Bounded failed-Start rollback** — `WithFailedStartTimeout` bounds the cleanup of a failed `Start` (default 30s), so a service that blocks in `Stop()` does not hang it; a negative value removes the bound.
 - **Cron scheduling** — 6-field cron (seconds included) with three concurrency modes: Parallel, Queue, Skip.
 - **Pub-sub Messenger** — topic-based messaging between services (Socket.IO rooms style), non-blocking sends, request-reply, and typed messages.
 - **Self-healing** — auto-restart crashed services with a factory-provided fresh instance and configurable backoff/retry.
@@ -128,7 +128,8 @@ These guarantees are part of the public API and are relied upon by callers.
   already-started services and then waits for their instance and log-pump
   goroutines under one budget shared by every step (`WithFailedStartTimeout`,
   default 30s), mirroring `Stop`. A service that ignores cancellation and blocks
-  in `Stop()` is reported as `ErrStopTimeout` and cannot hang `Start`. The reset
+  in `Stop()` is reported as `ErrStopTimeout` and does not hang `Start` — unless
+  `WithFailedStartTimeout` is set negative, which removes the bound. The reset
   that follows is best-effort: a goroutine that ignores cancellation may outlive
   the failed `Start`, but the orchestrator is left restartable so `Start` can be
   retried.
@@ -151,8 +152,8 @@ Sentinel errors returned by the orchestrator:
 | `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
 | `ErrInvalidCron` | `Start`, `Register` (hot add) | A `WithCron` spec is invalid. |
 | `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
-| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A stop did not finish within the caller's timeout: the before/after-stop hooks, `Stop()`, or the wait for the instance to exit was still in flight. The entry is left `StatusStopping` (not `StatusStopped`) and the stop is not counted in `Metrics().Stops`. On a failed `Start` it means the bounded rollback budget was exceeded. |
-| `ErrHookTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. The teardown is unverified, so the entry stays `StatusStopping`. |
+| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A stop did not finish within the caller's timeout: the before/after-stop hooks, `Stop()`, or the wait for the instance to exit was still in flight. On the stop methods the entry is left `StatusStopping` (not `StatusStopped`) and the stop is not counted in `Metrics().Stops`. On a failed `Start` it means the bounded rollback budget was exceeded; the rollback still resets the snapshotted entries to `StatusRegistered`, leaving the orchestrator retryable. |
+| `ErrHookTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. On the stop methods the teardown is unverified, so the entry stays `StatusStopping`; on a failed `Start` the rollback resets it to `StatusRegistered`. |
 | `ErrNilService` | `Register`, `RegisterFunc` | A nil `Service`, or a nil `Start` closure passed to `RegisterFunc`. |
 | `ErrOrchestratorNotStarted` | `StartService` | Called before the orchestrator was started. |
 | `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
