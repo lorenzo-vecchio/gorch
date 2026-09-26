@@ -449,6 +449,8 @@ gorch.WithBackoff(gorch.ConstantBackoff{Delay: 3 * time.Second})
 
 Services implement `HealthChecker` to report their health. The orchestrator probes on a configurable interval. After `HealthThreshold` consecutive failures, a self-healing service is restarted.
 
+Only services whose status is `StatusRunning` are probed — both by the periodic loop and by `Health()`. Non-running entries (registered, starting, stopping, stopped, crashed, succeeded) are omitted from the `Health()` result, so a stopped service is never reported as healthy. A running service that does not implement `HealthChecker` is reported with a nil (healthy) error.
+
 ```go
 type HealthChecker interface {
     Health(ctx context.Context) error
@@ -471,6 +473,7 @@ Manual health check:
 
 ```go
 results := orch.Health() // map[string]error, nil = healthy
+// Only StatusRunning services appear; non-running entries are omitted.
 ```
 
 ### Messenger

@@ -52,6 +52,10 @@
 //     StatusRunning to StatusCrashed (firing OnCrash and incrementing
 //     Metrics().Crashes) and is returned to StatusRunning once the new instance
 //     is live.
+//   - Health is a live signal: both the periodic loop and Health() probe only
+//     services that are StatusRunning. A non-running entry is omitted from the
+//     Health() result rather than reported healthy, while a running service that
+//     does not implement HealthChecker is reported with a nil error.
 //   - A hot add that names a hard dependency which is being removed fails with
 //     ErrDependencyRemoving: a retryable "not now" condition distinct from
 //     ErrHasDependents, which is only about the target's own running dependents.

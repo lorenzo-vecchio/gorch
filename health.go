@@ -63,6 +63,14 @@ func (s ServiceStatus) String() string {
 	}
 }
 
+// Health probes every registered service that is currently StatusRunning and
+// returns a map from service name to its probe error (nil = healthy). Services
+// that are not running — registered, starting, stopping, stopped, crashed, or
+// succeeded — are omitted, because their probe result would not be a live
+// health signal. A running service that does not implement HealthChecker is
+// reported with a nil error, as is a running service whose probe succeeds.
+// Each probe gets a fresh deadline (HealthTimeout) and a panic is recovered and
+// returned as an error. Thread-safe.
 func (o *Orchestrator) Health() map[string]error {
 	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
@@ -71,30 +79,52 @@ func (o *Orchestrator) Health() map[string]error {
 
 	result := make(map[string]error, len(entries))
 	for _, e := range entries {
-		// An entry being torn down must not be probed (C5).
-		if e.removing.Load() {
+		if !o.healthCandidate(e) {
 			continue
 		}
-		hc, ok := e.getSvc().(HealthChecker)
-		var probeErr error
-		if ok {
-			// Per-probe deadline so a slow checker does not fail later probes.
-			probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
-			probeErr = callErr(func() error { return hc.Health(probeCtx) })
-			cancel()
-		}
+		_, probeErr := o.probeHealth(e)
 		// Re-validate membership after the probe: a concurrent teardown may have
 		// removed the entry from the graph while the probe ran, and a removed
 		// name must not appear in the result (C5).
-		o.mu.RLock()
-		current := o.nameIndex[e.name]
-		o.mu.RUnlock()
-		if current != e {
+		if !o.healthStillCurrent(e) {
 			continue
 		}
 		result[e.name] = probeErr
 	}
 	return result
+}
+
+// healthCandidate reports whether entry is eligible for a health probe: it is
+// not being torn down and its status is StatusRunning. Both Health and the
+// periodic loop use it so the two paths cannot diverge on which entries they
+// probe.
+func (o *Orchestrator) healthCandidate(entry *serviceEntry) bool {
+	return !entry.removing.Load() && o.statusOf(entry) == StatusRunning
+}
+
+// probeHealth runs entry's HealthChecker probe, if it implements one. It
+// returns (false, nil) for a service that does not implement HealthChecker and
+// (true, err) otherwise, where err is the probe result or a recovered panic.
+// Each probe gets a fresh deadline (HealthTimeout) so a slow checker does not
+// fail later probes.
+func (o *Orchestrator) probeHealth(entry *serviceEntry) (bool, error) {
+	hc, ok := entry.getSvc().(HealthChecker)
+	if !ok {
+		return false, nil
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
+	defer cancel()
+	return true, callErr(func() error { return hc.Health(probeCtx) })
+}
+
+// healthStillCurrent reports whether entry is still the registered entry for its
+// name and is not being torn down. Both paths re-check it after a probe so a
+// concurrent teardown cannot make them act on a stale snapshot (C5).
+func (o *Orchestrator) healthStillCurrent(entry *serviceEntry) bool {
+	o.mu.RLock()
+	current := o.nameIndex[entry.name]
+	o.mu.RUnlock()
+	return current == entry && !entry.removing.Load()
 }
 
 // RegisterFunc registers a closure-based service.
@@ -121,20 +151,15 @@ func (o *Orchestrator) runHealthChecks() {
 	o.mu.RUnlock()
 
 	for _, e := range entries {
-		// Skip an entry the health loop snapshotted just before it was removed
-		// or while it is being torn down (C5).
-		if e.removing.Load() {
+		// Skip an entry the health loop snapshotted just before it was removed,
+		// while it is being torn down, or that is not running (C5).
+		if !o.healthCandidate(e) {
 			continue
 		}
-		hc, ok := e.getSvc().(HealthChecker)
-		if !ok {
-			continue
-		}
-
-		o.statusMu.RLock()
-		s := e.status
-		o.statusMu.RUnlock()
-		if s != StatusRunning {
+		// Hooks fire only for services that actually implement HealthChecker;
+		// probeHealth would otherwise report a running non-checker as healthy,
+		// but the periodic path must not instrument it.
+		if _, ok := e.getSvc().(HealthChecker); !ok {
 			continue
 		}
 
@@ -144,11 +169,7 @@ func (o *Orchestrator) runHealthChecks() {
 			}
 		}
 
-		// Each probe gets a fresh per-service deadline so a slow checker does
-		// not fail all later probes with an expired context.
-		probeCtx, cancel := context.WithTimeout(context.Background(), o.cfg.HealthTimeout)
-		healthErr := callErr(func() error { return hc.Health(probeCtx) })
-		cancel()
+		_, healthErr := o.probeHealth(e)
 		if o.cfg.AfterHealthCheck != nil {
 			callVoid(func() { o.cfg.AfterHealthCheck(e.name, healthErr) })
 		}
@@ -156,10 +177,7 @@ func (o *Orchestrator) runHealthChecks() {
 		// Health does: a concurrent Unregister may have removed or replaced this
 		// entry, and acting on the stale snapshot would cancel an instance the
 		// graph no longer tracks (C5).
-		o.mu.RLock()
-		current := o.nameIndex[e.name]
-		o.mu.RUnlock()
-		if current != e || e.removing.Load() {
+		if !o.healthStillCurrent(e) {
 			continue
 		}
 		failures := e.getHealthFailures()

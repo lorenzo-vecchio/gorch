@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2825,19 +2826,30 @@ func TestStopStartedServices_StopsRunningService(t *testing.T) {
 // ── Health ──
 
 func TestHealth_NonHealthChecker_ReportsNil(t *testing.T) {
-	o := New()
+	o := New(WithHealthChecksDisabled())
 	_ = o.Register(&namedSvc{}, WithName("plain"))
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
 	results := o.Health()
+	if _, ok := results["plain"]; !ok {
+		t.Fatal("running non-HealthChecker must be reported")
+	}
 	if results["plain"] != nil {
-		t.Error("non-HealthChecker should report nil")
+		t.Error("running non-HealthChecker should report nil")
 	}
 }
 
 func TestHealth_HealthChecker_ReportsError(t *testing.T) {
-	o := New()
+	o := New(WithHealthChecksDisabled())
 	healthErr := errors.New("unhealthy")
 	svc := &healthSvc{healthFn: func(ctx context.Context) error { return healthErr }}
 	_ = o.Register(svc, WithName("sick"))
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
 	results := o.Health()
 	if !errors.Is(results["sick"], healthErr) {
 		t.Errorf("expected health error, got %v", results["sick"])
@@ -2845,10 +2857,17 @@ func TestHealth_HealthChecker_ReportsError(t *testing.T) {
 }
 
 func TestHealth_HealthyService_ReportsNil(t *testing.T) {
-	o := New()
+	o := New(WithHealthChecksDisabled())
 	svc := &healthSvc{healthFn: func(ctx context.Context) error { return nil }}
 	_ = o.Register(svc, WithName("fine"))
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
 	results := o.Health()
+	if _, ok := results["fine"]; !ok {
+		t.Fatal("running healthy service must be reported")
+	}
 	if results["fine"] != nil {
 		t.Errorf("expected nil for healthy service, got %v", results["fine"])
 	}
@@ -2862,11 +2881,110 @@ func TestHealth_NoEntries(t *testing.T) {
 	}
 }
 
+// TestHealth_SkipsNonRunning pins that Health() omits every non-running entry
+// instead of reporting its probe result as a live health signal: a stopped
+// service whose Health() returns nil must not surface as "healthy".
+func TestHealth_SkipsNonRunning(t *testing.T) {
+	nonRunning := []ServiceStatus{
+		StatusRegistered,
+		StatusStarting,
+		StatusStopping,
+		StatusStopped,
+		StatusCrashed,
+		StatusSucceeded,
+	}
+	for _, st := range nonRunning {
+		t.Run(st.String(), func(t *testing.T) {
+			o := New(WithHealthChecks(0))
+			svc := &healthSvc{healthFn: func(ctx context.Context) error { return nil }}
+			entry := &serviceEntry{
+				name:   "svc",
+				svc:    svc,
+				cfg:    registerConfig{name: "svc"},
+				status: st,
+				logger: newServiceLogger("svc", make(chan logEntry, 8), nil, LogLevelError),
+			}
+			o.entries = append(o.entries, entry)
+			o.nameIndex[entry.name] = entry
+
+			results := o.Health()
+			if got, ok := results["svc"]; ok {
+				t.Errorf("non-running (%s) entry must be omitted, got %v", st, got)
+			}
+			if n := svc.healthCalls.Load(); n != 0 {
+				t.Errorf("non-running (%s) entry must not be probed, got %d calls", st, n)
+			}
+		})
+	}
+}
+
+// TestHealth_And_RunHealthChecks_AgreeOnWhichEntriesAreProbed pins that the
+// public method and the periodic loop select exactly the same entries — only
+// StatusRunning ones — across all seven statuses. Each entry's checker records
+// that it ran; both paths must probe only the running entry.
+func TestHealth_And_RunHealthChecks_AgreeOnWhichEntriesAreProbed(t *testing.T) {
+	statuses := []ServiceStatus{
+		StatusRegistered,
+		StatusStarting,
+		StatusRunning,
+		StatusStopping,
+		StatusStopped,
+		StatusCrashed,
+		StatusSucceeded,
+	}
+
+	setup := func(t *testing.T) (*Orchestrator, []*healthSvc) {
+		t.Helper()
+		o := New(WithHealthChecks(0, WithFailureThreshold(100)))
+		svcs := make([]*healthSvc, len(statuses))
+		for i, st := range statuses {
+			svc := &healthSvc{}
+			svcs[i] = svc
+			entry := &serviceEntry{
+				name:   st.String(),
+				svc:    svc,
+				cfg:    registerConfig{name: st.String()},
+				status: st,
+				logger: newServiceLogger(st.String(), make(chan logEntry, 8), nil, LogLevelError),
+			}
+			o.entries = append(o.entries, entry)
+			o.nameIndex[entry.name] = entry
+		}
+		return o, svcs
+	}
+
+	probed := func(svcs []*healthSvc) []ServiceStatus {
+		var got []ServiceStatus
+		for i, svc := range svcs {
+			if svc.healthCalls.Load() > 0 {
+				got = append(got, statuses[i])
+			}
+		}
+		return got
+	}
+
+	o, svcs := setup(t)
+	o.Health()
+	fromHealth := probed(svcs)
+
+	oLoop, svcsLoop := setup(t)
+	oLoop.runHealthChecks()
+	fromLoop := probed(svcsLoop)
+
+	if !reflect.DeepEqual(fromHealth, fromLoop) {
+		t.Fatalf("Health probed %v, runHealthChecks probed %v; they must agree", fromHealth, fromLoop)
+	}
+	want := []ServiceStatus{StatusRunning}
+	if !reflect.DeepEqual(fromHealth, want) {
+		t.Fatalf("only StatusRunning must be probed, got %v", fromHealth)
+	}
+}
+
 // TestHealth_ConcurrentRemoval covers the matrix row "Health vs removal": an
 // Unregister that removes an entry while a probe is in flight must not leave
 // the removed name in the result.
 func TestHealth_ConcurrentRemoval(t *testing.T) {
-	o := New()
+	o := New(WithHealthChecksDisabled())
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	svc := &healthSvc{healthFn: func(ctx context.Context) error {
@@ -2877,6 +2995,10 @@ func TestHealth_ConcurrentRemoval(t *testing.T) {
 	if err := o.Register(svc, WithName("h")); err != nil {
 		t.Fatal(err)
 	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
 
 	results := make(chan map[string]error, 1)
 	go func() { results <- o.Health() }()
@@ -3011,6 +3133,10 @@ func TestHealth_PerProbeTimeout(t *testing.T) {
 	}}
 	_ = o.Register(slow, WithName("slow"))
 	_ = o.Register(fast, WithName("fast"))
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
 
 	results := o.Health()
 
