@@ -21,7 +21,7 @@ Requires Go 1.25+.
 - **Run() convenience** — single call starts, blocks on OS signals, then stops.
 - **Dependency ordering** — declare dependencies with `DependsOn`, cycle detection at registration, topological start and reverse-topological stop.
 - **Start timeout** — per-service start deadline via `WithStartTimeout`, with a `DefaultStartTimeout` config default.
-- **Bounded failed-Start rollback** — `WithFailedStartTimeout` bounds the cleanup of a failed `Start` (default 30s), so a service that blocks in `Stop()` does not hang it; a negative value removes the bound.
+- **Bounded failed-Start rollback** — `WithFailedStartTimeout` bounds the cleanup of a failed `Start` (default 30s), unwinding the services that had started in reverse topological order so a dependency is never stopped before its dependent; a service that blocks in `Stop()` does not hang it; a negative value removes the bound.
 - **Cron scheduling** — 6-field cron (seconds included) with three concurrency modes: Parallel, Queue, Skip.
 - **Pub-sub Messenger** — topic-based messaging between services (Socket.IO rooms style), non-blocking sends, request-reply, and typed messages.
 - **Self-healing** — auto-restart crashed services with a factory-provided fresh instance and configurable backoff/retry.
@@ -366,7 +366,10 @@ orch.Register(svc, gorch.WithStartTimeout(30 * time.Second)) // per-service over
 `WithFailedStartTimeout` bounds the whole cleanup of a failed `Start`: the
 per-service stop sequences (before/after-stop hooks and `Stop()`) and the final
 wait for instance and log-pump goroutines share one budget, exactly like `Stop`.
-The default is 30s; a negative value removes the bound, which is not recommended
+The services that had started are stopped in reverse topological order — the same
+order as `Stop` — so a dependency is never torn down before its dependent,
+regardless of registration order. The default is 30s; a negative value removes
+the bound, which is not recommended
 because a service that blocks in `Stop()` would then hang `Start` forever. When
 the budget is exceeded, the error returned by `Start` matches `ErrStopTimeout`
 (and `ErrHookTimeout` for an overrunning before-stop hook), and the reset is

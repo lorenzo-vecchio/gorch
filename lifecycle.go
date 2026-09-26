@@ -227,11 +227,16 @@ func (o *Orchestrator) callAfterStartHook(entry *serviceEntry, err error) {
 
 // stopStartedServices stops all running services (used for cleanup on start
 // failure). It works on the Start snapshot rather than o.entries, so a
-// concurrent hot Register cannot race the cleanup. The deadline bounds the whole
-// rollback and is shared unchanged by every entry, so a service that blocks in a
-// hook or Stop() cannot hang Start past it; a zero deadline means no bound. The
-// returned error aggregates every unverified teardown, including
-// ErrStopTimeout/ErrHookTimeout.
+// concurrent hot Register cannot race the cleanup. Services are torn down in
+// reverse topological order — the same order Start/Stop/StopGroup honour — so a
+// dependency is never stopped before its dependent, regardless of registration
+// order. topoSortForStop falls back to registration order for a cyclic subset
+// and still returns the ordering error, so every entry is reached and the
+// failure is surfaced rather than silently leaving a service running. The
+// deadline bounds the whole rollback and is shared unchanged by every entry, so
+// a service that blocks in a hook or Stop() cannot hang Start past it; a zero
+// deadline means no bound. The returned error aggregates every unverified
+// teardown, including ErrStopTimeout/ErrHookTimeout, plus any ordering error.
 // ponytail: sequential stop; parallel Stop is premature.
 func (o *Orchestrator) stopStartedServices(entries []*serviceEntry, deadline time.Time) error {
 	// Cancel context.
@@ -242,16 +247,22 @@ func (o *Orchestrator) stopStartedServices(entries []*serviceEntry, deadline tim
 	if o.cronSched != nil {
 		<-o.cronSched.Stop().Done()
 	}
-	// Stop services in reverse registration order.
-	var stopErr error
-	for i := len(entries) - 1; i >= 0; i-- {
-		entry := entries[i]
-		o.statusMu.RLock()
-		s := entry.status
-		o.statusMu.RUnlock()
-		if s == StatusRunning || s == StatusStarting {
-			if _, _, err := o.stopOneServiceDeadline(entry, deadline); err != nil {
-				stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+	// Stop services in reverse topological order. A cyclic subset still reaches
+	// every entry (registration-order fallback) and contributes topoErr below.
+	levels, topoErr := o.topoSortForStop(entries)
+	stopErr := topoErr
+	for i := len(levels) - 1; i >= 0; i-- {
+		for _, entry := range levels[i] {
+			// Entries that never started need no rollback: their Start either
+			// never ran or was skipped before the failure, so there is nothing
+			// to tear down.
+			o.statusMu.RLock()
+			s := entry.status
+			o.statusMu.RUnlock()
+			if s == StatusRunning || s == StatusStarting {
+				if _, _, err := o.stopOneServiceDeadline(entry, deadline); err != nil {
+					stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+				}
 			}
 		}
 	}
