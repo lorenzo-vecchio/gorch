@@ -546,6 +546,10 @@ sc.Logger.Info("request completed", "status", 200, "latency", 12*time.Millisecon
 
 The built-in log-pump writes to `os.Stderr`. Log level filters entries: `Debug < Info < Warn < Error`.
 
+`ServiceLogger` never blocks: the send to the log channel is non-blocking, so an entry is dropped when the channel is full or its pump has been signalled to stop. A torn-down log channel can therefore never stall a service or a `Stop`; the cost of a dead channel is lost lines, never a hang.
+
+A service hot-added while a `Start` is in flight takes a logger bound to that `Start`'s channel. If that `Start` fails, its pump exits during the rollback and the survivor's entries are dropped until the next successful `Start` rebinds its logger. The rebind is automatic: every `Start` reassigns a logger to every entry in its snapshot, and that snapshot includes a survivor from a previous failed `Start`. So the window is low severity and self-healing — no hang, only dropped lines until the retry.
+
 #### Custom logger
 
 Inject any logger that satisfies the `Logger` interface via `WithLogger`. `*slog.Logger` from the standard library satisfies this interface directly.

@@ -3,6 +3,8 @@ package gorch
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -937,6 +939,260 @@ func TestFailedStart_ConcurrentHotAdd_DoesNotHangReset(t *testing.T) {
 	}
 	defer func() { _ = o.Stop(time.Second) }()
 	waitForStatus(t, o, "a", StatusRunning)
+}
+
+// startWithHotAddFailure drives a Start that fails at b's before-start gate,
+// hot-adds and starts "hot" via StartService while the gate holds the Start
+// open, and returns the channel of hot's ServiceContexts (one per instance) plus
+// a function that runs the retry Start (its gate now passes). The first Start is
+// asserted to fail; the caller consumes the first instance's context and, after
+// calling retry, the retry instance's context.
+func startWithHotAddFailure(t *testing.T, o *Orchestrator) (<-chan ServiceContext, func() error) {
+	t.Helper()
+
+	gateEntered := make(chan struct{})
+	hotReady := make(chan struct{})
+	var once sync.Once
+	failFirst := true
+
+	if err := o.Register(&testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+		WithName("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&testSvc{}, WithName("b"), DependsOn("a"),
+		WithOnBeforeStart(func(string) error {
+			if failFirst {
+				once.Do(func() { close(gateEntered) })
+				<-hotReady
+				return errors.New("b cannot start")
+			}
+			return nil
+		})); err != nil {
+		t.Fatal(err)
+	}
+
+	// Launch the failing Start first: "hot" must be registered only once that
+	// Start is in flight, so that commitDynamicLocked binds its logger to the
+	// failing Start's log channel and the failing Start's snapshot excludes it.
+	startDone := make(chan error, 1)
+	go func() { startDone <- o.Start() }()
+	select {
+	case <-gateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("b's before-start gate never ran")
+	}
+
+	contexts := make(chan ServiceContext, 4)
+	if err := o.RegisterFunc("hot", func(sc ServiceContext) error {
+		contexts <- sc
+		<-sc.Done()
+		return sc.Err()
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Hot-add and start while the failing Start is in flight: commitDynamicLocked
+	// binds the entry's logger to this Start's log channel.
+	if err := o.StartService("hot"); err != nil {
+		t.Fatalf("hot StartService: %v", err)
+	}
+	close(hotReady)
+
+	select {
+	case err := <-startDone:
+		if err == nil {
+			t.Fatal("first Start must fail")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Start hung")
+	}
+
+	return contexts, func() error {
+		failFirst = false
+		return o.Start()
+	}
+}
+
+// captureStderrWhile runs fn with os.Stderr redirected to a pipe and returns
+// everything written to it. fn must stop the log-pump before returning (e.g. by
+// calling Stop) so no goroutine writes to os.Stderr after it is restored.
+func captureStderrWhile(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+	fn()
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	_ = r.Close()
+	return string(out)
+}
+
+// TestFailedStart_HotAddedEntryLoggerStillWorks pins the verified behaviour of a
+// service hot-added and started during a failing Start. The issue suspected a
+// silent hang once the default logger's 256-slot channel filled after the
+// failed Start's pump exited. It does not hang: ServiceLogger.emit uses a
+// non-blocking send, so the entries are dropped. The next successful Start
+// rebinds the survivor's logger, after which its output reaches the retry's live
+// log-pump. A custom Logger is unaffected at every step.
+func TestFailedStart_HotAddedEntryLoggerStillWorks(t *testing.T) {
+	t.Run("default_logger_drops_then_rebinds_on_retry", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled(), WithLogLevel(LogLevelInfo))
+		contexts, retry := startWithHotAddFailure(t, o)
+
+		var first ServiceContext
+		select {
+		case first = <-contexts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hot never started")
+		}
+
+		// The failed Start's pump is gone. 400 entries (> the 256 slot buffer)
+		// must all be dropped without blocking the caller.
+		drained := make(chan struct{})
+		go func() {
+			for i := 0; i < 400; i++ {
+				first.Logger.Info("survivor line", "i", i)
+			}
+			close(drained)
+		}()
+		select {
+		case <-drained:
+		case <-time.After(2 * time.Second):
+			t.Fatal("survivor logger blocked after the failed Start's log-pump exited")
+		}
+
+		// Retry succeeds; Start rebinds every snapshotted entry, the survivor
+		// included, so its output reaches the retry's log-pump.
+		retryOut := captureStderrWhile(t, func() {
+			if err := retry(); err != nil {
+				t.Fatalf("retry Start: %v", err)
+			}
+			waitForStatus(t, o, "hot", StatusRunning)
+
+			var second ServiceContext
+			select {
+			case second = <-contexts:
+			case <-time.After(2 * time.Second):
+				t.Fatal("hot did not restart on the retry")
+			}
+			if second.Logger == first.Logger {
+				t.Error("retry did not rebind the survivor's logger")
+			}
+			for i := 0; i < 8; i++ {
+				second.Logger.Info("retry reaches the live logger", "i", i)
+			}
+
+			// Tear the retry down so the pump exits and the pipe can be read.
+			// Issue #26's stale-wgDone leak for a started survivor makes this
+			// whole Stop report ErrStopTimeout, so its error is not asserted:
+			// this test is scoped to the logger concern.
+			_ = o.Stop(200 * time.Millisecond)
+			select {
+			case <-o.logPumpDone:
+			case <-time.After(2 * time.Second):
+				t.Error("retry log-pump did not exit")
+			}
+		})
+		if !strings.Contains(retryOut, "retry reaches the live logger") {
+			t.Fatalf("survivor output did not reach the retry logger; captured %q", retryOut)
+		}
+	})
+
+	t.Run("custom_logger_is_unaffected", func(t *testing.T) {
+		tl := &testLogger{}
+		o := New(WithHealthChecksDisabled(), WithLogger(tl))
+		contexts, retry := startWithHotAddFailure(t, o)
+
+		var first ServiceContext
+		select {
+		case first = <-contexts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("hot never started")
+		}
+		for i := 0; i < 400; i++ {
+			first.Logger.Info("custom survivor", "i", i)
+		}
+		if got := len(tl.callsMatching("custom survivor")); got != 400 {
+			t.Fatalf("custom logger recorded %d survivor lines, want 400", got)
+		}
+
+		if err := retry(); err != nil {
+			t.Fatalf("retry Start: %v", err)
+		}
+		waitForStatus(t, o, "hot", StatusRunning)
+		select {
+		case second := <-contexts:
+			second.Logger.Info("custom retry")
+		case <-time.After(2 * time.Second):
+			t.Fatal("hot did not restart on the retry")
+		}
+		if got := len(tl.callsMatching("custom retry")); got != 1 {
+			t.Fatalf("custom logger recorded %d retry lines, want 1", got)
+		}
+
+		// Cleanup; see the default-logger subtest for why the whole Stop's error
+		// is not asserted.
+		_ = o.Stop(200 * time.Millisecond)
+	})
+}
+
+// TestFailedStart_ThenRetry_HotAddedEntryIsUsable pins that the survivor is a
+// full participant in the retried Start, not merely a log destination: it
+// reaches StatusRunning, it is rebound to the retry's logger, and its own Stop
+// lifecycle completes cleanly (Stop() runs, StopService returns nil, status
+// returns to Stopped). Issue #26's stale-wgDone leak for a *started* survivor
+// makes a whole-orchestrator Stop report ErrStopTimeout here, so that path is
+// deliberately not asserted and the test is scoped to the survivor itself.
+func TestFailedStart_ThenRetry_HotAddedEntryIsUsable(t *testing.T) {
+	o := New(WithHealthChecksDisabled(), WithLogLevel(LogLevelInfo))
+	contexts, retry := startWithHotAddFailure(t, o)
+
+	var first ServiceContext
+	select {
+	case first = <-contexts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hot never started")
+	}
+
+	if err := retry(); err != nil {
+		t.Fatalf("retry Start: %v", err)
+	}
+	waitForStatus(t, o, "hot", StatusRunning)
+
+	var second ServiceContext
+	select {
+	case second = <-contexts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hot did not restart on the retry")
+	}
+	if second.Logger == nil {
+		t.Fatal("retry ServiceContext carries no logger")
+	}
+	if second.Logger == first.Logger {
+		t.Error("retry did not rebind the survivor's logger")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- o.StopService("hot", time.Second) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("StopService on the survivor = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopService on the survivor hung")
+	}
+	if s, _ := o.Status("hot"); s != StatusStopped {
+		t.Fatalf("survivor status after StopService = %v, want StatusStopped", s)
+	}
+
+	// Bound the teardown of the remaining services; the error is expected to be
+	// ErrStopTimeout because of the issue #26 leak, so it is not asserted.
+	_ = o.Stop(200 * time.Millisecond)
 }
 
 // TestFailedStartTimeout_DefaultAndOverride pins the configurable rollback
