@@ -102,6 +102,17 @@ type Logger interface {
 // gorch consumes the channel and does the actual output (formatting, writing to stderr).
 // When a custom Logger is set via Config.Logger, ServiceLogger delegates to it
 // instead of the channel, prepending "service"=<name> to the key-value pairs.
+//
+// Emit never blocks. The channel send is non-blocking: an entry is dropped when
+// the log channel is full or the log-pump has been signalled to stop, so a
+// torn-down or backed-up log channel can never stall a service or a Stop.
+//
+// A service hot-added while a Start is in flight may take a logger bound to that
+// Start's log channel. If the Start fails, the channel's pump exits during the
+// rollback and the survivor's entries are dropped (never buffered by a blocked
+// send) until the next successful Start rebinds its logger. Start reassigns a
+// logger to every entry in its snapshot, which includes a survivor from a
+// previous failed Start, so the drop window ends at the retry.
 type ServiceLogger struct {
 	svcName  string
 	ch       chan<- logEntry // used by default channel-based logging

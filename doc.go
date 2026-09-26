@@ -79,6 +79,11 @@
 //     reports ErrStopTimeout. The reset is best-effort — a goroutine that
 //     ignores cancellation may outlive the failed Start — so the orchestrator is
 //     left restartable and Start can be retried.
+//   - A ServiceLogger never blocks: it drops an entry when the log channel is
+//     full or its pump has stopped, so a torn-down log channel cannot stall a
+//     service or a Stop. A service hot-added during a failed Start keeps a
+//     logger bound to that Start's torn-down channel, and its entries are
+//     dropped until the next Start rebinds every snapshotted entry's logger.
 //
 // See the README for the concurrency table and the per-method guarantees.
 package gorch
