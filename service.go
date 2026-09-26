@@ -262,6 +262,12 @@ var (
 	ErrOrchestratorNotStarted = errors.New("gorch: orchestrator not started")
 	ErrDependencyNotRunning   = errors.New("gorch: dependency not running")
 	ErrDependencyNotFound     = errors.New("gorch: dependency not found")
+	// ErrDependencyRemoving is returned by Register when a hot add names a hard
+	// dependency that is mid-teardown (being stopped or removed concurrently).
+	// It is distinct from ErrHasDependents, which is only about the target's own
+	// running dependents blocking a stop; here the caller has no dependents at
+	// all. Treat it as a retryable "not now" condition.
+	ErrDependencyRemoving = errors.New("gorch: dependency is being removed")
 	// ErrReentrantMembership is returned when a membership operation is
 	// re-entered from a service's own Start or Stop, or races another
 	// reservation. It is a programming error, not a recoverable state. It is

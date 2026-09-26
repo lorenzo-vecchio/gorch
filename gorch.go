@@ -486,6 +486,9 @@ func New(opts ...Option) *Orchestrator {
 // Returns ErrDependencyNotFound if DependsOn names a service that is not yet
 // registered: a hard dependency must always be registered before the service
 // that names it, both statically and on a hot add.
+// Returns ErrDependencyRemoving if a hot add names a hard dependency that is
+// being removed (stopped/removed concurrently): a retryable "not now"
+// condition, distinct from ErrHasDependents.
 // Returns ErrNilService if svc is nil.
 // Thread-safe.
 func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
@@ -593,7 +596,7 @@ func (o *Orchestrator) parseRegisterOptions(opts []RegisterOption) (registerConf
 			return cfg, fmt.Errorf("%w: dependency %q not found for service %s", ErrDependencyNotFound, dep, cfg.name)
 		}
 		if depEntry.removing.Load() {
-			return cfg, fmt.Errorf("%w: dependency %q is being removed for service %s", ErrHasDependents, dep, cfg.name)
+			return cfg, fmt.Errorf("%w: dependency %q is being removed for service %s", ErrDependencyRemoving, dep, cfg.name)
 		}
 		// Check if dep transitively depends on cfg.name (would create a cycle).
 		if o.dependsOnRecursive(depEntry, cfg.name) {
