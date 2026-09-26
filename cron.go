@@ -53,6 +53,9 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
 		}
 	}()
 
+	id := curGoroutineID()
+	entry.startGoid.Store(id)
+	defer entry.startGoid.CompareAndSwap(id, 0)
 	err := entry.getSvc().Start(sc)
 	if err != nil && err != context.Canceled {
 		entry.getLogger().Error("cron service returned error", "error", err.Error())

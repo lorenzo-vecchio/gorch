@@ -520,7 +520,7 @@ func TestStartService(t *testing.T) {
 		}
 	})
 
-	t.Run("reentrant start rejected", func(t *testing.T) {
+	t.Run("reserved start rejected as busy", func(t *testing.T) {
 		o := New()
 		if err := o.Start(); err != nil {
 			t.Fatal(err)
@@ -534,10 +534,16 @@ func TestStartService(t *testing.T) {
 		entry := o.nameIndex["r"]
 		o.mu.Unlock()
 
+		// A reservation set by another goroutine (no startGoid owner) is a
+		// transient collision, not same-goroutine reentrancy.
 		entry.starting.Store(true)
 		defer entry.starting.Store(false)
-		if err := o.StartService("r"); !errors.Is(err, ErrReentrantMembership) {
-			t.Fatalf("got %v, want reentrant membership error", err)
+		err := o.StartService("r")
+		if !errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("got %v, want ErrMembershipBusy", err)
+		}
+		if errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("got %v, must not be ErrReentrantMembership", err)
 		}
 	})
 }
@@ -1312,9 +1318,10 @@ func TestUnregister_ReleasesSubscriptions(t *testing.T) {
 	}
 }
 
-// TestTearDown_Reentrant covers the reentrancy guard: a membership op issued
-// while the target is inside its own Start is rejected, not deadlocked.
-func TestTearDown_Reentrant(t *testing.T) {
+// TestTearDown_BusyReservation covers the reservation guard: a membership op
+// issued while the target is reserved by another goroutine's in-flight start is
+// rejected as the transient, retryable ErrMembershipBusy, not deadlocked.
+func TestTearDown_BusyReservation(t *testing.T) {
 	o := New()
 	if err := o.Start(); err != nil {
 		t.Fatal(err)
@@ -1329,11 +1336,11 @@ func TestTearDown_Reentrant(t *testing.T) {
 
 	entry.starting.Store(true)
 	defer entry.starting.Store(false)
-	if err := o.StopService("r", time.Second); !errors.Is(err, ErrReentrantMembership) {
-		t.Errorf("StopService = %v, want reentrant membership error", err)
+	if err := o.StopService("r", time.Second); !errors.Is(err, ErrMembershipBusy) {
+		t.Errorf("StopService = %v, want ErrMembershipBusy", err)
 	}
-	if err := o.Unregister("r", time.Second); !errors.Is(err, ErrReentrantMembership) {
-		t.Errorf("Unregister = %v, want reentrant membership error", err)
+	if err := o.Unregister("r", time.Second); !errors.Is(err, ErrMembershipBusy) {
+		t.Errorf("Unregister = %v, want ErrMembershipBusy", err)
 	}
 }
 
@@ -1615,9 +1622,9 @@ func TestMembershipTransitions(t *testing.T) {
 // StartGroup/StopGroup and membership ops serialize their *selection*, so
 // concurrent calls never interleave on entry selection. Now that user code runs
 // outside the lock, a call that loses the race against an in-flight group
-// start or teardown is rejected with ErrReentrantMembership rather than
-// blocking; run under -race, this asserts no interleaving tears an entry
-// mid-operation.
+// start or teardown is rejected with the transient ErrMembershipBusy (or, from
+// a service callback, ErrReentrantMembership) rather than blocking; run under
+// -race, this asserts no interleaving tears an entry mid-operation.
 func TestGroupOps_SerializedWithMembership(t *testing.T) {
 	o := New(WithHealthChecksDisabled())
 	defer o.Stop(2 * time.Second)
@@ -1642,7 +1649,7 @@ func TestGroupOps_SerializedWithMembership(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := fn(); err != nil && !errors.Is(err, ErrReentrantMembership) {
+			if err := fn(); err != nil && !errors.Is(err, ErrMembershipBusy) && !errors.Is(err, ErrReentrantMembership) {
 				t.Errorf("serialized op failed: %v", err)
 			}
 		}()

@@ -268,11 +268,19 @@ var (
 	// running dependents blocking a stop; here the caller has no dependents at
 	// all. Treat it as a retryable "not now" condition.
 	ErrDependencyRemoving = errors.New("gorch: dependency is being removed")
-	// ErrReentrantMembership is returned when a membership operation is
-	// re-entered from a service's own Start or Stop, or races another
-	// reservation. It is a programming error, not a recoverable state. It is
+	// ErrReentrantMembership is returned when a membership operation re-enters
+	// from a service's own Start or Stop callback on the same goroutine (for
+	// example, a service stopping itself from its Start). It is a programming
+	// error, not a recoverable state. A collision with a reservation held by
+	// another goroutine instead returns the retryable ErrMembershipBusy. It is
 	// exported so callers can classify the rejection with errors.Is.
 	ErrReentrantMembership = errors.New("gorch: reentrant membership operation")
+	// ErrMembershipBusy is returned when a membership operation is blocked by an
+	// in-flight reservation on the target entry (another goroutine's Start,
+	// Stop, or group operation). It is transient and retryable: poll Busy(name)
+	// or retry once the reservation clears. Distinct from ErrReentrantMembership,
+	// which is a same-goroutine re-entry and a programming error.
+	ErrMembershipBusy = errors.New("gorch: membership operation blocked by an in-flight reservation")
 )
 
 // funcService wraps closures as a Service. Used by RegisterFunc.

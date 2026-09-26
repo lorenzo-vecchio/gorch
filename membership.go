@@ -47,7 +47,14 @@ func (o *Orchestrator) StartService(name string) error {
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
 	}
 	if entry.starting.Load() {
-		return fmt.Errorf("%w: %s", ErrReentrantMembership, name)
+		// A start reservation can be held either by this entry's own Start
+		// (same goroutine: a genuine re-entry, a programming error) or by
+		// another goroutine's start (a transient collision the caller may
+		// retry). Only goroutine identity can tell them apart.
+		if entry.lifecycleOwnedBy(curGoroutineID()) {
+			return fmt.Errorf("%w: %s", ErrReentrantMembership, name)
+		}
+		return fmt.Errorf("%w: %s", ErrMembershipBusy, name)
 	}
 
 	// Hard dependencies must exist (they may have been unregistered) and be
@@ -171,14 +178,26 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 		// non-running dependent stays registered untouched.
 		set = []*serviceEntry{entry}
 	}
-	// Reject any selected entry that is inside its own Start (C17) or already
-	// being removed: another transaction, or a StartGroup reservation (which
-	// sets starting on every selected entry), owns it.
+	// Reject a membership op that re-enters from a selected entry's own
+	// Start/Stop on this goroutine (C17): a programming error, never retryable.
+	// This pass must come before the reservation check so a self-reentry is
+	// classified as reentrancy even though the entry is also reserved.
+	goid := curGoroutineID()
+	for _, e := range set {
+		if e.lifecycleOwnedBy(goid) {
+			o.mu.Unlock()
+			o.membershipMu.Unlock()
+			return fmt.Errorf("%w: %s", ErrReentrantMembership, e.name)
+		}
+	}
+	// Otherwise a selected entry reserved by another goroutine's transaction or
+	// StartGroup start is a transient collision: the caller may retry once the
+	// reservation clears (observe it with Busy, or poll the status).
 	for _, e := range set {
 		if e.starting.Load() || e.removing.Load() {
 			o.mu.Unlock()
 			o.membershipMu.Unlock()
-			return fmt.Errorf("%w: %s", ErrReentrantMembership, e.name)
+			return fmt.Errorf("%w: %s", ErrMembershipBusy, e.name)
 		}
 	}
 	// Freeze new hard-dependency edges into the set while it is torn down; a
