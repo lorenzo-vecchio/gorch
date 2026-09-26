@@ -55,6 +55,12 @@
 //   - A hot add that names a hard dependency which is being removed fails with
 //     ErrDependencyRemoving: a retryable "not now" condition distinct from
 //     ErrHasDependents, which is only about the target's own running dependents.
+//   - A membership op blocked by an in-flight reservation is classified by
+//     cause: re-entry from the target's own Start/Stop on the same goroutine is
+//     a programming error and returns ErrReentrantMembership, while a collision
+//     with another goroutine's reservation is transient and returns the
+//     retryable ErrMembershipBusy. Busy(name) is the predicate a caller can poll
+//     to observe the reservation instead of racing.
 //
 // See the README for the concurrency table and the per-method guarantees.
 package gorch

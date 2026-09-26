@@ -321,9 +321,179 @@ func TestFailedStart_ReleasesReservations_AndRetrySucceeds(t *testing.T) {
 }
 
 // TestStop_BusyReservation_IsRetryable pins that a membership op rejected only
-// because the entry was momentarily reserved can be retried once the
-// reservation is released.
+// because the entry was momentarily reserved by *another goroutine* is reported
+// as the transient ErrMembershipBusy (never the programming-error
+// ErrReentrantMembership) and succeeds once the reservation is released.
 func TestStop_BusyReservation_IsRetryable(t *testing.T) {
+	t.Run("white-box reservation", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+		if err := o.Register(&namedSvc{}, WithName("r")); err != nil {
+			t.Fatal(err)
+		}
+		entry := entryNamed(t, o, "r")
+
+		entry.starting.Store(true)
+		err := o.StopService("r", time.Second)
+		if !errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("StopService on a reserved entry = %v, want ErrMembershipBusy", err)
+		}
+		if errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("StopService on a reserved entry = %v, must not be ErrReentrantMembership", err)
+		}
+		entry.starting.Store(false)
+
+		if err := o.StartService("r"); err != nil {
+			t.Fatalf("StartService after reservation release: %v", err)
+		}
+		if err := o.StopService("r", time.Second); err != nil {
+			t.Fatalf("StopService retry after reservation release: %v", err)
+		}
+	})
+
+	t.Run("real in-flight Start", func(t *testing.T) {
+		o := New()
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+
+		started := make(chan struct{})
+		release := make(chan struct{})
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			close(started)
+			<-release
+			return nil
+		}}
+		// Hot-add as runOnce: StartService then runs Start synchronously on the
+		// calling goroutine, so the entry stays reserved until release closes
+		// while a StopService from this goroutine is a reservation collision.
+		if err := o.Register(svc, WithName("s"), WithRunOnce()); err != nil {
+			t.Fatal(err)
+		}
+		startErr := make(chan error, 1)
+		go func() { startErr <- o.StartService("s") }()
+		<-started
+
+		err := o.StopService("s", time.Second)
+		if !errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("StopService during an in-flight Start = %v, want ErrMembershipBusy", err)
+		}
+		if errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("StopService during an in-flight Start = %v, must not be ErrReentrantMembership", err)
+		}
+
+		close(release)
+		if err := <-startErr; err != nil {
+			t.Fatalf("StartService: %v", err)
+		}
+		if err := o.StopService("s", time.Second); err != nil {
+			t.Fatalf("StopService retry after reservation cleared: %v", err)
+		}
+	})
+}
+
+// TestMembershipOp_FromOwnStart_IsProgrammingError pins the split: a membership
+// op invoked from a service's own Start on the same goroutine is genuine
+// reentrancy — a programming error — and must never be reported as the
+// retryable ErrMembershipBusy.
+func TestMembershipOp_FromOwnStart_IsProgrammingError(t *testing.T) {
+	run := func(t *testing.T, op func(o *Orchestrator) error) error {
+		t.Helper()
+		o := New()
+		var innerErr error
+		done := make(chan struct{})
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			innerErr = op(o)
+			close(done)
+			return nil
+		}}
+		if err := o.Register(svc, WithName("self"), WithRunOnce()); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer o.Stop(time.Second)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("membership op from own Start deadlocked")
+		}
+		return innerErr
+	}
+
+	t.Run("StopService self", func(t *testing.T) {
+		err := run(t, func(o *Orchestrator) error { return o.StopService("self", time.Second) })
+		if !errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("StopService from own Start = %v, want ErrReentrantMembership", err)
+		}
+		if errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("StopService from own Start = %v, must not be ErrMembershipBusy", err)
+		}
+	})
+
+	t.Run("StartService self", func(t *testing.T) {
+		err := run(t, func(o *Orchestrator) error { return o.StartService("self") })
+		if !errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("StartService from own Start = %v, want ErrReentrantMembership", err)
+		}
+		if errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("StartService from own Start = %v, must not be ErrMembershipBusy", err)
+		}
+	})
+}
+
+// TestMembershipOp_FromOwnStop_IsProgrammingError covers the stopGoid branch: a
+// membership op invoked from a service's own Stop on the same goroutine is
+// reentrancy, must return ErrReentrantMembership rather than the transient
+// sentinel, and must not deadlock.
+func TestMembershipOp_FromOwnStop_IsProgrammingError(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	var innerErr error
+	svc := &testSvc{
+		startFn: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		stopFn: func() error {
+			innerErr = o.StopService("self", time.Second)
+			return nil
+		},
+	}
+	if err := o.Register(svc, WithName("self")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	outer := make(chan error, 1)
+	go func() { outer <- o.StopService("self", time.Second) }()
+	select {
+	case err := <-outer:
+		if err != nil {
+			t.Fatalf("StopService: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("membership op re-entered from Stop deadlocked")
+	}
+	if !errors.Is(innerErr, ErrReentrantMembership) {
+		t.Fatalf("StopService from own Stop = %v, want ErrReentrantMembership", innerErr)
+	}
+	if errors.Is(innerErr, ErrMembershipBusy) {
+		t.Fatalf("StopService from own Stop = %v, must not be ErrMembershipBusy", innerErr)
+	}
+}
+
+// TestBusy pins the observable predicate for the retryable collision: it is true
+// only for a registered entry holding an in-flight reservation, and false for an
+// idle or unknown entry.
+func TestBusy(t *testing.T) {
 	o := New(WithHealthChecksDisabled())
 	if err := o.Start(); err != nil {
 		t.Fatal(err)
@@ -332,19 +502,29 @@ func TestStop_BusyReservation_IsRetryable(t *testing.T) {
 	if err := o.Register(&namedSvc{}, WithName("r")); err != nil {
 		t.Fatal(err)
 	}
-	entry := entryNamed(t, o, "r")
 
+	if o.Busy("r") {
+		t.Error("idle registered entry must not report busy")
+	}
+	if o.Busy("unknown") {
+		t.Error("unknown name must not report busy")
+	}
+
+	entry := entryNamed(t, o, "r")
 	entry.starting.Store(true)
-	if err := o.StopService("r", time.Second); !errors.Is(err, ErrReentrantMembership) {
-		t.Fatalf("StopService on a reserved entry = %v, want ErrReentrantMembership", err)
+	if !o.Busy("r") {
+		t.Error("entry with a start reservation must report busy")
 	}
 	entry.starting.Store(false)
 
-	if err := o.StartService("r"); err != nil {
-		t.Fatalf("StartService after reservation release: %v", err)
+	entry.removing.Store(true)
+	if !o.Busy("r") {
+		t.Error("entry with a teardown reservation must report busy")
 	}
-	if err := o.StopService("r", time.Second); err != nil {
-		t.Fatalf("StopService retry after reservation release: %v", err)
+	entry.removing.Store(false)
+
+	if o.Busy("r") {
+		t.Error("entry must report idle again after its reservation clears")
 	}
 }
 

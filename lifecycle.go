@@ -91,6 +91,9 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 			// Use a goroutine to run Start with timeout
 			done := make(chan error, 1)
 			go func() {
+				id := curGoroutineID()
+				entry.startGoid.Store(id)
+				defer entry.startGoid.CompareAndSwap(id, 0)
 				defer func() {
 					if r := recover(); r != nil {
 						entry.getLogger().Error("service panicked", "panic", fmt.Sprint(r))
@@ -109,7 +112,10 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 				svcCancel()
 			}
 		} else {
+			id := curGoroutineID()
+			entry.startGoid.Store(id)
 			err = callErr(func() error { return entry.getSvc().Start(sc) })
+			entry.startGoid.CompareAndSwap(id, 0)
 		}
 		entry.setCancel(nil)
 		svcCancel()
@@ -172,6 +178,9 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 			}
 			close(done)
 		}()
+		id := curGoroutineID()
+		entry.startGoid.Store(id)
+		defer entry.startGoid.CompareAndSwap(id, 0)
 		exitErr = entry.getSvc().Start(sc)
 		if exitErr != nil && exitErr != context.Canceled {
 			sc.Logger.Error("service returned error", "error", exitErr.Error())
@@ -408,10 +417,10 @@ func (o *Orchestrator) callBeforeStopHook(entry *serviceEntry, deadline time.Tim
 func (o *Orchestrator) stopServiceBounded(entry *serviceEntry) (error, bool) {
 	timeout := entry.cfg.stopTimeout
 	if timeout <= 0 {
-		return o.safeStopWithResult(entry.getSvc()), true
+		return o.safeStopWithResult(entry), true
 	}
 	done := make(chan error, 1)
-	go func() { done <- o.safeStopWithResult(entry.getSvc()) }()
+	go func() { done <- o.safeStopWithResult(entry) }()
 	select {
 	case err := <-done:
 		return err, true
@@ -446,14 +455,20 @@ func afterStopHook(entry *serviceEntry, o *Orchestrator) func(string, error) {
 	return o.cfg.OnAfterStop
 }
 
-// safeStopWithResult calls Stop with panic recovery, returning any error.
-func (o *Orchestrator) safeStopWithResult(svc Service) (err error) {
+// safeStopWithResult calls the entry's Stop with panic recovery, returning any
+// error. It records the calling goroutine as the entry's stop owner while the
+// user callback runs, so a membership op that re-enters from that same Stop can
+// be told apart from one colliding on another goroutine.
+func (o *Orchestrator) safeStopWithResult(entry *serviceEntry) (err error) {
+	id := curGoroutineID()
+	entry.stopGoid.Store(id)
+	defer entry.stopGoid.CompareAndSwap(id, 0)
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("stop panicked: %v", r)
 		}
 	}()
-	return svc.Stop()
+	return entry.getSvc().Stop()
 }
 
 // safeStop calls Stop with panic recovery. Best-effort; errors and panics
@@ -489,6 +504,9 @@ func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext, done c
 		close(done)
 	}()
 
+	id := curGoroutineID()
+	entry.startGoid.Store(id)
+	defer entry.startGoid.CompareAndSwap(id, 0)
 	exitErr = entry.getSvc().Start(sc)
 	if exitErr != nil && exitErr != context.Canceled {
 		sc.Logger.Error("service returned error", "error", exitErr.Error())

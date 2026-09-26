@@ -55,14 +55,22 @@ type serviceEntry struct {
 	cronID cron.EntryID
 	// self-heal state for non-cron services
 	wgDone bool // true once wg.Done() has been called for this entry
-	// starting is true while startOneService is invoking this entry's user code
-	// synchronously on the caller's goroutine. It lets a reentrant membership
-	// op (a service starting itself from its own Start) be rejected instead of
-	// recursing (C17).
+	// starting is the start *reservation*: it is true while this entry is
+	// reserved for an in-flight start — during startOneService's synchronous
+	// work, or for every member StartGroup selected. It makes a membership op
+	// that would recurse (or collide with another goroutine's start) rejectable
+	// instead of deadlocking. Who owns the reservation is not encoded here; that
+	// is startGoid's job.
 	starting atomic.Bool
 	// removing is true while a StopService/Unregister is tearing this entry
 	// down. It rejects new hard-dependency edges from Register (C11).
 	removing atomic.Bool
+	// startGoid / stopGoid hold the goroutine id currently executing this
+	// entry's user Start()/Stop() (0 = none). They distinguish a genuine
+	// same-goroutine re-entry from a concurrent reservation collision: the
+	// starting/removing flags only say an operation is in flight.
+	startGoid atomic.Uint64
+	stopGoid  atomic.Uint64
 	// removed is set permanently when Unregister deletes the entry from the
 	// registry. It lets a caller that selected the entry before the removal
 	// (e.g. StartGroup) refuse to start it afterwards.
@@ -91,6 +99,13 @@ type serviceEntry struct {
 	cronActive   int
 	cronDraining bool
 	cronDrained  chan struct{}
+}
+
+// lifecycleOwnedBy reports whether goid is the goroutine currently inside this
+// entry's own user Start() or Stop(). It is what separates a genuine re-entry
+// (same goroutine) from a concurrent reservation collision (another goroutine).
+func (e *serviceEntry) lifecycleOwnedBy(goid uint64) bool {
+	return goid != 0 && (e.startGoid.Load() == goid || e.stopGoid.Load() == goid)
 }
 
 // getSvc returns the current service instance (thread-safe).
@@ -709,6 +724,23 @@ func (o *Orchestrator) lookupEntry(name string) *serviceEntry {
 		}
 	}
 	return nil
+}
+
+// Busy reports whether the named service is registered and currently holds an
+// in-flight membership reservation: a Start is running, a Stop is tearing it
+// down, or a group operation has reserved it. It is the predicate a caller can
+// poll to decide whether StartService/StopService/Unregister would be rejected
+// with the transient ErrMembershipBusy, instead of racing and retrying blind. It
+// returns false for an unknown name and for a registered but idle entry.
+// Thread-safe.
+func (o *Orchestrator) Busy(name string) bool {
+	o.mu.RLock()
+	entry := o.lookupEntry(name)
+	o.mu.RUnlock()
+	if entry == nil {
+		return false
+	}
+	return entry.starting.Load() || entry.removing.Load()
 }
 
 // dependsOnRecursive checks whether entry transitively depends on target via
