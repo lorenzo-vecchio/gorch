@@ -52,6 +52,9 @@
 //     StatusRunning to StatusCrashed (firing OnCrash and incrementing
 //     Metrics().Crashes) and is returned to StatusRunning once the new instance
 //     is live.
+//   - A hot add that names a hard dependency which is being removed fails with
+//     ErrDependencyRemoving: a retryable "not now" condition distinct from
+//     ErrHasDependents, which is only about the target's own running dependents.
 //
 // See the README for the concurrency table and the per-method guarantees.
 package gorch

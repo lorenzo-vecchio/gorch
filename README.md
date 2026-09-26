@@ -144,9 +144,10 @@ Sentinel errors returned by the orchestrator:
 | `ErrOrchestratorNotStarted` | `StartService` | Called before the orchestrator was started. |
 | `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | The entry is reserved by an in-flight membership operation. Either the caller re-entered from a service's own `Start`/`Stop` (a programming error) or it lost a benign race with a concurrent reservation (retry once the reservation clears). |
 | `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
-| `ErrHasDependents` | `StopService`, `Unregister`, `Register` | A stop/removal would break running hard dependents (pass `WithCascadeStop`), or a dynamic registration names a dependency that is being removed. |
+| `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break running hard dependents (pass `WithCascadeStop`). |
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
 | `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is not `StatusRunning`. |
+| `ErrDependencyRemoving` | `Register` | A hot-added service names a hard dependency that is being torn down (being stopped/removed concurrently); retry after the teardown completes. |
 | `ErrOrchestratorStopping` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` is in progress. |
 | `ErrOrchestratorStopped` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` has completed. |
 
@@ -317,7 +318,7 @@ mid-`Start` and a staged cron entry, so their status is `StatusStarting`/
 - Re-registering an explicitly named service after its `Unregister` completes is
   allowed.
 - Registering a hard dependency on a service that is mid-removal fails with
-  `ErrHasDependents`, so a torn-down entry cannot acquire new dependents.
+  `ErrDependencyRemoving`, so a torn-down entry cannot acquire new dependents.
 
 ### Start timeout
 

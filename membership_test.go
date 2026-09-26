@@ -1357,7 +1357,7 @@ func TestStartService_RemovingRejected(t *testing.T) {
 	}
 }
 
-func TestRegister_DependencyRemovingRejected(t *testing.T) {
+func TestRegister_DepBeingRemoved_DistinctSentinel(t *testing.T) {
 	o := New()
 	if err := o.Start(); err != nil {
 		t.Fatal(err)
@@ -1373,8 +1373,56 @@ func TestRegister_DependencyRemovingRejected(t *testing.T) {
 	entry.removing.Store(true)
 	defer entry.removing.Store(false)
 	err := o.Register(&namedSvc{}, WithName("child"), DependsOn("dep"))
-	if !errors.Is(err, ErrHasDependents) {
-		t.Errorf("Register onto a removing dependency = %v, want ErrHasDependents", err)
+	if !errors.Is(err, ErrDependencyRemoving) {
+		t.Errorf("Register onto a removing dependency = %v, want ErrDependencyRemoving", err)
+	}
+	if errors.Is(err, ErrHasDependents) {
+		t.Errorf("Register onto a removing dependency must not match ErrHasDependents, got %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "dep") {
+		t.Errorf("Register error must name the dependency %q, got %v", "dep", err)
+	}
+}
+
+func TestRegister_DepBeingRemoved_DuringRealTeardown(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(5 * time.Second)
+
+	stopEntered := make(chan struct{})
+	releaseStop := make(chan struct{})
+	dep := &testSvc{stopFn: func() error {
+		close(stopEntered)
+		<-releaseStop
+		return nil
+	}}
+	if err := o.Register(dep, WithName("dep")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("dep"); err != nil {
+		t.Fatal(err)
+	}
+
+	unregDone := make(chan error, 1)
+	go func() { unregDone <- o.Unregister("dep", 5*time.Second) }()
+
+	// dep.Stop() only runs after tearDown set the entry's removing flag, so
+	// waiting for the entry to Stop() guarantees the flag is observable.
+	<-stopEntered
+
+	err := o.Register(&namedSvc{}, WithName("child"), DependsOn("dep"))
+	if !errors.Is(err, ErrDependencyRemoving) {
+		t.Errorf("Register during dep teardown = %v, want ErrDependencyRemoving", err)
+	}
+	if errors.Is(err, ErrHasDependents) {
+		t.Errorf("Register during dep teardown must not match ErrHasDependents, got %v", err)
+	}
+
+	close(releaseStop)
+	if err := <-unregDone; err != nil {
+		t.Fatalf("Unregister = %v", err)
 	}
 }
 
