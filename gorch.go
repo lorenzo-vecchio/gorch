@@ -252,6 +252,55 @@ func (e *serviceEntry) teardownActive() bool {
 	return false
 }
 
+// resetEntryLocked restores the entry's per-instance lifecycle state to the
+// pristine state of a registered, never-started service. It is the single
+// definition of "fresh" shared by the failed-Start reset (the entry is retained
+// so Start can be retried) and Unregister's discard (the entry is additionally
+// marked removed and dropped from the registry). The caller must hold o.mu.
+//
+// It leaves the registration identity (svc, cfg, name), the start reservation
+// (starting), and the removal flags (removing, removed) untouched: those belong
+// to the registration/reservation discipline, not to one instance's run. The
+// logger is also left in place, so the next Start can rebind it for a retained
+// entry and an abandoned live instance can still log for a discarded one.
+func (e *serviceEntry) resetEntryLocked() {
+	e.status = StatusRegistered
+	e.wgDone = false
+	e.setCancel(nil)
+	e.setDone(nil)
+	e.clearTeardown()
+	e.setRetryCount(0)
+	e.setHealthFailures(0)
+	e.setStableSince(time.Time{})
+	e.stopsCounted.Store(false)
+	e.running.Store(false)
+	e.startGoid.Store(0)
+	e.stopGoid.Store(0)
+	// The scheduler the entry was scheduled on is gone (a failed Start tears it
+	// down; Unregister stops it). Drop the schedule id so a later Start
+	// re-schedules instead of treating a dead id as a live schedule.
+	e.cronID = 0
+	e.resetCronAccounting()
+}
+
+// resetCronAccounting cancels the entry's shared schedule context, if any, and
+// clears the per-schedule tick accounting. cronGen is advanced so an in-flight
+// tick of the previous schedule is ignored rather than driving the fresh
+// counter negative. Thread-safe.
+func (e *serviceEntry) resetCronAccounting() {
+	e.cronTrackMu.Lock()
+	if e.cronCancel != nil {
+		e.cronCancel()
+	}
+	e.cronGen++
+	e.cronCtx = nil
+	e.cronCancel = nil
+	e.cronActive = 0
+	e.cronDraining = false
+	e.cronDrained = nil
+	e.cronTrackMu.Unlock()
+}
+
 // addOwner records id as a live Messenger owner of the entry (one per running
 // instance or cron tick). Thread-safe.
 func (e *serviceEntry) addOwner(id uint64) {
@@ -905,6 +954,13 @@ func (o *Orchestrator) Start() error {
 		}
 		for _, e := range entries {
 			e.starting.Store(true)
+			// o.cronSched is brand new, so any cron id an entry still holds is
+			// stale (its scheduler was stopped by a failed Start's rollback).
+			// Clear it so setupCron re-schedules every cron entry instead of
+			// treating a dead id as live. This is what reschedules a hot-added
+			// cron survivor, which resetAfterStartFailure's snapshot does not
+			// reach, on the retry.
+			e.cronID = 0
 		}
 		o.mu.Unlock()
 		o.membershipMu.Unlock()
@@ -1128,14 +1184,10 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline 
 	o.healthDone = nil
 
 	for _, entry := range entries {
-		entry.status = StatusRegistered
-		entry.wgDone = false
-		entry.setCancel(nil)
-		entry.setDone(nil)
-		entry.clearTeardown()
-		entry.setRetryCount(0)
-		entry.setHealthFailures(0)
-		entry.setStableSince(time.Time{})
+		// resetEntryLocked is the shared definition of "fresh"; the retry path
+		// additionally drops the logger bound to the failed Start's dead log
+		// channel, which the next Start rebinds anyway.
+		entry.resetEntryLocked()
 		entry.setLogger(nil)
 	}
 	o.mu.Unlock()

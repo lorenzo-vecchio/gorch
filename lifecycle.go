@@ -138,6 +138,17 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	// Persistent service: start in goroutine.
 	o.setStatus(entry, StatusRunning)
 	o.metricsStarts.Add(1)
+	// Clear the wait-group latch for this instance. A restarted entry may still
+	// carry wgDone = true from a previous incarnation: StartService resets it on
+	// its own path, but a StartGroup restart and a hot-added survivor of a failed
+	// Start (which resetAfterStartFailure's snapshot does not reach) do not. An
+	// instance whose exit sees a stale wgDone skips o.wg.Done(), so the counter
+	// never returns to zero, Done() never closes, and Stop reports ErrStopTimeout.
+	// startOneService is the single start path that adds to the wait group, so the
+	// latch is cleared here for every new instance.
+	o.mu.Lock()
+	entry.wgDone = false
+	o.mu.Unlock()
 	o.wg.Add(1)
 
 	// done closes when this instance's goroutine has fully exited, so a

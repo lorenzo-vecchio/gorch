@@ -140,11 +140,7 @@ func (o *Orchestrator) StartService(name string) error {
 	case entry.cfg.runOnce:
 		return o.startOneService(entry)
 	default:
-		// Clear the wait-group latch so the restarted instance's exit decrements
-		// the wait group again.
-		o.mu.Lock()
-		entry.wgDone = false
-		o.mu.Unlock()
+		// startOneService clears the wait-group latch for the fresh instance.
 		return o.startOneService(entry)
 	}
 }
@@ -410,11 +406,17 @@ func (o *Orchestrator) awaitDone(ch <-chan struct{}, deadline time.Time) bool {
 	}
 }
 
-// removeEntryLocked deletes entry from the registry and marks it removed. The
-// flag is permanent, so a start that selected the entry before deletion cannot
-// revive it. The caller must hold o.mu.
+// removeEntryLocked deletes entry from the registry, marks it removed, and
+// discards its per-instance state. The removed flag is permanent, so a start
+// that selected the entry before deletion cannot revive it. The state reset
+// shares resetEntryLocked with the failed-Start retry path, so "removed" means
+// no run state is left behind, not merely an unindexed entry; unlike the retry
+// path (which keeps the entry registered and rebinds its logger on the next
+// Start), removal is terminal and leaves the logger in place so an abandoned
+// live instance can still log. The caller must hold o.mu.
 func (o *Orchestrator) removeEntryLocked(entry *serviceEntry) {
 	entry.removed.Store(true)
+	entry.resetEntryLocked()
 	delete(o.nameIndex, entry.name)
 	filtered := o.entries[:0]
 	for _, e := range o.entries {

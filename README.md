@@ -96,7 +96,13 @@ These guarantees are part of the public API and are relied upon by callers.
   every live owner id of the entry, so the release its abandoned goroutine skips
   cannot leak the id. Owner ids are monotonic and never reused, so a drained id
   is never minted into a later view. `Unregister` also drops
-  the cron schedule. A stop is refused
+  the cron schedule and discards the entry's per-instance state — instance and
+  teardown contexts, exit channel, retry/health counters, stability window,
+  liveness/accounting flags, owner ids, and cron accounting — from both the
+  `entries` slice and the name index, using the same "fresh" definition as a
+  failed-`Start` retry. Re-registering the same name therefore creates a
+  brand-new entry that inherits nothing from the previous incarnation (a
+  monotonic auto-name counter means `$N` is never reused either). A stop is refused
   with `ErrHasDependents` while a hard dependent is `Running` or `Starting` (the
   error names each blocker and its status), unless `WithCascadeStop` is passed;
   a dependent that is `Stopping`, `Registered`, `Crashed`, `Stopped`, or
