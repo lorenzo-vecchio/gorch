@@ -33,6 +33,12 @@
 //     and remove services while it runs. Only the whole-orchestrator lifecycle
 //     is single-shot: after a successful Stop the orchestrator cannot be
 //     restarted.
+//   - StartService is idempotent on a Running persistent/cron service (a no-op)
+//     and never restarts a live instance: replacing one is the explicit
+//     StopService + StartService. Its start decision and reservation are claimed
+//     atomically, so concurrent calls start exactly one instance and a collision
+//     with another goroutine's in-flight reservation is the transient
+//     ErrMembershipBusy (a runOnce entry is the deliberate re-run exception).
 //   - The wire format is encoding/gob and is part of the public contract; types
 //     passed through the typed Messenger helpers must be gob-compatible.
 //   - Publish is drop-only: when a subscriber's buffer is full the message is
