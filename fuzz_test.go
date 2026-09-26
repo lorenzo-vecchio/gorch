@@ -116,6 +116,20 @@ func FuzzMembershipTransitions(f *testing.F) {
 			}
 		}
 
+		// assertOwnerMapsConsistent pins the two owner maps together. newOwner
+		// registers in the root before recording on the entry, and every release
+		// path removes from the entry before draining the root, so at any instant
+		// the root map holds at least as many owners as the entries collectively
+		// claim. A root count below that sum would mean an entry references an id
+		// the root already forgot: a stale "dead" view that could reject a later
+		// Subscribe.
+		assertOwnerMapsConsistent := func() {
+			root, total := rootOwnerCount(o), totalEntryOwnerCount(o)
+			if root < total {
+				t.Fatalf("root owner count %d < entry owner sum %d: an entry references an id the root map lost", root, total)
+			}
+		}
+
 		// runOp drives one operation and asserts the abandoned-goroutine counter
 		// did not move when the operation completed without an overrun. A leaked
 		// teardown goroutine must only ever follow ErrStopTimeout/ErrHookTimeout,
@@ -214,6 +228,7 @@ func FuzzMembershipTransitions(f *testing.F) {
 				_ = runOp(func() error { return o.StartService("cron") })
 			}
 			assertNoReservationLeak()
+			assertOwnerMapsConsistent()
 		}
 		_ = runOp(func() error { return o.Stop(2 * time.Second) })
 		assertNoReservationLeak()
@@ -226,6 +241,26 @@ func FuzzMembershipTransitions(f *testing.F) {
 		case <-o.Done():
 		case <-time.After(2 * time.Second):
 			t.Fatal("goroutines did not wind down after Stop")
+		}
+
+		// Every owner is either released by its instance/tick or swept by the
+		// teardown drain; after shutdown neither map may retain an id. Draining
+		// each remaining entry first proves the entry-side map is fully
+		// releasable and leaves the root map with no reachable owner.
+		o.mu.RLock()
+		remaining := make([]*serviceEntry, len(o.entries))
+		copy(remaining, o.entries)
+		o.mu.RUnlock()
+		for _, e := range remaining {
+			o.drainService(e)
+		}
+		if root := rootOwnerCount(o); root != 0 {
+			t.Fatalf("root owner map holds %d owners after shutdown, want 0", root)
+		}
+		for _, e := range remaining {
+			if ids := entryOwnerIDs(e); len(ids) != 0 {
+				t.Fatalf("entry %s holds owners %v after shutdown, want none", e.name, ids)
+			}
 		}
 
 		// Reconcile the crash surfaces: a crash is counted exactly once, and

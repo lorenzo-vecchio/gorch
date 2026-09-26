@@ -54,6 +54,12 @@
 //     service and counted in the monotonic Metrics().AbandonedGoroutines. The
 //     goroutine is not registered with Done(), so the counter is the only
 //     visibility into a leak user code can cause by ignoring the contract.
+//   - Messenger subscriptions are scoped to the instance or cron tick that
+//     created them, and their owner is released on every exit path. Teardown
+//     drains every live owner id of an entry, so an owner whose goroutine is
+//     abandoned — its deferred release skipped — is still released. Owner ids
+//     are monotonic and never reused, so a drained id cannot be reminted into a
+//     later view.
 //   - A self-heal crash is observable before the restart: the entry transitions
 //     StatusRunning to StatusCrashed (firing OnCrash and incrementing
 //     Metrics().Crashes) and is returned to StatusRunning once the new instance
