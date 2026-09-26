@@ -71,6 +71,12 @@
 //   - A hot add that names a hard dependency which is being removed fails with
 //     ErrDependencyRemoving: a retryable "not now" condition distinct from
 //     ErrHasDependents, which is only about the target's own running dependents.
+//   - The cycle check walks each node once, so a diamond costs O(V+E) rather
+//     than one walk per path. The walk is depth-capped: a chain deeper than
+//     10000 edges fails registration with
+//     ErrDependencyDepthExceeded instead of overflowing the goroutine stack.
+//     Registration is expected to build a bounded, startup-sized acyclic graph;
+//     the cap guards the unbounded reload loop, not normal use.
 //   - A membership op blocked by an in-flight reservation is classified by
 //     cause: re-entry from the target's own Start/Stop on the same goroutine is
 //     a programming error and returns ErrReentrantMembership, while a collision

@@ -2757,22 +2757,22 @@ func TestDependsOnRecursive(t *testing.T) {
 	_ = o.Register(&namedSvc{}, WithName("c"), DependsOn("b"))
 
 	// c transitively depends on a and b.
-	if !o.dependsOnRecursive(o.nameIndex["c"], "a") {
-		t.Error("c should transitively depend on a")
+	if found, err := o.dependsOnRecursive(o.nameIndex["c"], "a", make(map[string]struct{}), 0); err != nil || !found {
+		t.Errorf("c depends on a = (%v, %v), want (true, nil)", found, err)
 	}
-	if !o.dependsOnRecursive(o.nameIndex["c"], "b") {
-		t.Error("c should transitively depend on b")
+	if found, err := o.dependsOnRecursive(o.nameIndex["c"], "b", make(map[string]struct{}), 0); err != nil || !found {
+		t.Errorf("c depends on b = (%v, %v), want (true, nil)", found, err)
 	}
-	if !o.dependsOnRecursive(o.nameIndex["b"], "a") {
-		t.Error("b should depend on a")
+	if found, err := o.dependsOnRecursive(o.nameIndex["b"], "a", make(map[string]struct{}), 0); err != nil || !found {
+		t.Errorf("b depends on a = (%v, %v), want (true, nil)", found, err)
 	}
 	// a doesn't depend on anything.
-	if o.dependsOnRecursive(o.nameIndex["a"], "b") {
-		t.Error("a should not depend on b")
+	if found, err := o.dependsOnRecursive(o.nameIndex["a"], "b", make(map[string]struct{}), 0); err != nil || found {
+		t.Errorf("a depends on b = (%v, %v), want (false, nil)", found, err)
 	}
 	// nil entry.
-	if o.dependsOnRecursive(nil, "x") {
-		t.Error("nil entry should return false")
+	if found, err := o.dependsOnRecursive(nil, "x", make(map[string]struct{}), 0); err != nil || found {
+		t.Errorf("nil entry = (%v, %v), want (false, nil)", found, err)
 	}
 }
 
@@ -3671,8 +3671,8 @@ func TestDependsOnRecursive_EntriesPath(t *testing.T) {
 	o.entries = append(o.entries, base, mid, top)
 	// Check: top transitively depends on a through b.
 	// top→b → b found in entries (not nameIndex) → b→a → a==a → true.
-	if !o.dependsOnRecursive(top, "a") {
-		t.Error("top should transitively depend on base via mid")
+	if found, err := o.dependsOnRecursive(top, "a", make(map[string]struct{}), 0); err != nil || !found {
+		t.Errorf("top depends on base via mid = (%v, %v), want (true, nil)", found, err)
 	}
 }
 
@@ -4623,6 +4623,120 @@ func TestSoftDep_SelfDependency(t *testing.T) {
 	err := o.Register(&testSvc{}, WithName("self"), DependsOnSoft("self"))
 	if !errors.Is(err, ErrDependencyCycle) {
 		t.Fatalf("expected ErrDependencyCycle for soft self-dependency, got %v", err)
+	}
+}
+
+// ── dependsOnRecursive: visited set and depth cap ──
+
+// insertDepChain appends n pre-built entries to o's registry as a hard
+// dependency chain (each entry depends on the previous) and returns the top
+// entry's name. It bypasses Register so a test can build an over-deep graph in
+// O(n) instead of triggering a full walk on every append. The caller must run
+// single-goroutine (no lock).
+func insertDepChain(o *Orchestrator, n int) string {
+	prev := ""
+	top := ""
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("chain-%06d", i)
+		e := &serviceEntry{name: name, svc: &namedSvc{}, status: StatusRegistered}
+		e.cfg.name = name
+		if prev != "" {
+			e.cfg.dependsOn = []string{prev}
+		}
+		o.entries = append(o.entries, e)
+		o.nameIndex[name] = e
+		prev = name
+		top = name
+	}
+	return top
+}
+
+// TestDependsOnRecursive_DiamondGraph_ExpandsEachNodeOnce verifies the walk
+// marks a visited node so a diamond (two paths to the same node) expands it
+// once: len(visited) is the number of distinct reachable nodes, not the number
+// of paths. Reachability stays correct.
+func TestDependsOnRecursive_DiamondGraph_ExpandsEachNodeOnce(t *testing.T) {
+	o := New()
+	// a -> {b, c}; b -> d; c -> d. Four distinct nodes, two paths to d.
+	d := &serviceEntry{name: "d"}
+	d.cfg.name = "d"
+	b := &serviceEntry{name: "b"}
+	b.cfg.name = "b"
+	b.cfg.dependsOn = []string{"d"}
+	c := &serviceEntry{name: "c"}
+	c.cfg.name = "c"
+	c.cfg.dependsOn = []string{"d"}
+	a := &serviceEntry{name: "a"}
+	a.cfg.name = "a"
+	a.cfg.dependsOn = []string{"b", "c"}
+	for _, e := range []*serviceEntry{a, b, c, d} {
+		o.entries = append(o.entries, e)
+		o.nameIndex[e.name] = e
+	}
+
+	visited := make(map[string]struct{})
+	found, err := o.dependsOnRecursive(a, "missing", visited, 0)
+	if err != nil {
+		t.Fatalf("dependsOnRecursive(a, missing) error = %v, want nil", err)
+	}
+	if found {
+		t.Fatal("dependsOnRecursive(a, missing) = true, want false")
+	}
+	if got := len(visited); got != 4 {
+		t.Errorf("expanded %d nodes, want 4 (each distinct reachable node once, not once per path)", got)
+	}
+
+	// A target reachable through the shared node is still found.
+	visited = make(map[string]struct{})
+	if found, err := o.dependsOnRecursive(a, "d", visited, 0); err != nil || !found {
+		t.Fatalf("dependsOnRecursive(a, d) = (%v, %v), want (true, nil)", found, err)
+	}
+}
+
+// TestDependsOnRecursive_DeepChain_DoesNotOverflow walks a chain far deeper
+// than maxDependencyDepth and asserts it returns a result or the typed depth
+// error, never a fatal stack overflow.
+func TestDependsOnRecursive_DeepChain_DoesNotOverflow(t *testing.T) {
+	o := New()
+	top := insertDepChain(o, maxDependencyDepth+16)
+	found, err := o.dependsOnRecursive(o.nameIndex[top], "missing", make(map[string]struct{}), 0)
+	if err != nil {
+		if !errors.Is(err, ErrDependencyDepthExceeded) {
+			t.Fatalf("deep chain error = %v, want ErrDependencyDepthExceeded", err)
+		}
+		if found {
+			t.Fatal("deep chain returned found=true together with an error")
+		}
+		return
+	}
+	if found {
+		t.Fatal("deep chain returned found=true for a missing target")
+	}
+}
+
+// TestRegister_DeepChain_ReturnsDepthExceeded verifies a real Register whose
+// hard-dependency walk exceeds the cap surfaces ErrDependencyDepthExceeded
+// rather than overflowing the stack.
+func TestRegister_DeepChain_ReturnsDepthExceeded(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	top := insertDepChain(o, maxDependencyDepth+16)
+	err := o.Register(&testSvc{}, WithName("leaf"), DependsOn(top))
+	if !errors.Is(err, ErrDependencyDepthExceeded) {
+		t.Fatalf("Register over-deep hard chain = %v, want ErrDependencyDepthExceeded", err)
+	}
+	if _, ok := o.nameIndex["leaf"]; ok {
+		t.Fatal("rejected Register must not leave the entry in the registry")
+	}
+}
+
+// TestRegister_DeepSoftChain_ReturnsDepthExceeded covers the soft-edge path:
+// the depth error from a soft dependency's walk is propagated, not swallowed.
+func TestRegister_DeepSoftChain_ReturnsDepthExceeded(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn))
+	top := insertDepChain(o, maxDependencyDepth+16)
+	err := o.Register(&testSvc{}, WithName("leaf"), DependsOnSoft(top))
+	if !errors.Is(err, ErrDependencyDepthExceeded) {
+		t.Fatalf("Register over-deep soft chain = %v, want ErrDependencyDepthExceeded", err)
 	}
 }
 

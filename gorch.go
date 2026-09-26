@@ -518,6 +518,10 @@ func New(opts ...Option) *Orchestrator {
 // being removed (stopped/removed concurrently): a retryable "not now"
 // condition, distinct from ErrHasDependents.
 // Returns ErrNilService if svc is nil.
+// Returns ErrDependencyDepthExceeded if walking the dependency graph to check
+// for a cycle runs deeper than 10000 edges: the graph has outgrown
+// the registration-time assumption of a bounded, startup-sized acyclic graph,
+// and the walk stops with a typed error instead of overflowing the stack.
 //
 // The caller's RegisterOption closures are applied exactly once, outside the
 // orchestrator lock, before any structural validation. A non-idempotent option
@@ -639,7 +643,11 @@ func (o *Orchestrator) validateRegisterConfigLocked(cfg registerConfig) (registe
 			return cfg, fmt.Errorf("%w: dependency %q is being removed for service %s", ErrDependencyRemoving, dep, cfg.name)
 		}
 		// Check if dep transitively depends on cfg.name (would create a cycle).
-		if o.dependsOnRecursive(depEntry, cfg.name) {
+		found, err := o.dependsOnRecursive(depEntry, cfg.name, make(map[string]struct{}), 0)
+		if err != nil {
+			return cfg, err
+		}
+		if found {
 			return cfg, fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
 		}
 	}
@@ -654,7 +662,11 @@ func (o *Orchestrator) validateRegisterConfigLocked(cfg registerConfig) (registe
 		if depEntry == nil {
 			continue
 		}
-		if o.dependsOnRecursive(depEntry, cfg.name) {
+		found, err := o.dependsOnRecursive(depEntry, cfg.name, make(map[string]struct{}), 0)
+		if err != nil {
+			return cfg, err
+		}
+		if found {
 			return cfg, fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, cfg.name, dep)
 		}
 	}
@@ -769,30 +781,58 @@ func (o *Orchestrator) Busy(name string) bool {
 	return entry.starting.Load() || entry.removing.Load()
 }
 
+// maxDependencyDepth bounds the recursion in dependsOnRecursive. The graph is
+// only expected to be this deep under an unbounded registration/reload loop:
+// registration enforces an acyclic graph, but membership is dynamic and nothing
+// removes entries except Unregister, so a long-running supervisor that reloads
+// config grows the graph monotonically. Exceeding the cap returns
+// ErrDependencyDepthExceeded instead of overflowing the goroutine stack, which
+// is a fatal error no recover can catch.
+const maxDependencyDepth = 10000
+
 // dependsOnRecursive checks whether entry transitively depends on target via
-// either hard or soft dependency edges.
-// ponytail: DFS on small graphs (registration-time only); O(V+E) fine.
-func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string) bool {
+// either hard or soft dependency edges. visited makes the walk O(V+E) per call
+// by expanding each node at most once, so a diamond is not re-walked once per
+// path. depth bounds the recursion: once it exceeds maxDependencyDepth the walk
+// aborts with ErrDependencyDepthExceeded rather than overflowing the stack. The
+// caller must pass a fresh visited map and depth 0 per top-level check, and must
+// hold o.mu (the graph is read via lookupEntry).
+func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string, visited map[string]struct{}, depth int) (bool, error) {
 	if entry == nil {
-		return false
+		return false, nil
 	}
+	if depth > maxDependencyDepth {
+		return false, fmt.Errorf("%w: exceeds %d edges", ErrDependencyDepthExceeded, maxDependencyDepth)
+	}
+	if _, seen := visited[entry.name]; seen {
+		return false, nil
+	}
+	visited[entry.name] = struct{}{}
 	for _, dep := range entry.cfg.dependsOn {
 		if dep == target {
-			return true
+			return true, nil
 		}
-		if o.dependsOnRecursive(o.lookupEntry(dep), target) {
-			return true
+		found, err := o.dependsOnRecursive(o.lookupEntry(dep), target, visited, depth+1)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
 		}
 	}
 	for _, dep := range entry.cfg.softDependsOn {
 		if dep == target {
-			return true
+			return true, nil
 		}
-		if o.dependsOnRecursive(o.lookupEntry(dep), target) {
-			return true
+		found, err := o.dependsOnRecursive(o.lookupEntry(dep), target, visited, depth+1)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // Start begins the orchestrator lifecycle. Returns ErrAlreadyStarted if already started.

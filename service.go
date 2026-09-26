@@ -268,6 +268,14 @@ var (
 	// running dependents blocking a stop; here the caller has no dependents at
 	// all. Treat it as a retryable "not now" condition.
 	ErrDependencyRemoving = errors.New("gorch: dependency is being removed")
+	// ErrDependencyDepthExceeded is returned by Register when the walk that
+	// checks a new dependency for a cycle exceeds maxDependencyDepth edges. The
+	// registered graph is only expected to reach this depth under an unbounded
+	// registration/reload loop — registration is otherwise a startup-sized,
+	// acyclic graph. The cap turns what would be a fatal, unrecoverable stack
+	// overflow into a typed error the caller can classify and act on (refuse the
+	// registration, or prune/free the graph and retry).
+	ErrDependencyDepthExceeded = errors.New("gorch: dependency depth limit exceeded")
 	// ErrReentrantMembership is returned when a membership operation re-enters
 	// from a service's own Start or Stop callback on the same goroutine (for
 	// example, a service stopping itself from its Start). It is a programming
