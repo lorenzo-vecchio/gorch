@@ -832,6 +832,196 @@ func TestFailedStart_RollbackHooksBounded(t *testing.T) {
 	}
 }
 
+// stopOrderRecorder records the order in which services' Stop() methods run.
+type stopOrderRecorder struct {
+	mu    sync.Mutex
+	order []string
+}
+
+func (r *stopOrderRecorder) record(name string) {
+	r.mu.Lock()
+	r.order = append(r.order, name)
+	r.mu.Unlock()
+}
+
+func (r *stopOrderRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.order))
+	copy(out, r.order)
+	return out
+}
+
+// onlyNames returns the entries of order restricted to names, preserving order.
+func onlyNames(order []string, names ...string) []string {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var out []string
+	for _, n := range order {
+		if want[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// TestFailedStart_RollbackOrderIsReverseTopological pins that the failed-Start
+// rollback unwinds in reverse topological order, not reverse registration
+// order. The graph registers the dependent before its dependency — via a soft
+// dependency, since parseRegisterOptions rejects a hard dependency that is not
+// yet registered — so registration order is a, b, c while topological order is
+// b, a, c. c (hard-dependent on a) fails to start, so the rollback must stop a
+// before b; reverse registration would stop b first.
+func TestFailedStart_RollbackOrderIsReverseTopological(t *testing.T) {
+	rec := &stopOrderRecorder{}
+	svc := func(name string) Service {
+		return &testSvc{
+			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			stopFn:  func() error { rec.record(name); return nil },
+		}
+	}
+
+	o := New(WithHealthChecksDisabled())
+	if err := o.Register(svc("a"), WithName("a"), DependsOnSoft("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(svc("b"), WithName("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(svc("c"), WithName("c"), DependsOn("a"),
+		WithOnBeforeStart(func(string) error { return errors.New("c cannot start") })); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.Start(); err == nil {
+		t.Fatal("Start should have failed on c")
+	}
+
+	order := rec.snapshot()
+	aIdx, bIdx := indexOf(order, "a"), indexOf(order, "b")
+	if aIdx == -1 || bIdx == -1 {
+		t.Fatalf("rollback stop order = %v, want both a and b stopped", order)
+	}
+	if aIdx > bIdx {
+		t.Errorf("rollback stop order = %v, want dependent a stopped before dependency b", order)
+	}
+}
+
+// TestFailedStart_RollbackOrder_MatchesOrchestratorStop pins that the rollback
+// and a normal orchestrator Stop unwind the same graph in the same order. On
+// the rollback path c never started, so only a and b are stopped; comparing the
+// a/b subsequences of the two orders isolates the ordering invariant.
+func TestFailedStart_RollbackOrder_MatchesOrchestratorStop(t *testing.T) {
+	registerGraph := func(o *Orchestrator, rec *stopOrderRecorder, failC bool) error {
+		svc := func(name string) Service {
+			return &testSvc{
+				startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+				stopFn:  func() error { rec.record(name); return nil },
+			}
+		}
+		if err := o.Register(svc("a"), WithName("a"), DependsOnSoft("b")); err != nil {
+			return err
+		}
+		if err := o.Register(svc("b"), WithName("b")); err != nil {
+			return err
+		}
+		opts := []RegisterOption{WithName("c"), DependsOn("a")}
+		if failC {
+			opts = append(opts, WithOnBeforeStart(func(string) error { return errors.New("c cannot start") }))
+		}
+		return o.Register(svc("c"), opts...)
+	}
+
+	rollbackRec := &stopOrderRecorder{}
+	rollback := New(WithHealthChecksDisabled())
+	if err := registerGraph(rollback, rollbackRec, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback.Start(); err == nil {
+		t.Fatal("Start should have failed on c")
+	}
+
+	stopRec := &stopOrderRecorder{}
+	stopped := New(WithHealthChecksDisabled())
+	if err := registerGraph(stopped, stopRec, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := stopped.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stopped.Stop(time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	rollbackAB := onlyNames(rollbackRec.snapshot(), "a", "b")
+	stopAB := onlyNames(stopRec.snapshot(), "a", "b")
+	if len(rollbackAB) != 2 || len(stopAB) != 2 {
+		t.Fatalf("a/b stop order = rollback %v, Stop %v; want both stopped on each",
+			rollbackRec.snapshot(), stopRec.snapshot())
+	}
+	if strings.Join(rollbackAB, ",") != strings.Join(stopAB, ",") {
+		t.Errorf("a/b stop order differs: rollback %v, Stop %v", rollbackAB, stopAB)
+	}
+}
+
+// TestFailedStart_Rollback_NoCascadeOfDependencyStopErrors pins that a correct
+// reverse-topological rollback does not manufacture teardown errors. b's Stop()
+// fails if it runs before its dependent a has stopped; under the old
+// reverse-registration order b stopped first and that error was joined into the
+// rollback, burying the real start failure. With reverse-topological order a
+// stops first, so the only error is the original start failure.
+func TestFailedStart_Rollback_NoCascadeOfDependencyStopErrors(t *testing.T) {
+	var mu sync.Mutex
+	aStopped := false
+	orderErr := errors.New("b stopped before its dependent a")
+	startErr := errors.New("c cannot start")
+
+	o := New(WithHealthChecksDisabled())
+	a := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		stopFn: func() error {
+			mu.Lock()
+			aStopped = true
+			mu.Unlock()
+			return nil
+		},
+	}
+	b := &testSvc{
+		startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+		stopFn: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+			if !aStopped {
+				return orderErr
+			}
+			return nil
+		},
+	}
+	if err := o.Register(a, WithName("a"), DependsOnSoft("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(b, WithName("b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Register(&testSvc{}, WithName("c"), DependsOn("a"),
+		WithOnBeforeStart(func(string) error { return startErr })); err != nil {
+		t.Fatal(err)
+	}
+
+	err := o.Start()
+	if err == nil {
+		t.Fatal("Start should have failed on c")
+	}
+	if !errors.Is(err, startErr) {
+		t.Errorf("Start error = %v, want the original start failure", err)
+	}
+	if errors.Is(err, orderErr) {
+		t.Errorf("rollback error = %v, must not contain the dependency teardown cascade", err)
+	}
+}
+
 // TestFailedStart_ThenRetry_Succeeds pins that an ordinary failed Start with a
 // non-blocking rollback leaves the orchestrator genuinely reusable.
 func TestFailedStart_ThenRetry_Succeeds(t *testing.T) {

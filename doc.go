@@ -77,12 +77,15 @@
 //     with another goroutine's reservation is transient and returns the
 //     retryable ErrMembershipBusy. Busy(name) is the predicate a caller can poll
 //     to observe the reservation instead of racing.
-//   - A failed Start rolls back within a bounded budget: the per-service stop
-//     sequences and the final wait for instance and log-pump goroutines share
-//     one failed-start deadline (WithFailedStartTimeout, default 30s), so a
-//     service that blocks in Stop() does not hang Start unless the bound is
-//     removed with a negative WithFailedStartTimeout. Overrunning the budget
-//     reports ErrStopTimeout. The reset is best-effort — a goroutine that
+//   - A failed Start rolls back within a bounded budget: services that had
+//     started are stopped in reverse topological order (the same order as Stop),
+//     so a dependency is never torn down before its dependent regardless of
+//     registration order. The per-service stop sequences and the final wait for
+//     instance and log-pump goroutines share one failed-start deadline
+//     (WithFailedStartTimeout, default 30s), so a service that blocks in Stop()
+//     does not hang Start unless the bound is removed with a negative
+//     WithFailedStartTimeout. Overrunning the budget reports ErrStopTimeout. The
+//     reset is best-effort — a goroutine that
 //     ignores cancellation may outlive the failed Start — so the orchestrator is
 //     left restartable and Start can be retried.
 //   - A ServiceLogger never blocks: it drops an entry when the log channel is
