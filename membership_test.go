@@ -589,6 +589,288 @@ func TestStartService_ReentrantFromOwnStart(t *testing.T) {
 	}
 }
 
+// TestStartService_OnRunning_MatchesDocumentedSemantics pins the chosen rule for
+// an already-Running service: a no-op (nil), never an implicit restart. Restart
+// is the explicit StopService + StartService. Cron reconciles to Running without
+// rescheduling; runOnce is the deliberate re-run exception (see TestStartService's
+// "runOnce re-runs once").
+func TestStartService_OnRunning_MatchesDocumentedSemantics(t *testing.T) {
+	t.Run("persistent", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+
+		var hooks atomic.Int32
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+		if err := o.Register(svc, WithName("p"),
+			WithOnBeforeStart(func(string) error { hooks.Add(1); return nil })); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.StartService("p"); err != nil {
+			t.Fatalf("StartService: %v", err)
+		}
+		waitForStatus(t, o, "p", StatusRunning)
+
+		startsBefore := o.Metrics().Starts
+		for i := 0; i < 3; i++ {
+			if err := o.StartService("p"); err != nil {
+				t.Fatalf("StartService on Running = %v, want nil (no-op)", err)
+			}
+		}
+		if got := o.Metrics().Starts; got != startsBefore {
+			t.Errorf("StartService on Running changed Starts: %d -> %d", startsBefore, got)
+		}
+		if got := hooks.Load(); got != 1 {
+			t.Errorf("before-start hook fired %d times, want 1", got)
+		}
+	})
+
+	t.Run("cron", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+		if err := o.Register(&testSvc{}, WithName("c"), WithCron("0 0 0 1 1 *", CronParallel)); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.StartService("c"); err != nil {
+			t.Fatalf("StartService cron: %v", err)
+		}
+		entry := entryNamed(t, o, "c")
+		o.mu.Lock()
+		idBefore := entry.cronID
+		o.mu.Unlock()
+		startsBefore := o.Metrics().Starts
+
+		if err := o.StartService("c"); err != nil {
+			t.Fatalf("StartService on Running cron = %v, want nil (no-op)", err)
+		}
+		o.mu.Lock()
+		idAfter := entry.cronID
+		o.mu.Unlock()
+		if idAfter != idBefore {
+			t.Errorf("StartService on Running cron rescheduled it: id %d -> %d", idBefore, idAfter)
+		}
+		if got := o.Metrics().Starts; got != startsBefore {
+			t.Errorf("StartService on Running cron changed Starts: %d -> %d", startsBefore, got)
+		}
+	})
+}
+
+// TestStartService_IdempotentIfNoop pins that concurrent StartService calls on a
+// not-yet-running persistent entry start exactly one instance: the winner takes
+// the reservation and the losers return the transient ErrMembershipBusy (or a
+// no-op nil if they arrive after it reached Running). A barrier releases every
+// caller together, so the collision is exercised without sleeping for ordering.
+func TestStartService_IdempotentIfNoop(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	var beforeHooks, afterHooks atomic.Int32
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	if err := o.Register(svc, WithName("x"),
+		WithOnBeforeStart(func(string) error { beforeHooks.Add(1); return nil }),
+		WithOnAfterStart(func(string, error) { afterHooks.Add(1) })); err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 32
+	barrier := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-barrier
+			errs[i] = o.StartService("x")
+		}(i)
+	}
+	close(barrier)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil && !errors.Is(err, ErrMembershipBusy) {
+			t.Errorf("caller %d: StartService = %v, want nil or ErrMembershipBusy", i, err)
+		}
+	}
+	waitForStatus(t, o, "x", StatusRunning)
+	if got := o.Metrics().Starts; got != 1 {
+		t.Errorf("Metrics().Starts = %d, want 1", got)
+	}
+	entry := entryNamed(t, o, "x")
+	entry.ownerMu.Lock()
+	owners := len(entry.owners)
+	entry.ownerMu.Unlock()
+	if owners != 1 {
+		t.Errorf("live owners = %d, want 1", owners)
+	}
+	if got := beforeHooks.Load(); got != 1 {
+		t.Errorf("before-start hook fired %d times, want 1", got)
+	}
+	if got := afterHooks.Load(); got != 1 {
+		t.Errorf("after-start hook fired %d times, want 1", got)
+	}
+}
+
+// TestStartService_OnStarting_ReturnsTypedError pins that a start colliding with
+// an in-flight reservation returns the retryable ErrMembershipBusy, never a
+// silent second start and never the programming-error ErrReentrantMembership
+// (that is the same-goroutine case, covered by TestStartService_ReentrantFromOwnStart).
+func TestStartService_OnStarting_ReturnsTypedError(t *testing.T) {
+	t.Run("white-box reservation", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+		if err := o.Register(&namedSvc{}, WithName("r")); err != nil {
+			t.Fatal(err)
+		}
+		entry := entryNamed(t, o, "r")
+		entry.starting.Store(true)
+		defer entry.starting.Store(false)
+
+		err := o.StartService("r")
+		if !errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("StartService on reserved entry = %v, want ErrMembershipBusy", err)
+		}
+		if errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("StartService on reserved entry = %v, must not be ErrReentrantMembership", err)
+		}
+	})
+
+	t.Run("real in-flight start", func(t *testing.T) {
+		o := New(WithHealthChecksDisabled())
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer o.Stop(time.Second)
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		svc := &testSvc{startFn: func(ctx context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		}}
+		// runOnce runs Start synchronously on the calling goroutine, so the entry
+		// stays reserved while blocked and the colliding call is deterministic.
+		if err := o.Register(svc, WithName("r"), WithRunOnce()); err != nil {
+			t.Fatal(err)
+		}
+		startErr := make(chan error, 1)
+		go func() { startErr <- o.StartService("r") }()
+		<-entered
+
+		err := o.StartService("r")
+		if !errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("concurrent StartService = %v, want ErrMembershipBusy", err)
+		}
+		close(release)
+		if err := <-startErr; err != nil {
+			t.Fatalf("winning StartService = %v", err)
+		}
+		if got := svc.startCalls.Load(); got != 1 {
+			t.Errorf("Start ran %d times, want 1", got)
+		}
+	})
+}
+
+// TestStartService_OnRunning_DoesNotOrphanInstance is the regression guard for
+// the start reservation: repeated and concurrent StartService calls on a Running
+// persistent service must leave exactly one live instance — one owner, one
+// metric, one hook pair, one Stop — with no orphaned goroutine (a leaked
+// wait-group add would make orchestrator Stop hang). Before the reservation was
+// claimed atomically with the start decision, two callers could both pass the
+// checks and start a second instance behind the first.
+func TestStartService_OnRunning_DoesNotOrphanInstance(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	var beforeHooks, afterHooks atomic.Int32
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	if err := o.Register(svc, WithName("x"),
+		WithOnBeforeStart(func(string) error { beforeHooks.Add(1); return nil }),
+		WithOnAfterStart(func(string, error) { afterHooks.Add(1) })); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("x"); err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+	waitForStatus(t, o, "x", StatusRunning)
+
+	for i := 0; i < 5; i++ {
+		if err := o.StartService("x"); err != nil {
+			t.Fatalf("sequential StartService = %v, want nil", err)
+		}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := o.StartService("x"); err != nil {
+				t.Errorf("concurrent StartService = %v, want nil", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := o.Metrics().Starts; got != 1 {
+		t.Errorf("Metrics().Starts = %d, want 1", got)
+	}
+	if got := svc.startCalls.Load(); got != 1 {
+		t.Errorf("Start ran %d times, want 1", got)
+	}
+	if got := beforeHooks.Load(); got != 1 {
+		t.Errorf("before-start hook fired %d times, want 1", got)
+	}
+	if got := afterHooks.Load(); got != 1 {
+		t.Errorf("after-start hook fired %d times, want 1", got)
+	}
+	entry := entryNamed(t, o, "x")
+	entry.ownerMu.Lock()
+	owners := len(entry.owners)
+	entry.ownerMu.Unlock()
+	if owners != 1 {
+		t.Errorf("live owners = %d, want 1", owners)
+	}
+
+	// One instance means one wait-group add and one exit latch: Stop must return
+	// rather than hang on a leaked add from an orphaned instance.
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- o.Stop(2 * time.Second) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop hung: a duplicate instance leaked the wait group")
+	}
+	if got := svc.stopCalls.Load(); got != 1 {
+		t.Errorf("Stop ran %d times, want 1", got)
+	}
+}
+
 // ── Per-service Messenger ownership ──
 
 // TestMessenger_ZeroValueUsable guards the root/view indirection: a bare

@@ -7,11 +7,24 @@ import (
 	"time"
 )
 
-// StartService starts (or restarts) a registered service by name.
+// StartService starts a registered service by name.
 //
 // A persistent service is (re)started in a fresh goroutine; a cron service is
 // (re)scheduled on the live scheduler; a runOnce service is re-run once. An
-// already-running persistent or cron entry is a no-op.
+// already-running persistent or cron entry is a no-op: repeated or concurrent
+// calls leave exactly one instance live, and the before/after-start hooks fire
+// only for the instance actually started. A runOnce entry is the deliberate
+// re-run exception.
+//
+// StartService does not restart a live instance: to replace one, call
+// StopService and then StartService. A start that is already reserved — by
+// another StartService, a StartGroup, or the entry's own in-flight Start — is
+// rejected with the transient ErrMembershipBusy; a start re-entered from the
+// entry's own Start on the same goroutine is the programming error
+// ErrReentrantMembership. The reservation is claimed atomically with the start
+// decision under the membership lock (released before any user code), so a
+// concurrent StopService/Unregister cannot interleave between the checks and the
+// start to double-start or orphan an instance.
 //
 // Every hard dependency (DependsOn) must be StatusRunning first. Returns
 // ErrServiceNotFound for an unknown name, ErrDependencyNotFound for a missing
@@ -21,29 +34,42 @@ import (
 // shutdown has begun.
 // Thread-safe.
 func (o *Orchestrator) StartService(name string) error {
-	o.mu.RLock()
+	// Serialize the start decision and its reservation with StopService,
+	// Unregister, StartGroup and Start (which all take membershipMu): the
+	// reservation must be claimed atomically with the checks below, or a second
+	// caller can slip between them and start a duplicate instance, and a
+	// concurrent teardown can tear down an entry about to start. The lock is
+	// released before any user code runs (startOneService and the hooks), so a
+	// service's Start may still call a membership op without self-deadlocking.
+	o.membershipMu.Lock()
+	o.mu.Lock()
+	unlock := func() {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+	}
 	if o.stopping {
-		o.mu.RUnlock()
+		unlock()
 		return ErrOrchestratorStopping
 	}
 	if o.stopped {
-		o.mu.RUnlock()
+		unlock()
 		return ErrOrchestratorStopped
 	}
 	// There is no scheduler or service context to start into before Start; a
 	// cron entry in particular would otherwise reach a nil scheduler and panic.
 	if !o.started {
-		o.mu.RUnlock()
+		unlock()
 		return ErrOrchestratorNotStarted
 	}
 	entry := o.lookupEntry(name)
-	o.mu.RUnlock()
 	if entry == nil {
+		unlock()
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
 	}
 	// A stopped entry is looked up before it is unregistered: treat a teardown in
 	// progress as already gone so nothing can restart it (C11).
 	if entry.removing.Load() {
+		unlock()
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
 	}
 	if entry.starting.Load() {
@@ -51,7 +77,9 @@ func (o *Orchestrator) StartService(name string) error {
 		// (same goroutine: a genuine re-entry, a programming error) or by
 		// another goroutine's start (a transient collision the caller may
 		// retry). Only goroutine identity can tell them apart.
-		if entry.lifecycleOwnedBy(curGoroutineID()) {
+		owned := entry.lifecycleOwnedBy(curGoroutineID())
+		unlock()
+		if owned {
 			return fmt.Errorf("%w: %s", ErrReentrantMembership, name)
 		}
 		return fmt.Errorf("%w: %s", ErrMembershipBusy, name)
@@ -60,13 +88,13 @@ func (o *Orchestrator) StartService(name string) error {
 	// Hard dependencies must exist (they may have been unregistered) and be
 	// running before the dependent starts (C12).
 	for _, dep := range entry.cfg.dependsOn {
-		o.mu.RLock()
 		depEntry := o.lookupEntry(dep)
-		o.mu.RUnlock()
 		if depEntry == nil {
+			unlock()
 			return fmt.Errorf("%w: %s -> %s", ErrDependencyNotFound, name, dep)
 		}
 		if s := o.statusOf(depEntry); s != StatusRunning {
+			unlock()
 			return fmt.Errorf("%w: %s depends on %s (%s)", ErrDependencyNotRunning, name, dep, s)
 		}
 	}
@@ -74,6 +102,7 @@ func (o *Orchestrator) StartService(name string) error {
 	// Idempotent for an already-running persistent/cron entry (runOnce is the
 	// deliberate exception — it re-runs once).
 	if o.statusOf(entry) == StatusRunning {
+		unlock()
 		return nil
 	}
 
@@ -91,9 +120,19 @@ func (o *Orchestrator) StartService(name string) error {
 		case <-done:
 			// No live instance: fall through and (re)start.
 		default:
+			unlock()
 			return nil
 		}
 	}
+
+	// Claim this entry for the start before releasing the lock, exactly like
+	// StartGroup: the flag stays set across the synchronous start (and the user
+	// Start) so a colliding membership op is rejected as busy rather than
+	// double-starting. startOneService re-sets and clears the same flag; the
+	// clear on return is harmless because the guarded work is done.
+	entry.starting.Store(true)
+	unlock()
+	defer entry.starting.Store(false)
 
 	switch {
 	case entry.cfg.cronSpec != "":
@@ -253,9 +292,10 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 
 	// Release subscriptions only after the contexts were cancelled and the
 	// goroutines exited, so no instance can re-subscribe post-drain. The
-	// removing flag stays set until the drain finishes: a concurrent
-	// StartService (which takes no membership lock) must keep seeing the entry
-	// as unavailable, or it could restart and be drained a moment later.
+	// removing flag stays set until the drain finishes, past the point where the
+	// membership lock is released: a concurrent StartService acquiring that lock
+	// must still see the entry as unavailable, or it could restart and be
+	// drained a moment later.
 	for _, e := range set {
 		o.drainService(e)
 	}
