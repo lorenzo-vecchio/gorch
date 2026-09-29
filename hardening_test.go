@@ -137,6 +137,50 @@ func TestNoPublicAPI_Panics(t *testing.T) {
 		})
 	})
 
+	t.Run("zero_value_orchestrator", func(t *testing.T) {
+		// #87: the zero-value receiver must satisfy the same panic-free contract
+		// as one built by New. Every public entry point is exercised here.
+		var o Orchestrator
+		mustNotPanic(t, "zero Names", func() { _ = o.Names() })
+		mustNotPanic(t, "zero Statuses", func() { _ = o.Statuses() })
+		mustNotPanic(t, "zero Status", func() { _, _ = o.Status("nope") })
+		mustNotPanic(t, "zero Count", func() { _ = o.Count() })
+		mustNotPanic(t, "zero CountRunning", func() { _ = o.CountRunning() })
+		mustNotPanic(t, "zero RunningNames", func() { _ = o.RunningNames() })
+		mustNotPanic(t, "zero Metrics", func() { _ = o.Metrics() })
+		mustNotPanic(t, "zero Done", func() { _ = o.Done() })
+		mustNotPanic(t, "zero Health", func() { _ = o.Health() })
+		mustNotPanic(t, "zero Busy", func() { _ = o.Busy("nope") })
+		mustNotPanic(t, "zero IsReady", func() { _ = o.IsReady(context.Background(), "nope") })
+		mustNotPanic(t, "zero Dependents", func() { _, _ = o.Dependents("nope") })
+		mustNotPanic(t, "zero DependenciesOf", func() { _, _ = o.DependenciesOf("nope") })
+		mustNotPanic(t, "zero StatusesByGroup", func() { _ = o.StatusesByGroup("g") })
+		mustNotPanic(t, "zero StatusesByLabel", func() { _ = o.StatusesByLabel("k", "v") })
+		mustNotPanic(t, "zero StartService", func() { _ = o.StartService("nope") })
+		mustNotPanic(t, "zero StopService", func() { _ = o.StopService("nope", time.Second) })
+		mustNotPanic(t, "zero Unregister", func() { _ = o.Unregister("nope", time.Second) })
+		mustNotPanic(t, "zero StartGroup", func() { _ = o.StartGroup("g") })
+		mustNotPanic(t, "zero StopGroup", func() { _ = o.StopGroup("g", time.Second) })
+		mustNotPanic(t, "zero WaitFor", func() { _ = o.WaitFor("nope", StatusRunning, time.Millisecond) })
+		mustNotPanic(t, "zero Register", func() { _ = o.Register(nil) })
+		mustNotPanic(t, "zero RegisterFunc", func() { _ = o.RegisterFunc("fn", nil, nil) })
+
+		// The writes that used to panic on a nil map/channel must succeed on the
+		// same zero value.
+		if err := o.Register(&namedSvc{}, WithName("z")); err != nil {
+			t.Fatalf("zero-value Register = %v, want nil", err)
+		}
+		if err := o.Start(); err != nil {
+			t.Fatalf("zero-value Start = %v", err)
+		}
+		if err := o.StartService("z"); err != nil {
+			t.Fatalf("zero-value StartService = %v", err)
+		}
+		if err := o.Stop(time.Second); err != nil {
+			t.Fatalf("zero-value Stop = %v", err)
+		}
+	})
+
 	t.Run("zero_value_messenger", func(t *testing.T) {
 		var m Messenger
 		mustNotPanic(t, "Subscribe", func() {

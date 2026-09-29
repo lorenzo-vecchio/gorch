@@ -71,6 +71,10 @@
 //     reject a nil context with ErrNilContext. An unknown or empty group selects
 //     nothing and returns nil (a group is a filter tag, not an entity), and
 //     StopGroup before Start is a no-op, consistent with StopService/Unregister.
+//   - An Orchestrator zero value is usable: its first public call lazily
+//     initialises it with the same defaults as New(), so `var o Orchestrator`
+//     behaves like New() and no public entry point panics on an uninitialised
+//     registry, Messenger, or shutdown channel.
 //   - Introspection reports what is registered, not what is live: Count, Names,
 //     and Statuses include an entry from the moment it is registered, so a
 //     hot-added, not-yet-started service and a staged cron entry are both
