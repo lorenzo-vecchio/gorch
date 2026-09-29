@@ -45,6 +45,11 @@
 //     atomically, so concurrent calls start exactly one instance and a collision
 //     with another goroutine's in-flight reservation is the transient
 //     ErrMembershipBusy (a runOnce entry is the deliberate re-run exception).
+//   - Concurrent Start calls are claimed atomically: the caller that wins the
+//     claim runs the lifecycle's start and every other caller returns
+//     ErrAlreadyStarted immediately without waiting for it, so a nil return
+//     always identifies the call that actually ran the start. A failed Start
+//     releases the claim, leaving the lifecycle retryable.
 //   - The wire format is encoding/gob and is part of the public contract; types
 //     passed through the typed Messenger helpers must be gob-compatible.
 //   - Publish is drop-only: when a subscriber's buffer is full the message is

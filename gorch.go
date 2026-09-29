@@ -444,12 +444,20 @@ func (e *serviceEntry) cronDrain() <-chan struct{} {
 type Orchestrator struct {
 	cfg     config
 	started bool
+	// startClaimed closes the window between Start's o.started pre-check and the
+	// point where the startOnce closure publishes o.started. The Start call that
+	// wins the claim sets it; resetAfterStartFailure clears it when that Start
+	// fails, so a retry can claim again. A concurrent Start that finds it set
+	// returns ErrAlreadyStarted immediately instead of blocking on startOnce and
+	// returning a startErr it never wrote (nil) while nothing started (issue #32).
+	// Guarded by mu.
+	startClaimed bool
 	// stopping is true from the moment Stop begins until it returns; stopped is
 	// true once Stop has completed. Both are guarded by mu and gate dynamic
 	// membership ops (C6, D10).
 	stopping bool
 	stopped  bool
-	mu       sync.RWMutex // protects started, stopping, stopped, entries slice, nameIndex
+	mu       sync.RWMutex // protects started, startClaimed, stopping, stopped, entries slice, nameIndex
 
 	// membershipMu serializes StopService, Unregister, StartGroup and StopGroup
 	// so their entry selection and reservation cannot interleave (C3, D16). It
@@ -902,13 +910,25 @@ func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string, vi
 // The whole-orchestrator lifecycle is single-shot: after a successful Stop it cannot
 // be restarted, and a subsequent Start returns ErrAlreadyStarted. Registering after
 // Stop returns ErrOrchestratorStopped instead.
+// Concurrent Start calls are claimed atomically: the caller that wins the claim runs
+// the start, and every other caller returns ErrAlreadyStarted immediately without
+// waiting for it. A nil return therefore means this call ran the start, not merely
+// that some concurrent Start did.
 // Thread-safe.
 func (o *Orchestrator) Start() error {
+	// Claim the lifecycle before entering startOnce. Without the claim a second
+	// caller could pass the o.started pre-check while the winner is still inside
+	// the closure (o.started is published there), block on startOnce.Do, and then
+	// return the startErr local it never wrote — nil — even though it started
+	// nothing (issue #32). startClaimed stays set for the rest of a successful
+	// lifecycle; resetAfterStartFailure releases it on failure so a retry can
+	// claim again.
 	o.mu.Lock()
-	if o.started {
+	if o.started || o.startClaimed {
 		o.mu.Unlock()
 		return ErrAlreadyStarted
 	}
+	o.startClaimed = true
 	o.mu.Unlock()
 
 	var startErr error
@@ -1179,6 +1199,7 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline 
 
 	o.mu.Lock()
 	o.started = false
+	o.startClaimed = false
 	o.stopping = false
 	o.stopped = false
 	o.ctx = nil
@@ -1197,9 +1218,12 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline 
 		entry.resetEntryLocked()
 		entry.setLogger(nil)
 	}
-	o.mu.Unlock()
+	// Reset the once gates in the same critical section as the flags above: a
+	// concurrent Start must not observe the released claim and then find a stale
+	// consumed startOnce (which would run no closure and return nil).
 	o.startOnce = sync.Once{}
 	o.stopOnce = sync.Once{}
+	o.mu.Unlock()
 	return resetErr
 }
 
