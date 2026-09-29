@@ -395,6 +395,208 @@ func TestStart_RetryAfterFailure(t *testing.T) {
 	})
 }
 
+// TestStart_Concurrent_SecondCallerBehaviour pins the concurrent-Start contract:
+// the caller that wins the lifecycle claim runs the start, and a caller that
+// loses it returns ErrAlreadyStarted without waiting for the winner and without
+// running any service itself.
+//
+// The test opens the race window deterministically by holding the membership
+// lock, which the winner's startOnce closure takes before it can publish
+// o.started. The loser therefore races the claim, not a fully started
+// orchestrator — exactly the interleaving where it used to return nil.
+func TestStart_Concurrent_SecondCallerBehaviour(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn), WithHealthChecksDisabled())
+
+	svc := &testSvc{startFn: func(context.Context) error { return nil }}
+	if err := o.Register(svc, WithName("svc"), WithRunOnce()); err != nil {
+		t.Fatal(err)
+	}
+
+	unlockMembership := sync.OnceFunc(o.membershipMu.Unlock)
+	defer unlockMembership()
+	o.membershipMu.Lock()
+
+	winner := make(chan error, 1)
+	go func() { winner <- o.Start() }()
+
+	// Wait until the winner has claimed the lifecycle. Until it does, the second
+	// caller would race a plainly-not-started orchestrator instead of the claim.
+	waitUntil(t, func() bool {
+		o.mu.RLock()
+		claimed := o.startClaimed
+		o.mu.RUnlock()
+		return claimed
+	}, "winning Start never claimed the lifecycle")
+
+	loser := make(chan error, 1)
+	go func() { loser <- o.Start() }()
+	select {
+	case err := <-loser:
+		if !errors.Is(err, ErrAlreadyStarted) {
+			t.Fatalf("loser Start = %v, want ErrAlreadyStarted", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("loser Start blocked on the winner instead of returning ErrAlreadyStarted")
+	}
+
+	// The winner is still blocked inside its closure, so o.started has not been
+	// published: the loser really did race the claim window.
+	o.mu.RLock()
+	started := o.started
+	o.mu.RUnlock()
+	if started {
+		t.Fatal("winner published o.started before the loser was exercised")
+	}
+
+	unlockMembership()
+	if err := <-winner; err != nil {
+		t.Fatalf("winning Start = %v, want nil", err)
+	}
+	if got := svc.startCalls.Load(); got != 1 {
+		t.Fatalf("service Start ran %d times, want 1 (the loser must start nothing)", got)
+	}
+	if err := o.Stop(time.Second); err != nil {
+		t.Fatalf("Stop = %v", err)
+	}
+}
+
+// TestStart_Concurrent_WhenWinnerFails pins that a concurrent Start never reports
+// success while the lifecycle is not started: the loser returns ErrAlreadyStarted
+// even when the winner's Start goes on to fail and reset the orchestrator.
+func TestStart_Concurrent_WhenWinnerFails(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn), WithHealthChecksDisabled())
+
+	boom := errors.New("winner boom")
+	if err := o.Register(&errSvc{err: boom}, WithName("gate"), WithRunOnce()); err != nil {
+		t.Fatal(err)
+	}
+
+	unlockMembership := sync.OnceFunc(o.membershipMu.Unlock)
+	defer unlockMembership()
+	o.membershipMu.Lock()
+
+	winner := make(chan error, 1)
+	go func() { winner <- o.Start() }()
+	waitUntil(t, func() bool {
+		o.mu.RLock()
+		claimed := o.startClaimed
+		o.mu.RUnlock()
+		return claimed
+	}, "winning Start never claimed the lifecycle")
+
+	loser := make(chan error, 1)
+	go func() { loser <- o.Start() }()
+	select {
+	case err := <-loser:
+		if err == nil {
+			t.Fatal("concurrent Start returned nil while the winner had not finished")
+		}
+		if !errors.Is(err, ErrAlreadyStarted) {
+			t.Fatalf("loser Start = %v, want ErrAlreadyStarted", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("concurrent Start blocked on a winner that then failed")
+	}
+
+	unlockMembership()
+	if err := <-winner; !errors.Is(err, boom) {
+		t.Fatalf("winning Start = %v, want %v", err, boom)
+	}
+
+	// A failed Start releases the claim: the loser did not return nil, and the
+	// orchestrator is genuinely reset rather than left half-started.
+	o.mu.RLock()
+	started := o.started
+	claimed := o.startClaimed
+	o.mu.RUnlock()
+	if started || claimed {
+		t.Fatalf("after the winner failed: started=%v claimed=%v, want false,false", started, claimed)
+	}
+}
+
+// TestRun_Concurrent_DoesNotSilentlySucceed pins that Run inherits the
+// concurrent-Start decision: a second Run returns ErrAlreadyStarted instead of
+// blocking on a shutdown signal after a Start it did not run.
+func TestRun_Concurrent_DoesNotSilentlySucceed(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn), WithHealthChecksDisabled())
+
+	boom := errors.New("run winner boom")
+	if err := o.Register(&errSvc{err: boom}, WithName("gate"), WithRunOnce()); err != nil {
+		t.Fatal(err)
+	}
+
+	unlockMembership := sync.OnceFunc(o.membershipMu.Unlock)
+	defer unlockMembership()
+	o.membershipMu.Lock()
+
+	winner := make(chan error, 1)
+	go func() { winner <- o.Run(time.Second) }()
+	waitUntil(t, func() bool {
+		o.mu.RLock()
+		claimed := o.startClaimed
+		o.mu.RUnlock()
+		return claimed
+	}, "winning Run never claimed the lifecycle")
+
+	loser := make(chan error, 1)
+	go func() { loser <- o.Run(time.Second) }()
+	select {
+	case err := <-loser:
+		if err == nil {
+			t.Fatal("concurrent Run returned nil while the winner had not finished")
+		}
+		if !errors.Is(err, ErrAlreadyStarted) {
+			t.Fatalf("loser Run = %v, want ErrAlreadyStarted", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("loser Run blocked instead of returning ErrAlreadyStarted")
+	}
+
+	unlockMembership()
+	if err := <-winner; !errors.Is(err, boom) {
+		t.Fatalf("winning Run = %v, want %v", err, boom)
+	}
+}
+
+// TestStop_Concurrent_IsIdempotent pins the documented Stop-vs-Stop behaviour:
+// concurrent Stop calls are a no-op for the losers. The first runs the shutdown;
+// the others return nil once it completes and never run a second teardown.
+func TestStop_Concurrent_IsIdempotent(t *testing.T) {
+	o := New(WithLogLevel(LogLevelWarn), WithHealthChecksDisabled())
+
+	stopEntered := make(chan struct{})
+	stopRelease := make(chan struct{})
+	var once sync.Once
+	svc := &testSvc{stopFn: func() error {
+		once.Do(func() { close(stopEntered) })
+		<-stopRelease
+		return nil
+	}}
+	if err := o.Register(svc, WithName("svc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	first := make(chan error, 1)
+	go func() { first <- o.Stop(time.Second) }()
+	waitRecv(t, stopEntered)
+
+	second := make(chan error, 1)
+	go func() { second <- o.Stop(time.Second) }()
+	close(stopRelease)
+
+	for i, ch := range []<-chan error{first, second} {
+		if err := <-ch; err != nil {
+			t.Fatalf("Stop caller %d = %v, want nil", i+1, err)
+		}
+	}
+	if got := svc.stopCalls.Load(); got != 1 {
+		t.Fatalf("service Stop ran %d times, want 1 (the loser must not re-run teardown)", got)
+	}
+}
+
 // ── Stop ──
 
 func TestStop(t *testing.T) {
