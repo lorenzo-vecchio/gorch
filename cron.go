@@ -2,6 +2,7 @@ package gorch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/robfig/cron/v3"
@@ -49,6 +50,7 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
 
 	defer func() {
 		if r := recover(); r != nil {
+			o.metricsCronFailures.Add(1)
 			entry.getLogger().Error("cron service panicked", "panic", fmt.Sprint(r))
 		}
 	}()
@@ -56,8 +58,12 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
 	id := curGoroutineID()
 	entry.startGoid.Store(id)
 	defer entry.startGoid.CompareAndSwap(id, 0)
-	err := entry.getSvc().Start(sc)
-	if err != nil && err != context.Canceled {
+	// A failed tick is counted (and logged) unless it is the deliberate
+	// cancellation a teardown uses to stop an in-flight tick; a context.Canceled
+	// return is the normal shutdown signal, not a failure. The same predicate
+	// drives both the counter and the log so they cannot drift.
+	if err := entry.getSvc().Start(sc); err != nil && !errors.Is(err, context.Canceled) {
+		o.metricsCronFailures.Add(1)
 		entry.getLogger().Error("cron service returned error", "error", err.Error())
 	}
 }

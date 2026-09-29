@@ -148,10 +148,18 @@ func FuzzMembershipTransitions(f *testing.F) {
 
 		// stopChecked runs a stop op and, when it succeeds, asserts the public
 		// status is honest and the Stops metric moved by at most maxDelta, so a
-		// teardown/done race cannot double-count one stop.
+		// teardown/done race cannot double-count one stop. A refused op that is
+		// not a timeout (busy, not found, reentrant) tears nothing down, so it
+		// must leave Stops unchanged; only a timeout can have partially stopped.
 		stopChecked := func(name string, maxDelta int64, stop func() error) {
 			before := o.Metrics().Stops
-			if err := runOp(stop); err != nil {
+			err := runOp(stop)
+			if err != nil {
+				if !errors.Is(err, ErrStopTimeout) && !errors.Is(err, ErrHookTimeout) {
+					if delta := o.Metrics().Stops - before; delta != 0 {
+						t.Fatalf("refused stop %s moved Stops by %d: %v", name, delta, err)
+					}
+				}
 				return
 			}
 			if delta := o.Metrics().Stops - before; delta > maxDelta {
@@ -162,6 +170,38 @@ func FuzzMembershipTransitions(f *testing.F) {
 			}
 		}
 
+		// stopActiveChecked pins the exact Stops accounting for an entry that
+		// cannot restart in the background (a and b have no factory), so "Stops
+		// equals the number of completed caller-initiated stops" is checkable: a
+		// successful stop of an active entry adds exactly one, a no-op stop of an
+		// inactive entry adds none, and a refused op adds none.
+		stopActiveChecked := func(name string, stop func() error) {
+			active := false
+			if s, ok := o.Status(name); ok && (s == StatusRunning || s == StatusStarting) {
+				active = true
+			}
+			before := o.Metrics().Stops
+			if err := runOp(stop); err != nil {
+				if !errors.Is(err, ErrStopTimeout) && !errors.Is(err, ErrHookTimeout) {
+					if delta := o.Metrics().Stops - before; delta != 0 {
+						t.Fatalf("refused stop %s moved Stops by %d: %v", name, delta, err)
+					}
+				}
+				return
+			}
+			want := int64(0)
+			if active {
+				want = 1
+			}
+			if delta := o.Metrics().Stops - before; delta != want {
+				t.Fatalf("stop %s moved Stops by %d, want %d (active=%v)", name, delta, want, active)
+			}
+			if s, ok := o.Status(name); ok && (s == StatusRunning || s == StatusStarting) {
+				t.Fatalf("stop %s returned nil but status is %v", name, s)
+			}
+		}
+
+		var prev Metrics
 		const maxLate = 8
 		late := 0
 		for _, b := range data {
@@ -169,7 +209,7 @@ func FuzzMembershipTransitions(f *testing.F) {
 			case 0:
 				_ = runOp(func() error { return o.StartService("a") })
 			case 1:
-				stopChecked("a", 1, func() error { return o.StopService("a", 50*time.Millisecond) })
+				stopActiveChecked("a", func() error { return o.StopService("a", 50*time.Millisecond) })
 			case 2:
 				stopChecked("b", 3, func() error { return o.StopService("b", 50*time.Millisecond, WithCascadeStop()) })
 			case 3:
@@ -204,7 +244,7 @@ func FuzzMembershipTransitions(f *testing.F) {
 				// c self-heals, so allow one background restart's accounting.
 				stopChecked("c", 2, func() error { return o.StopService("c", 50*time.Millisecond) })
 			case 7:
-				stopChecked("b", 1, func() error { return o.StopService("b", 50*time.Millisecond) })
+				stopActiveChecked("b", func() error { return o.StopService("b", 50*time.Millisecond) })
 			case 8:
 				// Fire a cron tick directly (the scheduler's second cadence is too
 				// slow for a fuzz iteration), tear the entry down, and require the
@@ -227,6 +267,17 @@ func FuzzMembershipTransitions(f *testing.F) {
 				}
 				_ = runOp(func() error { return o.StartService("cron") })
 			}
+			// Every counter is monotonic: no operation may decrement one. A
+			// restart that was mistakenly accounted as a stop, or a stop counted
+			// twice, would surface here as a decrease or as a delta the per-op
+			// checks above missed.
+			now := o.Metrics()
+			if now.Starts < prev.Starts || now.Stops < prev.Stops || now.Crashes < prev.Crashes ||
+				now.Restarts < prev.Restarts || now.HealthFails < prev.HealthFails ||
+				now.CronFailures < prev.CronFailures || now.AbandonedGoroutines < prev.AbandonedGoroutines {
+				t.Fatalf("a metric decreased: before=%+v after=%+v", prev, now)
+			}
+			prev = now
 			assertNoReservationLeak()
 			assertOwnerMapsConsistent()
 		}
