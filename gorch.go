@@ -492,11 +492,12 @@ type Orchestrator struct {
 	shutdownDone     chan struct{}
 	shutdownDoneOnce sync.Once
 
-	metricsStarts      atomic.Int64
-	metricsStops       atomic.Int64
-	metricsCrashes     atomic.Int64
-	metricsRestarts    atomic.Int64
-	metricsHealthFails atomic.Int64
+	metricsStarts       atomic.Int64
+	metricsStops        atomic.Int64
+	metricsCrashes      atomic.Int64
+	metricsRestarts     atomic.Int64
+	metricsHealthFails  atomic.Int64
+	metricsCronFailures atomic.Int64
 	// metricsAbandoned counts teardown goroutines walked away from because a
 	// deadline won. It is monotonic: there is no signal that an abandoned
 	// goroutine later returned, so it is never decremented.

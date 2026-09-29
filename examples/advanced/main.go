@@ -276,8 +276,8 @@ func main() {
 	// Metrics snapshot: counters for orchestrator-level events.
 	m := orch.Metrics()
 	fmt.Printf("\n=== metrics snapshot ===\n")
-	fmt.Printf("  starts=%d stops=%d crashes=%d restarts=%d health-fails=%d\n",
-		m.Starts, m.Stops, m.Crashes, m.Restarts, m.HealthFails)
+	fmt.Printf("  starts=%d stops=%d crashes=%d restarts=%d health-fails=%d cron-fails=%d\n",
+		m.Starts, m.Stops, m.Crashes, m.Restarts, m.HealthFails, m.CronFailures)
 
 	// Let health checks fire a couple of times.
 	time.Sleep(4 * time.Second)

@@ -63,9 +63,8 @@
 //     status until startOneService commits StatusStarting, so poll Busy(name)
 //     for an in-flight reservation. For a cron entry StatusRunning means the
 //     schedule is installed, not that a tick is working: a tick that returns an
-//     error only logs, and IsReady and Health inherit that scheduling-fact
-//     reading. Tick failures are not observable through the public API yet (see
-//     the metrics-semantics issue); only the log records them.
+//     error or panics only logs and increments Metrics().CronFailures, and
+//     IsReady and Health inherit that scheduling-fact reading.
 //   - A panic from a lifecycle hook, Validator, start condition, or probe is
 //     recovered and reported as an error (or as unhealthy/unready), so a
 //     misbehaving callback never unwinds through a public entry point.
@@ -89,6 +88,17 @@
 //     StatusRunning to StatusCrashed (firing OnCrash and incrementing
 //     Metrics().Crashes) and is returned to StatusRunning once the new instance
 //     is live.
+//   - Metrics() is a snapshot of monotonic lifecycle counters. Each counter has
+//     a fixed meaning: Starts counts lifecycle starts (one per instance launched
+//     or cron schedule installed, invocations not successes); Stops counts
+//     completed instance stops, excluding a self-heal restart's internal cleanup
+//     and not counting a timed-out stop until the abandoned instance finally
+//     exits; Crashes counts Running -> Crashed transitions; Restarts counts
+//     self-heal re-launches; HealthFails counts failed periodic probes (per
+//     probe, not per incident, and not on-demand Health() probes); CronFailures
+//     counts failed or panicking cron ticks (skips and teardown cancellations
+//     excluded); AbandonedGoroutines counts deadline-abandoned teardown
+//     goroutines. See the Metrics type for the frozen definitions.
 //   - Health is a live signal: both the periodic loop and Health() probe only
 //     services that are StatusRunning. A non-running entry is omitted from the
 //     Health() result rather than reported healthy, while a running service that

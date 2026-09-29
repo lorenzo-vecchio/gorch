@@ -42,7 +42,7 @@ Requires Go 1.25+.
 - **State-change hooks** — `OnStateChange` + `OnCrash` callbacks for external observability without polling.
 - **WaitFor** — Block until a service reaches a target status.
 - **TypedRequest** — Typed request-reply without losing type safety: `TypedRequest[TReq, TResp](messenger, ctx, req, topic)`.
-- **Metrics** — atomic int64 counters (`Starts`, `Stops`, `Crashes`, `Restarts`, `HealthFails`, `AbandonedGoroutines`), exposed via `Metrics()` snapshot.
+- **Metrics** — atomic int64 counters (`Starts`, `Stops`, `Crashes`, `Restarts`, `HealthFails`, `CronFailures`, `AbandonedGoroutines`), exposed via `Metrics()` snapshot.
 - **Validator interface** — `Validate() error` called at `Register` for early config checks.
 - **WithStartCondition** — Skip a service at runtime via a `func() bool`.
 - **Per-service stop timeout** — `WithStopTimeout` controls how long to wait for `Stop()`.
@@ -814,12 +814,22 @@ No manual gob encoding is required anywhere in user code.
 
 ### Metrics
 
-`Metrics()` returns a snapshot of atomic counters for orchestrator-level events. The user wires these into their own monitoring system — no metrics library dependency. Each stop of an instance is counted exactly once, even when a teardown and the instance's own exit race. `Stops` counts only stops that completed; a stop that timed out (`ErrStopTimeout`/`ErrHookTimeout`, or a `WithStopTimeout` cap that fired) is not counted, matching its unverified `StatusStopping`. `AbandonedGoroutines` counts teardown goroutines abandoned because a deadline won: a blocking hook or `Stop()`, or a failed-`Start` wait that outlived its rollback budget. It is monotonic — never decremented, since there is no reliable signal that an abandoned goroutine later returned — so a non-zero value means user code may be leaked for the process lifetime.
+`Metrics()` returns a snapshot of monotonic atomic counters for orchestrator-level events. Take a baseline and subtract — the counters are never reset or decremented. They count lifecycle events, not per-tick work: a self-heal restart is a `Restart` and never a `Stop`, a cron tick is not a `Start`, and a failed probe is counted per probe, not per incident. The user wires these into their own monitoring system — no metrics library dependency. Each stop of an instance is counted exactly once, even when a teardown and the instance's own exit race.
+
+| Counter | Definition |
+|---------|------------|
+| `Starts` | Service starts initiated through the lifecycle API (`Start`, `StartService`, `StartGroup`, `Run`): one per persistent/`runOnce` instance launched and one per cron schedule installed. It counts invocations, not successes, so a start that immediately fails is still counted. Self-heal re-launches are in `Restarts`, so `Starts + Restarts` is the total number of instances launched. |
+| `Stops` | Completed instance stops: a lifecycle-API stop (`Stop`, `StopService`, `StopGroup`, `Unregister`) and a non-self-heal instance that exits on its own and is committed `StatusStopped` both count. A stop that timed out (`ErrStopTimeout`/`ErrHookTimeout`, or a `WithStopTimeout` cap that fired) is not counted at that moment, matching its unverified `StatusStopping`; it counts only once the abandoned instance finally exits, so one that never does is never counted. The internal `Stop()` a self-heal restart runs is not counted either. Counted at most once per instance. |
+| `Crashes` | `Running -> Crashed` transitions: an instance that exited with a real error, or whose retry budget was exhausted. A self-heal crash is counted before the restart, so it is observable even when the service comes straight back up. Clean or `context.Canceled` exits are not crashes. |
+| `Restarts` | Self-heal re-launches: a fresh instance spawned after an instance exited on its own (crash, clean return, or a health-threshold cancellation) without a caller-initiated teardown. |
+| `HealthFails` | Failed periodic health probes, incremented once per failed probe rather than once per service that crossed the failure threshold. Probes issued on demand by `Health()` are not counted; the counter instruments the supervision loop. |
+| `CronFailures` | Cron tick invocations that failed: the tick's `Start` returned a non-`context.Canceled` error, or panicked. A tick skipped by `CronSkip` while the previous invocation is still running, and a tick cancelled by teardown, are not failures. Ticks are not counted as `Starts`, so this is the counter for per-tick cron activity. |
+| `AbandonedGoroutines` | Teardown goroutines abandoned because a deadline won: a blocking hook or `Stop()`, or a failed-`Start` wait that outlived its rollback budget. Monotonic — never decremented, since there is no reliable signal that an abandoned goroutine later returned — so a non-zero value means user code may be leaked for the process lifetime. |
 
 ```go
 stats := orch.Metrics()
-fmt.Printf("starts=%d stops=%d crashes=%d restarts=%d healthFails=%d abandonedGoroutines=%d\n",
-    stats.Starts, stats.Stops, stats.Crashes, stats.Restarts, stats.HealthFails, stats.AbandonedGoroutines)
+fmt.Printf("starts=%d stops=%d crashes=%d restarts=%d healthFails=%d cronFailures=%d abandonedGoroutines=%d\n",
+    stats.Starts, stats.Stops, stats.Crashes, stats.Restarts, stats.HealthFails, stats.CronFailures, stats.AbandonedGoroutines)
 ```
 
 ### Validator
