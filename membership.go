@@ -3,7 +3,6 @@ package gorch
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -212,7 +211,7 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 		if blockers := o.activeDependentsLocked(entry, ordered); len(blockers) > 0 {
 			o.mu.Unlock()
 			o.membershipMu.Unlock()
-			return fmt.Errorf("%w: %s is depended on by %s", ErrHasDependents, name, strings.Join(blockers, ", "))
+			return &HasDependentsError{Name: name, Dependents: blockers}
 		}
 		// Without cascade only the target itself is stopped/removed; a
 		// non-running dependent stays registered untouched.
@@ -324,13 +323,12 @@ func (o *Orchestrator) hardDependentsOrderLocked(target *serviceEntry) []*servic
 	return order
 }
 
-// activeDependentsLocked returns the hard dependents in set, other than target,
-// that are Starting or Running: the ones a plain stop would break. Each is
-// rendered as "name (status)" so the caller's error says whether a dependent
-// has an instance (running) or has only been promised one (starting). Every
-// other status is non-blocking: a Stopping dependent is already going down, a
-// Registered one has no instance yet, and Crashed/Stopped/Succeeded are inert.
-// The caller must hold o.mu.
+// activeDependentsLocked returns the names of the hard dependents in set, other
+// than target, that are Starting or Running: the ones a plain stop would break.
+// Every other status is non-blocking: a Stopping dependent is already going
+// down, a Registered one has no instance yet, and Crashed/Stopped/Succeeded are
+// inert. It is the blocker set of ErrHasDependents and the same set
+// Dependents(name) reads. The caller must hold o.mu.
 func (o *Orchestrator) activeDependentsLocked(target *serviceEntry, set []*serviceEntry) []string {
 	var blockers []string
 	for _, e := range set {
@@ -338,7 +336,7 @@ func (o *Orchestrator) activeDependentsLocked(target *serviceEntry, set []*servi
 			continue
 		}
 		if s := o.statusOf(e); s == StatusRunning || s == StatusStarting {
-			blockers = append(blockers, fmt.Sprintf("%s (%s)", e.name, s))
+			blockers = append(blockers, e.name)
 		}
 	}
 	return blockers

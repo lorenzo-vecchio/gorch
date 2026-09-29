@@ -17,7 +17,7 @@ Requires Go 1.25+.
 ## Features
 
 - **Service lifecycle** — Start/Stop with context cancellation and graceful shutdown.
-- **Dynamic membership** — `Register` adds a service to a running orchestrator, and `StartService`/`StopService`/`Unregister` start, stop, and remove services while it runs; `WithCascadeStop` extends a removal to hard dependents.
+- **Dynamic membership** — `Register` adds a service to a running orchestrator, and `StartService`/`StopService`/`Unregister` start, stop, and remove services while it runs; `WithCascadeStop` extends a removal to hard dependents, and `Dependents`/`DependenciesOf` expose the dependency graph before you act.
 - **Run() convenience** — single call starts, blocks on OS signals, then stops.
 - **Dependency ordering** — declare dependencies with `DependsOn`, cycle detection at registration, topological start and reverse-topological stop.
 - **Start timeout** — per-service start deadline via `WithStartTimeout`, with a `DefaultStartTimeout` config default.
@@ -29,7 +29,7 @@ Requires Go 1.25+.
 - **Backoff & retry** — `ExponentialBackoff` and `ConstantBackoff` strategies, max retries, stability-window retry reset.
 - **One-shot services** — init/gate tasks that run once before persistent services; `Stop()` is called at shutdown.
 - **Lifecycle hooks** — `OnBeforeStart`, `OnAfterStart`, `OnBeforeStop`, `OnAfterStop` (global or per-service overrides).
-- **Status introspection** — `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, and `Busy(name)` for runtime observability. `Count`/`Names`/`Statuses` report every *registered* entry; `CountRunning`/`RunningNames` report the `StatusRunning` subset; `Busy(name)` polls an in-flight membership reservation, which status does not encode.
+- **Status introspection** — `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Dependents`, `DependenciesOf`, and `Busy(name)` for runtime observability. `Count`/`Names`/`Statuses` report every *registered* entry; `CountRunning`/`RunningNames` report the `StatusRunning` subset; `Dependents`/`DependenciesOf` walk the hard-dependency edges in each direction; `Busy(name)` polls an in-flight membership reservation, which status does not encode.
 - **Error aggregation** — `errors.Join` in `Start`/`Stop` so all failures are reported, not just the first.
 - **Nestable orchestrators** — a service can create its own gorch for sub-services.
 - **Structured logging** — channel-based log-pump writes to stderr; services call `Info/Error/Debug/Warn` on a `ServiceLogger`.
@@ -60,9 +60,9 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 |--------------|-------------------------------|
 | `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A hot add made while `Start` runs lands either in `Start`'s snapshot or, after it, live as `StatusRegistered` (never auto-started); before `Start` it is part of the static graph. It is rejected with `ErrOrchestratorStopping` while `Stop` runs and `ErrOrchestratorStopped` after `Stop`. |
 | `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning`; an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). It never restarts a live instance: to replace one, `StopService` and then `StartService` — and `StopService` is itself refused with `ErrHasDependents` while a hard dependent is `Running` or `Starting`, unless `WithCascadeStop` is used, so restarting a depended-on service bounces those dependents first. The start decision and its reservation are claimed atomically under the membership lock (released before any user code), so concurrent `StartService` calls cannot double-start or orphan an instance. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with another goroutine's reservation returns the transient `ErrMembershipBusy` (poll `Busy`); re-entering from the entry's own `Start` returns `ErrReentrantMembership`. |
-| `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents`, and the error names each blocker with its status (e.g. `api (starting)`); every other dependent status — `Stopping`, `Registered`, `Crashed`, `Stopped`, `Succeeded` — does not block, so a plain stop proceeds and leaves the dependent untouched. With `WithCascadeStop`, every transitive hard dependent is stopped/removed in reverse topological order, except one already `Stopping`, which is left to its own in-flight teardown rather than stopped a second time (no double `Stop()` or hooks). A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
+| `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents`, returned as a `*HasDependentsError` that names each blocker; every other dependent status — `Stopping`, `Registered`, `Crashed`, `Stopped`, `Succeeded` — does not block, so a plain stop proceeds and leaves the dependent untouched. With `WithCascadeStop`, every transitive hard dependent is stopped/removed in reverse topological order, except one already `Stopping`, which is left to its own in-flight teardown rather than stopped a second time (no double `Stop()` or hooks). A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
 | `Start`, `Stop` | Yes — against each other. Guarded by `sync.Once`; the **whole-orchestrator lifecycle** is single-shot, so after a successful `Stop` neither can run again. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
-| `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation, and is the only observable for the reservation window. |
+| `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Dependents`, `DependenciesOf`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Dependents`/`DependenciesOf` walk the hard-dependency edges under the graph lock and return snapshots. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation, and is the only observable for the reservation window. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
 | `Metrics`, `Done` | Yes — atomic counters and a shutdown-completed channel created once in `New` and returned unchanged. |
 | `StartGroup`, `StopGroup` | Drive one group per orchestrator. Serialized with `StopService`/`Unregister` by the membership lock; a group start reserves each member and rolls back the members it already started if a later one fails, and a group stop honours a concurrent start's reservation by skipping that entry. Both are gated by shutdown (`ErrOrchestratorStopping`/`ErrOrchestratorStopped`). Group ops are not synchronized with the whole-orchestrator `Start`/`Stop` beyond that shutdown gate: do not drive them from inside a concurrent `Start`/`Stop`. |
@@ -104,7 +104,8 @@ These guarantees are part of the public API and are relied upon by callers.
   brand-new entry that inherits nothing from the previous incarnation (a
   monotonic auto-name counter means `$N` is never reused either). A stop is refused
   with `ErrHasDependents` while a hard dependent is `Running` or `Starting` (the
-  error names each blocker and its status), unless `WithCascadeStop` is passed;
+  returned `*HasDependentsError` names each blocker), unless `WithCascadeStop` is
+  passed;
   a dependent that is `Stopping`, `Registered`, `Crashed`, `Stopped`, or
   `Succeeded` does not block, and a cascade leaves an already-`Stopping`
   dependent to its own teardown instead of stopping it twice. Soft dependencies
@@ -173,7 +174,7 @@ Sentinel errors returned by the orchestrator:
 | `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
 | `ErrMembershipBusy` | `StartService`, `StopService`, `Unregister` | A membership op collided with a reservation held by another goroutine's in-flight `Start`/`Stop`/group operation. Transient: poll `Busy(name)` or retry once the reservation clears. |
 | `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
-| `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break a hard dependent that is `Running` or `Starting`; the message names each blocker and its status. Pass `WithCascadeStop` to tear those dependents down too. Dependents in `Stopping`, `Registered`, `Crashed`, `Stopped`, or `Succeeded` do not block. |
+| `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break a hard dependent that is `Running` or `Starting`. Returned as a `*HasDependentsError` whose `Name` is the target and whose `Dependents` names each blocker (the same set as `Dependents(name)`). Pass `WithCascadeStop` to tear those dependents down too. Dependents in `Stopping`, `Registered`, `Crashed`, `Stopped`, or `Succeeded` do not block. |
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
 | `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is not `StatusRunning`. |
 | `ErrDependencyRemoving` | `Register` | A hot-added service names a hard dependency that is being torn down (being stopped/removed concurrently); retry after the teardown completes. |
@@ -220,8 +221,11 @@ Decisions behind the table ([#29](https://github.com/lorenzo-vecchio/gorch/issue
 - **Reentrancy and contention are split.** `ErrReentrantMembership` is a
   same-goroutine programming error — permanent, never retried; a reservation
   held by *another* goroutine is the transient, retryable `ErrMembershipBusy`.
-- **`ErrHasDependents` answers one direction only.** It is returned by
-  `StopService`/`Unregister` when the *target* has running dependents. Naming a
+- **`ErrHasDependents` answers one direction only, and now carries the names.**
+  It is returned by `StopService`/`Unregister` when the *target* has active
+  dependents, as a `*HasDependentsError` whose `Dependents` is the same set
+  `Dependents(name)` returns; `DependenciesOf(name)` is the forward direction.
+  Naming a
   dependency that is mid-removal is `ErrDependencyRemoving` instead, a distinct
   transient condition.
 - **The not-found family is already uniform.** `ErrServiceNotFound` (the named
@@ -349,14 +353,37 @@ _ = orch.Unregister("late", 5*time.Second)
 A plain stop refuses to break a hard dependent that is `Running` or `Starting`:
 
 ```go
-_ = orch.StopService("db", 5*time.Second)
-// ErrHasDependents: service has active dependents: db is depended on by api (running)
+err := orch.StopService("db", 5*time.Second)
+// ErrHasDependents: service has active dependents: db is depended on by api, worker
+
+// The error is a *HasDependentsError carrying the same set, so a CLI can offer
+// a confirmation prompt without parsing the message:
+var depErr *gorch.HasDependentsError
+if errors.As(err, &depErr) {
+    fmt.Println("stopping", depErr.Name, "will also stop:", depErr.Dependents)
+}
+
+// Plan before acting: the same set is available as a query.
+blockers, _ := orch.Dependents("db")       // [api worker], reverse topological
+deps, _ := orch.DependenciesOf("api")      // [db], direct hard dependencies
 
 // Tear down the target and its transitive hard dependents in reverse
 // topological order, under one shared timeout. A dependent already stopping is
 // left to its own teardown and never stopped twice.
 _ = orch.StopService("db", 5*time.Second, gorch.WithCascadeStop())
 ```
+
+`Dependents(name)` returns the transitive hard dependents that currently block a
+plain stop — the ones `Running` or `Starting` — in reverse topological order (a
+dependent before the dependency it reaches through `DependsOn`), which is also
+the order `WithCascadeStop` would tear them down. It is empty exactly when a
+plain stop would proceed, and it backs the `*HasDependentsError` payload, so the
+query and the error never disagree. `DependenciesOf(name)` returns the direct
+hard dependencies in declaration order (the forward edges). Both report
+`ErrServiceNotFound` for an unknown name; neither includes soft dependencies. A
+non-blocking hard dependent (`Registered`, `Stopping`, `Crashed`, `Stopped`,
+`Succeeded`) is still part of the graph but is not returned by `Dependents`,
+because it is not one a plain stop would break.
 
 `timeout` bounds the whole stop — the before/after-stop hooks, the service's own
 `Stop()`, and the wait for its instance or in-flight cron ticks to exit — and is
@@ -508,6 +535,8 @@ names := orch.Names()                      // []string in registration order (al
 count := orch.Count()                      // total registered services (not live)
 runningCount := orch.CountRunning()        // number of StatusRunning services ("N of M running")
 runningNames := orch.RunningNames()        // []string of StatusRunning services
+blockers, err := orch.Dependents("db")     // transitive hard dependents blocking a stop (reverse topo)
+deps, err := orch.DependenciesOf("api")    // direct hard dependencies in declaration order
 busy := orch.Busy("db")                    // true if an in-flight reservation blocks membership ops
 ```
 
@@ -515,7 +544,14 @@ busy := orch.Busy("db")                    // true if an in-flight reservation b
 the moment `Register` accepts it, so a hot-added, not-yet-started persistent
 service and a staged cron entry are both present and both read
 `StatusRegistered`. `CountRunning` and `RunningNames` are the `StatusRunning`
-subset, backed by the same `Statuses` snapshot. The reservation window is not
+subset, backed by the same `Statuses` snapshot. `Dependents` and
+`DependenciesOf` are the two directions of the hard-dependency graph:
+`Dependents(name)` is the transitive hard dependents that block a plain stop
+(those `Running` or `Starting`) in reverse topological order — the same set
+`ErrHasDependents` carries, so it is empty exactly when the stop would proceed —
+while `DependenciesOf(name)` is the direct hard dependencies in declaration
+order. Neither includes soft dependencies, and both report `ErrServiceNotFound`
+for an unknown name. The reservation window is not
 part of either: a start claimed but not yet committed to `StatusStarting` still
 reads as the previous status, so poll `Busy(name)` to see an in-flight
 reservation.

@@ -189,6 +189,51 @@ func (o *Orchestrator) RunningNames() []string {
 	return names
 }
 
+// Dependents returns the transitive hard dependents of name that currently
+// block a plain StopService/Unregister — those whose status is StatusRunning or
+// StatusStarting — in reverse topological order: a dependent precedes the
+// dependency it reaches through DependsOn, and the named service itself is
+// omitted. It is exactly the set a plain stop is refused on (ErrHasDependents),
+// so an empty result means the stop would proceed, while the *HasDependentsError
+// carries the same names when it is refused. It is also the set
+// WithCascadeStop would tear down, in that order.
+//
+// The result is status-dependent and excludes the non-blocking hard dependents
+// (StatusRegistered, StatusStopping, StatusCrashed, StatusStopped,
+// StatusSucceeded), which the graph still holds but a plain stop does not break.
+// Soft dependencies are never included: they neither block nor cascade. Use
+// DependenciesOf for the opposite direction. Returns ErrServiceNotFound for an
+// unknown name. Thread-safe.
+func (o *Orchestrator) Dependents(name string) ([]string, error) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	entry := o.lookupEntry(name)
+	if entry == nil {
+		return nil, fmt.Errorf("%w: %s", ErrServiceNotFound, name)
+	}
+	return o.activeDependentsLocked(entry, o.hardDependentsOrderLocked(entry)), nil
+}
+
+// DependenciesOf returns the direct hard dependencies of name, in the order its
+// DependsOn options declared them. It is the opposite direction of Dependents:
+// it answers "what must be Running before name can start". Soft dependencies
+// (DependsOnSoft) are not included. A dependency named here may have been
+// unregistered since; it stays listed because it is still part of the entry's
+// configuration, and StartService reports it as ErrDependencyNotFound until the
+// dependent is re-registered or removed. Returns ErrServiceNotFound for an
+// unknown name. Thread-safe.
+func (o *Orchestrator) DependenciesOf(name string) ([]string, error) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	entry := o.lookupEntry(name)
+	if entry == nil {
+		return nil, fmt.Errorf("%w: %s", ErrServiceNotFound, name)
+	}
+	deps := make([]string, len(entry.cfg.dependsOn))
+	copy(deps, entry.cfg.dependsOn)
+	return deps, nil
+}
+
 // Health probes all registered services that implement HealthChecker.
 // Returns a map of service name to error (nil = healthy).
 // Services that don't implement HealthChecker are reported as nil.

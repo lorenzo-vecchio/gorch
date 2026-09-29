@@ -3,7 +3,6 @@ package gorch
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -561,9 +560,9 @@ func TestCascade_StartingDependentBlocks(t *testing.T) {
 }
 
 // TestStop_NonRunningDependents_Matrix pins the exact plain-stop decision for a
-// hard dependent in every ServiceStatus. Only Starting and Running block, with
-// ErrHasDependents naming the dependent and its status; each of the other five
-// leaves the dependent untouched and lets the target stop.
+// hard dependent in every ServiceStatus. Only Starting and Running block, with a
+// *HasDependentsError naming the dependent; each of the other five leaves the
+// dependent untouched and lets the target stop.
 func TestStop_NonRunningDependents_Matrix(t *testing.T) {
 	blocking := map[ServiceStatus]bool{
 		StatusStarting: true,
@@ -602,9 +601,18 @@ func TestStop_NonRunningDependents_Matrix(t *testing.T) {
 				if !errors.Is(err, ErrHasDependents) {
 					t.Fatalf("plain stop with a %s dependent = %v, want ErrHasDependents", st, err)
 				}
-				want := fmt.Sprintf("dep (%s)", st)
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("error %q must name the dependent and its status (%q)", err, want)
+				var depErr *HasDependentsError
+				if !errors.As(err, &depErr) {
+					t.Fatalf("plain stop with a %s dependent = %v, want *HasDependentsError", st, err)
+				}
+				if depErr.Name != "base" {
+					t.Errorf("HasDependentsError.Name = %q, want base", depErr.Name)
+				}
+				if len(depErr.Dependents) != 1 || depErr.Dependents[0] != "dep" {
+					t.Errorf("HasDependentsError.Dependents = %v, want [dep]", depErr.Dependents)
+				}
+				if !strings.Contains(err.Error(), "dep") {
+					t.Errorf("error %q must name the dependent (%q)", err, "dep")
 				}
 				if s, _ := o.Status("base"); s != StatusRunning {
 					t.Errorf("base status = %v, want Running (stop refused)", s)

@@ -3,6 +3,8 @@ package gorch
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -295,10 +297,10 @@ var (
 	// retryable.
 	ErrServiceNotFound = errors.New("gorch: service not found")
 	// ErrHasDependents is transient: a plain StopService/Unregister would break a
-	// hard dependent that is Running or Starting. The returned error names each
-	// blocker and its status; pass WithCascadeStop to tear those dependents down
-	// too, or retry once they stop. Dependents in any other status do not block.
-	// Retryable.
+	// hard dependent that is Running or Starting. The returned error is a
+	// *HasDependentsError naming each blocker; pass WithCascadeStop to tear those
+	// dependents down too, or retry once they stop. Dependents in any other status
+	// do not block. Retryable.
 	ErrHasDependents = errors.New("gorch: service has active dependents")
 	// ErrOrchestratorStopping is transient: whole-orchestrator Stop is in
 	// progress; retry once it completes. Retryable.
@@ -345,6 +347,37 @@ var (
 	// re-entry and a programming error.
 	ErrMembershipBusy = errors.New("gorch: membership operation blocked by an in-flight reservation")
 )
+
+// HasDependentsError is the typed error returned by StopService and Unregister
+// when a plain stop would break a hard dependent, i.e. when Dependents(name) is
+// non-empty. Name is the service the caller tried to stop or unregister, and
+// Dependents holds the transitive hard dependents that block it — the ones
+// Running or Starting — in reverse topological order, the same slice
+// Dependents(name) returns.
+//
+// It matches ErrHasDependents with errors.Is, so an existing caller that only
+// classifies the sentinel keeps working, while one that needs the names — to
+// render a "stopping db will also stop api, worker; continue?" prompt, or to
+// decide without parsing the message — can read them off the typed error:
+//
+//	var depErr *gorch.HasDependentsError
+//	if errors.As(err, &depErr) {
+//	    fmt.Println("will also stop:", depErr.Dependents)
+//	}
+type HasDependentsError struct {
+	Name       string
+	Dependents []string
+}
+
+// Error implements error. The message leads with ErrHasDependents so the
+// rendered form keeps matching the sentinel's wording.
+func (e *HasDependentsError) Error() string {
+	return fmt.Sprintf("%s: %s is depended on by %s", ErrHasDependents, e.Name, strings.Join(e.Dependents, ", "))
+}
+
+// Is reports that the typed error matches ErrHasDependents, so errors.Is works
+// across both the typed and the bare sentinel.
+func (e *HasDependentsError) Is(target error) bool { return target == ErrHasDependents }
 
 // funcService wraps closures as a Service. Used by RegisterFunc.
 type funcService struct {
