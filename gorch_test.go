@@ -327,7 +327,16 @@ func TestStart(t *testing.T) {
 
 	t.Run("start_with_invalid_cron_returns_ErrInvalidCron", func(t *testing.T) {
 		o := New()
-		_ = o.Register(&namedSvc{name: "bad-cron"}, WithCron("invalid", CronParallel))
+		// Register validates the spec on both paths, so inject a spec that is
+		// valid at registration but corrupted afterwards. Start's setupCron
+		// re-schedules every cron entry and must still surface ErrInvalidCron
+		// defensively rather than leaving a broken entry live.
+		if err := o.Register(&namedSvc{name: "bad-cron"}, WithCron("* * * * * *", CronParallel)); err != nil {
+			t.Fatalf("Register valid cron: %v", err)
+		}
+		o.mu.Lock()
+		o.entries[0].cfg.cronSpec = "invalid"
+		o.mu.Unlock()
 		err := o.Start()
 		if !errors.Is(err, ErrInvalidCron) {
 			t.Errorf("expected ErrInvalidCron, got %v", err)
@@ -3002,7 +3011,14 @@ func TestStatusTransitions(t *testing.T) {
 
 func TestRun_StartError(t *testing.T) {
 	o := New()
-	_ = o.Register(&namedSvc{name: "bad"}, WithCron("invalid", CronParallel))
+	if err := o.Register(&namedSvc{name: "bad"}, WithCron("* * * * * *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	// Register validates the spec, so corrupt it after registration: Run calls
+	// Start, whose setupCron re-check must surface ErrInvalidCron.
+	o.mu.Lock()
+	o.entries[0].cfg.cronSpec = "invalid"
+	o.mu.Unlock()
 	err := o.Run(time.Second)
 	if !errors.Is(err, ErrInvalidCron) {
 		t.Errorf("expected ErrInvalidCron, got %v", err)
@@ -4216,8 +4232,15 @@ func TestStopStartedServices_LogQuitSignal(t *testing.T) {
 	// stopStartedServices signals the log-pump via logQuit instead of closing
 	// logCh, so a late log send can never panic on a closed channel.
 	o := New(WithLogLevel(LogLevelWarn))
-	_ = o.Register(&namedSvc{}, WithCron("invalid", CronParallel))
-	// Start fails → logQuit closed → logPumpDone closed → logCh left open.
+	if err := o.Register(&namedSvc{}, WithCron("* * * * * *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	// Register validates the spec, so corrupt it afterwards to force Start to
+	// fail at setupCron (Start fails → logQuit closed → logPumpDone closed →
+	// logCh left open).
+	o.mu.Lock()
+	o.entries[0].cfg.cronSpec = "invalid"
+	o.mu.Unlock()
 	_ = o.Start() // will fail with ErrInvalidCron
 
 	// logCh must remain open so sends never panic.
@@ -6721,6 +6744,7 @@ func TestStartGroup_Complete(t *testing.T) {
 	t.Run("start_group_successfully", func(t *testing.T) {
 		o := New(WithLogLevel(LogLevelWarn))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
+		o.started = true // StartGroup requires a started orchestrator (issue #33)
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
@@ -6767,6 +6791,7 @@ func TestStartGroup_Complete(t *testing.T) {
 	t.Run("start_group_toposort_error", func(t *testing.T) {
 		o := New(WithLogLevel(LogLevelWarn))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
+		o.started = true // StartGroup requires a started orchestrator (issue #33)
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
@@ -6800,6 +6825,7 @@ func TestStartGroup_Complete(t *testing.T) {
 	t.Run("start_group_start_failure", func(t *testing.T) {
 		o := New(WithLogLevel(LogLevelWarn))
 		o.ctx, o.cancel = context.WithCancel(context.Background())
+		o.started = true // StartGroup requires a started orchestrator (issue #33)
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
@@ -6825,6 +6851,7 @@ func TestStartGroup_Complete(t *testing.T) {
 
 	t.Run("start_group_empty", func(t *testing.T) {
 		o := New(WithLogLevel(LogLevelWarn))
+		o.started = true // an empty group on a started orchestrator is a no-op
 		err := o.StartGroup("nonexistent")
 		if err != nil {
 			t.Fatalf("StartGroup with empty group should not error: %v", err)
@@ -6838,6 +6865,7 @@ func TestStartGroup_Complete(t *testing.T) {
 func TestStartGroup_PartialFailureRollsBack(t *testing.T) {
 	o := New(WithLogLevel(LogLevelWarn))
 	o.ctx, o.cancel = context.WithCancel(context.Background())
+	o.started = true // StartGroup requires a started orchestrator (issue #33)
 	o.logCh = make(chan logEntry, 1)
 	o.logQuit = make(chan struct{})
 	o.logPumpDone = make(chan struct{})
@@ -7026,23 +7054,23 @@ func TestCustomLogger_SelfHeal(t *testing.T) {
 }
 
 func TestCustomLogger_StartErrorPath(t *testing.T) {
-	// Verify that the cron error path in Start doesn't panic
-	// when custom logger is set (logCh is nil).
+	// Verify that the cron error path in Start doesn't panic when a custom
+	// logger is set (logCh and logQuit are nil).
 	tl := &testLogger{}
 	o := New(WithLogger(tl))
-	err := o.Register(&testSvc{}, WithName("x"), WithCron("invalid cron spec", CronParallel))
-	if err == nil {
-		// Register succeeded, but Start should fail due to invalid cron.
-		startErr := o.Start()
-		if startErr == nil {
-			// Already started by Register error? Actually Register with invalid
-			// cron won't fail until Start. Let's check.
-			// Wait, invalid cron spec causes Register to not fail — Start fails.
-			// But we can't Start twice. Let's just verify no panic.
-			if o.logCh != nil {
-				t.Error("expected logCh to be nil when custom logger is set")
-			}
-		}
+	if err := o.Register(&testSvc{}, WithName("x"), WithCron("* * * * * *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	// Register validates the spec, so corrupt it afterwards to force Start to
+	// fail at setupCron with a custom logger (nil logCh/logQuit).
+	o.mu.Lock()
+	o.entries[0].cfg.cronSpec = "invalid cron spec"
+	o.mu.Unlock()
+	if err := o.Start(); !errors.Is(err, ErrInvalidCron) {
+		t.Fatalf("Start = %v, want ErrInvalidCron", err)
+	}
+	if o.logCh != nil {
+		t.Error("expected logCh to be nil when custom logger is set")
 	}
 }
 

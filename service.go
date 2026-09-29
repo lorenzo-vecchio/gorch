@@ -28,7 +28,12 @@ type ServiceContext struct {
 type registerConfig struct {
 	cronSpec string
 	cronMode CronMode
-	factory  func() Service // non-nil means self-heal is enabled
+	// cronSet records that WithCron was called, even with an empty spec. The
+	// empty string doubles as the "not a cron service" marker, so without this
+	// flag WithCron("") would silently register a non-cron service. It lets
+	// validation tell an explicit empty spec (rejected) from no WithCron at all.
+	cronSet bool
+	factory func() Service // non-nil means self-heal is enabled
 
 	// dependency ordering
 	name      string
@@ -68,11 +73,17 @@ type registerConfig struct {
 // RegisterOption — functional options for Register.
 type RegisterOption func(*registerConfig)
 
-// WithCron registers the service to run on a 6-field cron schedule (seconds included).
+// WithCron registers the service to run on a 6-field cron schedule (seconds
+// included). The spec is validated by Register on both the static and the
+// hot-add path, so an empty or malformed spec returns ErrInvalidCron instead of
+// silently registering a non-cron service or deferring the error to Start. The
+// underlying parser clamps an "@every" interval below one second (including
+// "@every 0s") to one second rather than rejecting it.
 func WithCron(spec string, mode CronMode) RegisterOption {
 	return func(cfg *registerConfig) {
 		cfg.cronSpec = spec
 		cfg.cronMode = mode
+		cfg.cronSet = true
 	}
 }
 
@@ -291,6 +302,14 @@ var (
 	// ErrUnsupportedOption is permanent: an incoherent option combination (for
 	// example WithSelfHeal with WithCron or WithRunOnce). Not retryable.
 	ErrUnsupportedOption = errors.New("gorch: unsupported option combination")
+	// ErrInvalidBufferSize is permanent: SubscribeWithBuffer was given a negative
+	// channel capacity, which cannot back a buffered channel. Fix the size; not
+	// retryable.
+	ErrInvalidBufferSize = errors.New("gorch: invalid messenger buffer size")
+	// ErrNilContext is permanent: Request, RequestAsync, or TypedRequest was
+	// handed a nil context. A context is required for cancellation and reply
+	// deadlines; pass context.Background() for none. Not retryable.
+	ErrNilContext = errors.New("gorch: nil context")
 
 	// Dynamic membership sentinels. See the Contract section of README.md.
 	// ErrServiceNotFound is permanent: no registered service has that name. Not

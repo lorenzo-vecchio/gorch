@@ -269,6 +269,13 @@ func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
 // code runs: a service's Start may call a membership op without self-deadlocking.
 // Each selected entry is reserved via its starting flag, so a concurrent teardown
 // is rejected rather than stopping an entry about to be started.
+//
+// Returns ErrOrchestratorNotStarted before Start, exactly like StartService:
+// without a service context a member's Start would otherwise reach a nil parent
+// context. An unknown or empty group selects nothing and returns nil: a group is
+// a tag, not a registered entity, so an empty match is a no-op. After Stop it
+// returns ErrOrchestratorStopped (or ErrOrchestratorStopping while Stop runs).
+// Thread-safe.
 func (o *Orchestrator) StartGroup(group string) error {
 	o.membershipMu.Lock()
 	o.mu.Lock()
@@ -276,6 +283,14 @@ func (o *Orchestrator) StartGroup(group string) error {
 		o.mu.Unlock()
 		o.membershipMu.Unlock()
 		return err
+	}
+	// No service context or scheduler exists before Start: a selected member
+	// would reach startOneService and build a context from a nil parent. Gate on
+	// the lifecycle flag, as StartService does.
+	if !o.started {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		return ErrOrchestratorNotStarted
 	}
 	// groupEntries keeps every group member so topoSort sees the full
 	// dependency graph even when only a subset is actually started.
@@ -355,6 +370,11 @@ func (o *Orchestrator) clearStarting(entries []*serviceEntry) {
 // services' Stop hooks run, so a hook may call a membership op without
 // self-deadlocking. Selected entries are reserved via the removing flag so a
 // concurrent group start/stop or teardown sees them mid-operation.
+//
+// Before Start it is a no-op returning nil, consistent with StopService and
+// Unregister: nothing is running to stop. An unknown or empty group likewise
+// selects nothing and returns nil. After Stop it returns ErrOrchestratorStopped
+// (or ErrOrchestratorStopping while Stop runs). Thread-safe.
 func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
 	o.membershipMu.Lock()
 	o.mu.Lock()
@@ -440,7 +460,9 @@ func (o *Orchestrator) StatusesByLabel(key, value string) map[string]ServiceStat
 }
 
 // WaitFor blocks until the named service reaches target status or timeout expires.
-// Polls at 50ms intervals. Returns an error on timeout or if the service is not found.
+// Polls at 50ms intervals. Returns an error on timeout or if the service is not
+// found. A non-positive timeout does not wait: it returns immediately (only
+// succeeding if the status already matches).
 func (o *Orchestrator) WaitFor(name string, target ServiceStatus, timeout time.Duration) error {
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(50 * time.Millisecond)

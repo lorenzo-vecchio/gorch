@@ -1258,7 +1258,10 @@ func TestTypedSubscribe_ChannelFullDefault(t *testing.T) {
 
 func TestSubscribeWithBuffer_DoubleUnsubscribe(t *testing.T) {
 	m := newMessenger()
-	_, unsub := m.SubscribeWithBuffer("topic", 4)
+	_, unsub, err := m.SubscribeWithBuffer("topic", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
 	unsub()
 	// Second unsubscribe: channel not found in slice — hits the
 	// fallthrough return struct{}{} path.
@@ -1474,7 +1477,10 @@ func TestFuncService_StopNil(t *testing.T) {
 
 func TestSubscribeWithBuffer_DoubleUnsubscribe_Raw(t *testing.T) {
 	m := newMessenger()
-	_, unsub := m.SubscribeWithBuffer("topic", 4)
+	_, unsub, err := m.SubscribeWithBuffer("topic", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Clear subscribers BEFORE first unsubscribe so the for-loop
 	// over nil slice hits the fallthrough return struct{}{}.
 	m.mu.Lock()

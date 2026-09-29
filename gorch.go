@@ -440,7 +440,9 @@ func (e *serviceEntry) cronDrain() <-chan struct{} {
 	return e.cronDrained
 }
 
-// Orchestrator manages service lifecycles.
+// Orchestrator manages service lifecycles. Create it with New: the zero value
+// is not usable (its registry and Messenger are uninitialised), so a zero-value
+// Orchestrator must not be registered against or started.
 type Orchestrator struct {
 	cfg     config
 	started bool
@@ -568,6 +570,9 @@ func (o *Orchestrator) signalShutdownDone() {
 // ErrOrchestratorStopping, and after Stop it returns ErrOrchestratorStopped.
 //
 // Returns ErrDuplicateName if WithName conflicts with another service.
+// Returns ErrInvalidCron if a WithCron spec is empty or malformed, on both the
+// static and the hot-add path, so the same spec is accepted or rejected
+// identically regardless of when it is registered.
 // Returns ErrDependencyCycle if DependsOn introduces a cycle.
 // Returns ErrDependencyNotFound if DependsOn names a service that is not yet
 // registered: a hard dependency must always be registered before the service
@@ -662,12 +667,13 @@ func applyRegisterOptions(opts []RegisterOption) registerConfig {
 }
 
 // validateRegisterConfigLocked performs the structural validation of an
-// already-applied registerConfig: the self-heal combination check, auto-naming,
-// duplicate-name detection, hard-dependency existence and cycle detection, and
-// soft-dependency cycle detection. It does not call user code. The caller must
-// hold o.mu, because the graph is inspected via lookupEntry/dependsOnRecursive.
-// A missing hard dependency is reported with ErrDependencyNotFound on both the
-// static and the dynamic path, so callers can classify it with errors.Is
+// already-applied registerConfig: the self-heal combination check, cron-spec
+// validation, auto-naming, duplicate-name detection, hard-dependency existence
+// and cycle detection, and soft-dependency cycle detection. It does not call
+// user code. The caller must hold o.mu, because the graph is inspected via
+// lookupEntry/dependsOnRecursive. A missing hard dependency is reported with
+// ErrDependencyNotFound and a malformed cron spec with ErrInvalidCron on both the
+// static and the dynamic path, so callers can classify either with errors.Is
 // regardless of when they register.
 func (o *Orchestrator) validateRegisterConfigLocked(cfg registerConfig) (registerConfig, error) {
 	// Self-heal is only wired into the persistent-service path. A cron tick and a
@@ -675,6 +681,17 @@ func (o *Orchestrator) validateRegisterConfigLocked(cfg registerConfig) (registe
 	// of silently ignoring it.
 	if cfg.factory != nil && (cfg.cronSpec != "" || cfg.runOnce) {
 		return cfg, fmt.Errorf("%w: WithSelfHeal cannot be combined with WithCron or WithRunOnce", ErrUnsupportedOption)
+	}
+
+	// Validate the cron spec here, on both the static and the dynamic path, so
+	// the same spec is accepted or rejected identically regardless of when it is
+	// registered. cronSet is what makes WithCron("") rejectable: the empty string
+	// is the "not a cron service" marker, so only the flag distinguishes an
+	// explicit empty spec from no WithCron at all.
+	if cfg.cronSet {
+		if err := validateCronSpec(cfg.cronSpec); err != nil {
+			return cfg, err
+		}
 	}
 
 	// Auto-name if no WithName set.
@@ -766,10 +783,10 @@ func (o *Orchestrator) registerDynamicCfg(svc Service, cfg registerConfig) error
 }
 
 // commitDynamicLocked appends a hot-added entry to a running orchestrator. The
-// caller must hold o.mu; Validator.Validate (if any) must already have run
-// outside the lock. The entry stays StatusRegistered and is never auto-started
-// (D1); a cron entry is only validated here, not scheduled, so its schedule and
-// status stay consistent until StartService.
+// caller must hold o.mu, and must have run validateRegisterConfigLocked and
+// Validator.Validate (if any) first. The entry stays StatusRegistered and is
+// never auto-started (D1); a cron entry is scheduled only by StartService, so its
+// schedule and status stay consistent until then.
 func (o *Orchestrator) commitDynamicLocked(svc Service, cfg registerConfig) error {
 	if err := o.membershipGateLocked(); err != nil {
 		return err
@@ -777,11 +794,9 @@ func (o *Orchestrator) commitDynamicLocked(svc Service, cfg registerConfig) erro
 	if _, exists := o.nameIndex[cfg.name]; exists {
 		return fmt.Errorf("%w: %s", ErrDuplicateName, cfg.name)
 	}
-	if cfg.cronSpec != "" {
-		if err := validateCronSpec(cfg.cronSpec); err != nil {
-			return err
-		}
-	}
+	// The cron spec was already validated by validateRegisterConfigLocked, which
+	// every caller of commitDynamicLocked runs first; validateCronSpec is not
+	// repeated here.
 	// Read the log fields under o.mu: a concurrent Start publishes them in one
 	// critical section, so reading them without the lock would race.
 	entry := &serviceEntry{svc: svc, cfg: cfg, name: cfg.name, status: StatusRegistered}
@@ -1370,7 +1385,10 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 
 // Run starts the orchestrator, blocks on SIGINT/SIGTERM, then stops.
 // Returns any error from Start or aggregated errors from Stop.
-// Optional signals override the default signal set (SIGINT, SIGTERM).
+// Optional signals override the default signal set (SIGINT, SIGTERM). A nil
+// element in signals is inert (it can never match a delivered signal); passing
+// only nil therefore registers no catchable signal and Run never returns. Pass
+// at least one real signal, or no argument to use the defaults.
 func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) error {
 	if err := o.Start(); err != nil {
 		return err

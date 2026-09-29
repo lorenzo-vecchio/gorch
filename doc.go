@@ -59,6 +59,18 @@
 //     into membership operations without deadlocking.
 //   - A hot-added cron service is staged by Register and only scheduled by
 //     StartService, so it never ticks while reporting StatusRegistered.
+//   - A WithCron spec is validated by Register on both the static and the
+//     hot-add path, so the same spec is accepted or rejected identically. An
+//     empty spec returns ErrInvalidCron instead of silently registering a
+//     non-cron service, and a sub-second @every interval is clamped to one
+//     second by the underlying parser.
+//   - Public entry points return sentinels rather than panicking on hostile but
+//     plausible input: StartGroup before Start returns ErrOrchestratorNotStarted
+//     exactly like StartService, SubscribeWithBuffer rejects a negative capacity
+//     with ErrInvalidBufferSize, and Request, RequestAsync, and TypedRequest
+//     reject a nil context with ErrNilContext. An unknown or empty group selects
+//     nothing and returns nil (a group is a filter tag, not an entity), and
+//     StopGroup before Start is a no-op, consistent with StopService/Unregister.
 //   - Introspection reports what is registered, not what is live: Count, Names,
 //     and Statuses include an entry from the moment it is registered, so a
 //     hot-added, not-yet-started service and a staged cron entry are both

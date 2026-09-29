@@ -105,9 +105,13 @@ func TypedSubscribe[T any](m *Messenger, topic string) (<-chan T, func()) {
 
 // TypedRequest sends a typed request and waits for a typed response.
 // It gob-encodes the request, publishes it via requestMessage, and gob-decodes
-// the response. Returns the decoded response or an error.
+// the response. Returns the decoded response or an error. A nil ctx is rejected
+// with ErrNilContext.
 func TypedRequest[TReq, TResp any](m *Messenger, ctx context.Context, req TReq, topic string) (TResp, error) {
 	var zero TResp
+	if ctx == nil {
+		return zero, ErrNilContext
+	}
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(&req); err != nil {
 		return zero, fmt.Errorf("gorch: failed to encode request: %w", err)

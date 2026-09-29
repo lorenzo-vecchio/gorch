@@ -55,15 +55,17 @@ type sentinelSpec struct {
 // documentedEntryPoints is the set of public entry points a sentinel may name
 // as its producer; it keeps the entry column from drifting to a typo.
 var documentedEntryPoints = map[string]struct{}{
-	"Start":        {},
-	"Stop":         {},
-	"Register":     {},
-	"RegisterFunc": {},
-	"StartService": {},
-	"StopService":  {},
-	"Unregister":   {},
-	"StartGroup":   {},
-	"StopGroup":    {},
+	"Start":               {},
+	"Stop":                {},
+	"Register":            {},
+	"RegisterFunc":        {},
+	"StartService":        {},
+	"StopService":         {},
+	"Unregister":          {},
+	"StartGroup":          {},
+	"StopGroup":           {},
+	"SubscribeWithBuffer": {},
+	"Request":             {},
 }
 
 var sentinelTaxonomy = []sentinelSpec{
@@ -87,6 +89,8 @@ var sentinelTaxonomy = []sentinelSpec{
 	{name: "ErrDependencyDepthExceeded", err: ErrDependencyDepthExceeded, class: classPermanent, entry: "Register", produce: produceErrDependencyDepthExceeded},
 	{name: "ErrReentrantMembership", err: ErrReentrantMembership, class: classPermanent, entry: "StartService", produce: produceErrReentrantMembership},
 	{name: "ErrMembershipBusy", err: ErrMembershipBusy, class: classTransient, entry: "StartService", produce: produceErrMembershipBusy},
+	{name: "ErrInvalidBufferSize", err: ErrInvalidBufferSize, class: classPermanent, entry: "SubscribeWithBuffer", produce: produceErrInvalidBufferSize},
+	{name: "ErrNilContext", err: ErrNilContext, class: classPermanent, entry: "Request", produce: produceErrNilContext},
 }
 
 // TestSentinelsTable_EverySentinelHasATest fails when a new exported sentinel
@@ -327,8 +331,7 @@ func produceErrAlreadyStarted(t *testing.T) error {
 
 func produceErrInvalidCron(t *testing.T) error {
 	t.Helper()
-	// A hot add validates the cron spec at Register (a static registration is
-	// validated at Start instead).
+	// Register validates the cron spec on both the static and the hot-add path.
 	o := startedOrchestrator(t)
 	t.Cleanup(func() { _ = o.Stop(time.Second) })
 	return o.Register(&namedSvc{}, WithName("bad"), WithCron("invalid", CronParallel))
@@ -580,4 +583,18 @@ func produceErrMembershipBusy(t *testing.T) error {
 	entry.starting.Store(true)
 	t.Cleanup(func() { entry.starting.Store(false) })
 	return o.StartService("r")
+}
+
+func produceErrInvalidBufferSize(t *testing.T) error {
+	t.Helper()
+	m := newMessenger()
+	_, _, err := m.SubscribeWithBuffer("topic", -1)
+	return err
+}
+
+func produceErrNilContext(t *testing.T) error {
+	t.Helper()
+	m := newMessenger()
+	_, err := m.Request(nilCtx, "req", "topic")
+	return err
 }

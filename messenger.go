@@ -99,12 +99,16 @@ func (m *Messenger) Subscribe(topic string) (<-chan any, func()) {
 }
 
 // SubscribeWithBuffer registers interest in a topic with a caller-specified
-// buffer size. Returns a receive-only channel and an unsubscribe function.
-// Safe to call after Drain (subscriptions are lazily re-initialized).
-// Thread-safe.
-func (m *Messenger) SubscribeWithBuffer(topic string, bufSize int) (<-chan any, func()) {
+// buffer size. Returns a receive-only channel, an unsubscribe function, and an
+// error. A negative buffer size is rejected with ErrInvalidBufferSize rather than
+// panicking in make. Safe to call after Drain (subscriptions are lazily
+// re-initialized). Thread-safe.
+func (m *Messenger) SubscribeWithBuffer(topic string, bufSize int) (<-chan any, func(), error) {
+	if bufSize < 0 {
+		return nil, nil, fmt.Errorf("%w: %d", ErrInvalidBufferSize, bufSize)
+	}
 	ch, unsub, _ := m.subscribe(m.state, topic, bufSize)
-	return ch, unsub
+	return ch, unsub, nil
 }
 
 // subscribe registers interest in topic under state's owner (0 for the root). A
@@ -197,7 +201,7 @@ func (m *Messenger) Publish(msg any, topics ...string) {
 // request, and returns the first response (or an error if ctx expires).
 // The responding service receives a Message on its channel; it should
 // Publish the response on msg.ReplyTopic.
-// Thread-safe.
+// A nil ctx is rejected with ErrNilContext. Thread-safe.
 func (m *Messenger) Request(ctx context.Context, msg any, topic string) (any, error) {
 	ch, err := m.RequestAsync(ctx, msg, topic)
 	if err != nil {
@@ -230,8 +234,12 @@ func (m *Messenger) requestMessage(wrapper Message, topic string) (<-chan any, f
 // channel. The caller must select on the channel and ctx.Done().
 // The returned channel is delivered to exactly once on reply, and the
 // forwarding goroutine exits on either a reply or context cancellation.
-// Thread-safe.
+// Returns ErrNilContext for a nil ctx, rather than panicking when the
+// forwarding goroutine calls ctx.Done(). Thread-safe.
 func (m *Messenger) RequestAsync(ctx context.Context, msg any, topic string) (<-chan any, error) {
+	if ctx == nil {
+		return nil, ErrNilContext
+	}
 	// encode payload with gob
 	var payload []byte
 	if msg != nil {
