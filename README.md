@@ -65,8 +65,8 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 | `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Dependents`, `DependenciesOf`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Dependents`/`DependenciesOf` walk the hard-dependency edges under the graph lock and return snapshots. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation, and is the only observable for the reservation window. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
 | `Metrics`, `Done` | Yes — atomic counters and a shutdown-completed channel created once in `New` and returned unchanged. |
-| `StartGroup`, `StopGroup` | Drive one group per orchestrator. Serialized with `StopService`/`Unregister` by the membership lock; a group start reserves each member and rolls back the members it already started if a later one fails, and a group stop honours a concurrent start's reservation by skipping that entry. Both are gated by shutdown (`ErrOrchestratorStopping`/`ErrOrchestratorStopped`). Group ops are not synchronized with the whole-orchestrator `Start`/`Stop` beyond that shutdown gate: do not drive them from inside a concurrent `Start`/`Stop`. |
-| `Messenger` (`Subscribe`, `Publish`, `Request`, `RequestAsync`, `Drain`) and the typed helpers | Yes — all Messenger methods are safe for concurrent use. |
+| `StartGroup`, `StopGroup` | Drive one group per orchestrator. Serialized with `StopService`/`Unregister` by the membership lock; a group start reserves each member and rolls back the members it already started if a later one fails, and a group stop honours a concurrent start's reservation by skipping that entry. `StartGroup` before `Start` returns `ErrOrchestratorNotStarted` (a member would otherwise build its context from a nil parent), while `StopGroup` before `Start` is a no-op returning `nil`, consistent with `StopService`/`Unregister`. An unknown or empty group selects nothing and returns `nil`: a group is a filter tag, not a registered entity. Both are gated by shutdown (`ErrOrchestratorStopping`/`ErrOrchestratorStopped`). Group ops are not synchronized with the whole-orchestrator `Start`/`Stop` beyond those gates: do not drive them from inside a concurrent `Start`/`Stop`. |
+| `Messenger` (`Subscribe`, `SubscribeWithBuffer`, `Publish`, `Request`, `RequestAsync`, `Drain`) and the typed helpers | Yes — all Messenger methods are safe for concurrent use. `SubscribeWithBuffer` rejects a negative capacity with `ErrInvalidBufferSize` instead of panicking, and `Request`/`RequestAsync`/`TypedRequest` reject a nil context with `ErrNilContext` instead of panicking on `ctx.Done()`. |
 
 Service implementations are responsible for their own internal concurrency:
 `Start` runs in its own goroutine and `Stop` may be called from another after
@@ -136,7 +136,16 @@ These guarantees are part of the public API and are relied upon by callers.
   recovered and reported as an error (or as unhealthy/unready); it never unwinds
   through a public entry point. `Register(nil, …)` and a nil `RegisterFunc`
   `startFn` are rejected with `ErrNilService` rather than deferred to a panic at
-  `Start`.
+  `Start`. `StartGroup` before `Start` is gated with `ErrOrchestratorNotStarted`
+  (like `StartService`), `SubscribeWithBuffer` rejects a negative capacity with
+  `ErrInvalidBufferSize`, and `Request`/`RequestAsync`/`TypedRequest` reject a nil
+  context with `ErrNilContext`; none of these unwind.
+- **Construct an `Orchestrator` with `New`.** The `Orchestrator` zero value is
+  not usable: it has no registry or Messenger, so a zero-value instance must not
+  be registered against or started. By contrast a zero-value `Messenger` (for
+  example `var m Messenger` before any scope is created) is usable: its registry
+  is lazily initialised and `Publish`/`Subscribe`/`SubscribeWithBuffer`/`Drain`
+  are safe on it.
 - **A blocked before-stop hook cannot strand a service.** `Stop`'s budget is
   split so the hook gets at most half of what remains; the service's own `Stop()`
   is always invoked, and a hook that overruns is reported as `ErrHookTimeout`
@@ -168,14 +177,16 @@ Sentinel errors returned by the orchestrator:
 | `ErrDuplicateName` | `Register` | Two services share a `WithName`. |
 | `ErrDependencyCycle` | `Register`, `Start`, `Stop` (defensive), `StartGroup`, `StopGroup` | A hard or soft dependency chain loops. `Register` rejects it up front; `Start`, `Stop`, and the group ops re-check their selected subset and surface it defensively if a cycle survived registration. |
 | `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
-| `ErrInvalidCron` | `Start`, `Register` (hot add) | A `WithCron` spec is invalid. |
+| `ErrInvalidCron` | `Register` (static and hot add), `Start` (defensive re-check) | A `WithCron` spec is empty or invalid. `Register` validates the spec on both paths, so the same spec is accepted or rejected identically; `Start` re-checks defensively in case an entry's spec was changed after registration. A sub-second `@every` interval (including `@every 0s`) is *not* invalid: the underlying parser clamps it to one second. |
 | `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
 | `ErrStopTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A stop did not finish within the caller's timeout: the before/after-stop hooks, `Stop()`, or the wait for the instance to exit was still in flight. On the stop methods the entry is left `StatusStopping` (not `StatusStopped`) and the stop is not counted in `Metrics().Stops`. On a failed `Start` it means the bounded rollback budget was exceeded; the rollback still resets the snapshotted entries to `StatusRegistered`, leaving the orchestrator retryable. |
 | `ErrHookTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. On the stop methods the teardown is unverified, so the entry stays `StatusStopping`; on a failed `Start` the rollback resets it to `StatusRegistered`. |
 | `ErrNilService` | `Register`, `RegisterFunc` | A nil `Service`, or a nil `Start` closure passed to `RegisterFunc`. |
-| `ErrOrchestratorNotStarted` | `StartService` | Called before the orchestrator was started. |
+| `ErrOrchestratorNotStarted` | `StartService`, `StartGroup` | Called before the orchestrator was started, so there is no service context or scheduler yet. |
 | `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
 | `ErrMembershipBusy` | `StartService`, `StopService`, `Unregister` | A membership op collided with a reservation held by another goroutine's in-flight `Start`/`Stop`/group operation. Transient: poll `Busy(name)` or retry once the reservation clears. |
+| `ErrInvalidBufferSize` | `SubscribeWithBuffer` | The buffer capacity was negative. A permanent caller bug: fix the size, do not retry. |
+| `ErrNilContext` | `Request`, `RequestAsync`, `TypedRequest` | A nil `context.Context` was passed. A permanent caller bug: pass `context.Background()` for no cancellation or deadline, do not retry. |
 | `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
 | `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break a hard dependent that is `Running` or `Starting`. Returned as a `*HasDependentsError` whose `Name` is the target and whose `Dependents` names each blocker (the same set as `Dependents(name)`). Pass `WithCascadeStop` to tear those dependents down too. Dependents in `Stopping`, `Registered`, `Crashed`, `Stopped`, or `Succeeded` do not block. |
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
@@ -192,7 +203,7 @@ Sentinels are stable API surface, so each one is classified along two axes: a
 
 | Class | Retryable | Meaning | Sentinels |
 |-------|-----------|---------|-----------|
-| permanent | no | A bug in the caller's code or configuration; an identical call keeps failing until code or configuration changes. | `ErrDuplicateName`, `ErrNilService`, `ErrInvalidCron`, `ErrDependencyCycle`, `ErrDependencyNotFound`, `ErrServiceNotFound`, `ErrDependencyDepthExceeded`, `ErrUnsupportedOption`, `ErrReentrantMembership` |
+| permanent | no | A bug in the caller's code or configuration; an identical call keeps failing until code or configuration changes. | `ErrDuplicateName`, `ErrNilService`, `ErrInvalidCron`, `ErrDependencyCycle`, `ErrDependencyNotFound`, `ErrServiceNotFound`, `ErrDependencyDepthExceeded`, `ErrUnsupportedOption`, `ErrReentrantMembership`, `ErrInvalidBufferSize`, `ErrNilContext` |
 | transient | yes | A condition that may clear on its own or after another operation; retry once it does. | `ErrOrchestratorStopping`, `ErrOrchestratorNotStarted`, `ErrDependencyNotRunning`, `ErrDependencyRemoving`, `ErrHasDependents`, `ErrMembershipBusy`, `ErrStartAborted` |
 | terminal | no | The whole-orchestrator lifecycle has already begun or ended; by design the operation can never succeed. | `ErrAlreadyStarted`, `ErrOrchestratorStopped` |
 | environmental | no | User code or teardown overran a deadline and the outcome is unverified; the timed-out teardown is not retried. | `ErrStopTimeout`, `ErrHookTimeout` |
@@ -458,7 +469,8 @@ a timed-out stop abandoned a goroutine — and stays open until then.
 - `WithName` assigns the name used as the key everywhere else: `DependsOn` edges,
   `StartService`/`StopService`/`Unregister`, `Status`/`WaitFor`, and the
   lifecycle hooks. Names must be unique across the registry.
-- Omitting `WithName` auto-assigns `$1`, `$2`, … The counter advances on every
+- Omitting `WithName`, or passing an explicit empty string, auto-assigns `$1`,
+  `$2`, … The counter advances on every
   registration — named services included — so it is not the count of unnamed
   services, and it never winds back: `Unregister` frees an explicitly named
   entry, but the auto-name sequence never reuses a value.
@@ -505,6 +517,14 @@ orch := gorch.New(gorch.WithFailedStartTimeout(5 * time.Second))
 Each tick receives a fresh `ServiceContext` whose context is cancelled when that
 tick returns; `StopService`/`Unregister` cancel every in-flight tick through it
 and wait for them to return.
+
+`WithCron` is validated by `Register` on both the static and the hot-add path, so
+the same spec is accepted or rejected identically regardless of when it is
+registered. An empty or malformed spec returns `ErrInvalidCron`: `WithCron("")`
+is rejected rather than silently registering a non-cron service, and a static
+bad spec is no longer deferred to `Start`. A sub-second `@every` interval
+(including `@every 0s`) is accepted and clamped to one second by the underlying
+parser.
 
 **For a cron entry, `StatusRunning` means "schedule installed", not "working".**
 Scheduling and health are separate facts, and the status reports only the first:
@@ -911,10 +931,13 @@ orch.Register(svc, gorch.WithStopTimeout(3 * time.Second))
 
 ### Messenger buffer size
 
-`SubscribeWithBuffer` lets callers set the buffer capacity to prevent slow consumers from blocking publishers.
+`SubscribeWithBuffer` lets callers set the buffer capacity to prevent slow consumers from blocking publishers. A negative capacity is rejected with `ErrInvalidBufferSize` rather than panicking.
 
 ```go
-ch, unsub := messenger.SubscribeWithBuffer("high-throughput", 256)
+ch, unsub, err := messenger.SubscribeWithBuffer("high-throughput", 256)
+if err != nil {
+    return err
+}
 ```
 
 ### Health check hooks

@@ -93,6 +93,78 @@ func TestNoPublicAPI_Panics(t *testing.T) {
 		}
 	})
 
+	t.Run("static_cron_specs", func(t *testing.T) {
+		o := New()
+		if err := o.Register(&namedSvc{}, WithName("empty"), WithCron("", CronParallel)); !errors.Is(err, ErrInvalidCron) {
+			t.Fatalf("Register WithCron(\"\") = %v, want ErrInvalidCron", err)
+		}
+		if err := o.Register(&namedSvc{}, WithName("bad"), WithCron("not a spec", CronParallel)); !errors.Is(err, ErrInvalidCron) {
+			t.Fatalf("Register WithCron(bad) = %v, want ErrInvalidCron", err)
+		}
+		// A sub-second @every is accepted (the parser clamps it to 1s), not a panic.
+		if err := o.Register(&namedSvc{}, WithName("every"), WithCron("@every 0s", CronParallel)); err != nil {
+			t.Fatalf("Register WithCron(@every 0s) = %v, want nil (clamped)", err)
+		}
+	})
+
+	t.Run("negative_buffer", func(t *testing.T) {
+		m := newMessenger()
+		mustNotPanic(t, "SubscribeWithBuffer(-1)", func() {
+			ch, unsub, err := m.SubscribeWithBuffer("t", -1)
+			if !errors.Is(err, ErrInvalidBufferSize) {
+				t.Errorf("SubscribeWithBuffer(-1) = %v, want ErrInvalidBufferSize", err)
+			}
+			if ch != nil || unsub != nil {
+				t.Error("a rejected SubscribeWithBuffer must return a nil channel and unsubscribe")
+			}
+		})
+	})
+
+	t.Run("nil_context", func(t *testing.T) {
+		m := newMessenger()
+		if _, err := m.Request(nilCtx, "req", "t"); !errors.Is(err, ErrNilContext) {
+			t.Errorf("Request(nil ctx) = %v, want ErrNilContext", err)
+		}
+		mustNotPanic(t, "RequestAsync(nil ctx)", func() {
+			if _, err := m.RequestAsync(nilCtx, "req", "t"); !errors.Is(err, ErrNilContext) {
+				t.Errorf("RequestAsync(nil ctx) = %v, want ErrNilContext", err)
+			}
+		})
+		mustNotPanic(t, "TypedRequest(nil ctx)", func() {
+			if _, err := TypedRequest[string, string](m, nilCtx, "req", "t"); !errors.Is(err, ErrNilContext) {
+				t.Errorf("TypedRequest(nil ctx) = %v, want ErrNilContext", err)
+			}
+		})
+	})
+
+	t.Run("zero_value_messenger", func(t *testing.T) {
+		var m Messenger
+		mustNotPanic(t, "Subscribe", func() {
+			ch, unsub := m.Subscribe("t")
+			m.Publish(1, "t")
+			select {
+			case <-ch:
+			default:
+			}
+			unsub()
+		})
+		mustNotPanic(t, "Publish", func() { m.Publish(1) })
+		mustNotPanic(t, "SubscribeWithBuffer", func() {
+			if _, _, err := m.SubscribeWithBuffer("t", 0); err != nil {
+				t.Errorf("SubscribeWithBuffer(0) = %v, want nil", err)
+			}
+		})
+		mustNotPanic(t, "Drain", func() { m.Drain() })
+	})
+
+	t.Run("unknown_groups", func(t *testing.T) {
+		o := New()
+		mustNotPanic(t, "StartGroup unknown before Start", func() {
+			_ = o.StartGroup("ghost")
+		})
+		mustNotPanic(t, "StopGroup unknown", func() { _ = o.StopGroup("ghost", time.Second) })
+	})
+
 	t.Run("messenger_after_drain", func(t *testing.T) {
 		m := newMessenger()
 		m.Drain()

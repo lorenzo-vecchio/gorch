@@ -30,7 +30,10 @@ func BenchmarkStartStop50Services(b *testing.B) {
 // subscriber, then drains the buffered messages outside the timed loop.
 func BenchmarkMessengerPublish(b *testing.B) {
 	m := newMessenger()
-	ch, _ := m.SubscribeWithBuffer("bench", b.N+1)
+	ch, _, err := m.SubscribeWithBuffer("bench", b.N+1)
+	if err != nil {
+		b.Fatal(err)
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m.Publish(i, "bench")
