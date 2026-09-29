@@ -58,7 +58,11 @@
 //     and Statuses include an entry from the moment it is registered, so a
 //     hot-added, not-yet-started service and a staged cron entry are both
 //     present and both read StatusRegistered. CountRunning and RunningNames are
-//     the StatusRunning subset ("N of M running"). A start reservation is not
+//     the StatusRunning subset ("N of M running"). Dependents and DependenciesOf
+//     read the hard-dependency edges in the reverse and forward directions
+//     respectively: Dependents is the blocking set a plain stop is refused on,
+//     so it excludes soft and non-blocking dependents, while DependenciesOf is
+//     the direct hard dependencies. A start reservation is not
 //     encoded in status: an entry actively starting still reports its prior
 //     status until startOneService commits StatusStarting, so poll Busy(name)
 //     for an in-flight reservation. For a cron entry StatusRunning means the
@@ -107,9 +111,12 @@
 //     ErrDependencyRemoving: a retryable "not now" condition distinct from
 //     ErrHasDependents, which is only about the target's own hard dependents.
 //   - A plain StopService/Unregister is refused with ErrHasDependents when a
-//     hard dependent is Running or Starting, and the error names each blocker
-//     with its status. Dependents in any other status (Stopping, Registered,
-//     Crashed, Stopped, Succeeded) do not block. WithCascadeStop tears the
+//     hard dependent is Running or Starting. The typed *HasDependentsError
+//     carries the target name and the blocking dependents (the same set
+//     Dependents(name) returns, in reverse topological order); DependenciesOf
+//     is the forward direction. Dependents in any other status (Stopping,
+//     Registered, Crashed, Stopped, Succeeded) do not block, and soft
+//     dependencies neither block nor are reported. WithCascadeStop tears the
 //     dependents down in reverse topological order; a dependent already Stopping
 //     is left to its own in-flight teardown rather than stopped a second time.
 //   - The cycle check walks each node once, so a diamond costs O(V+E) rather
