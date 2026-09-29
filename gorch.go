@@ -440,9 +440,11 @@ func (e *serviceEntry) cronDrain() <-chan struct{} {
 	return e.cronDrained
 }
 
-// Orchestrator manages service lifecycles. Create it with New: the zero value
-// is not usable (its registry and Messenger are uninitialised), so a zero-value
-// Orchestrator must not be registered against or started.
+// Orchestrator manages service lifecycles. Create it with New, or use the zero
+// value directly: a zero-value Orchestrator is usable because the first public
+// call lazily initialises it with the same defaults as New(), so
+// `var o Orchestrator` behaves like `New()` and never panics on an
+// uninitialised registry, Messenger, or shutdown channel.
 type Orchestrator struct {
 	cfg     config
 	started bool
@@ -495,6 +497,12 @@ type Orchestrator struct {
 	stopOnce  sync.Once
 	startOnce sync.Once
 
+	// initOnce runs initialize at most once: New performs it eagerly, while a
+	// zero-value Orchestrator performs it lazily on its first public call. It is
+	// what makes `var o Orchestrator` usable instead of panicking on a nil
+	// registry, Messenger, or shutdown channel.
+	initOnce sync.Once
+
 	// shutdownDone is closed exactly once, by signalShutdownDone, when a Stop
 	// call completes. Done() returns it directly: unlike the old
 	// sync.OnceValue that wrapped o.wg.Wait, it can never close early when a
@@ -519,7 +527,29 @@ type Orchestrator struct {
 // sub-services. Configure via Option functions; the zero-option call uses the
 // defaults (LogLevelInfo, health checks every 30s with a 5s probe timeout, a 30s
 // failed-Start rollback budget).
+//
+// The zero value is usable too: `var o Orchestrator` behaves like New() with no
+// options, because every public entry point lazily initialises it on first use.
 func New(opts ...Option) *Orchestrator {
+	o := &Orchestrator{}
+	o.initOnce.Do(func() { o.initialize(opts) })
+	return o
+}
+
+// ensureInit lazily initialises a zero-value Orchestrator with the same defaults
+// as New(). Every public entry point calls it, so `var o Orchestrator` behaves
+// like New() rather than panicking on an uninitialised registry, Messenger, or
+// shutdown channel. sync.Once makes it safe under concurrent first calls and a
+// no-op on an orchestrator already built by New, so state registered before the
+// first public call is never discarded.
+func (o *Orchestrator) ensureInit() {
+	o.initOnce.Do(func() { o.initialize(nil) })
+}
+
+// initialize applies opts over the defaults and creates the runtime state. It is
+// the single initializer behind New and ensureInit; initOnce guarantees it runs
+// at most once per Orchestrator.
+func (o *Orchestrator) initialize(opts []Option) {
 	cfg := config{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -546,12 +576,10 @@ func New(opts ...Option) *Orchestrator {
 	if cfg.failedStartTimeout == 0 {
 		cfg.failedStartTimeout = 30 * time.Second
 	}
-	return &Orchestrator{
-		cfg:          cfg,
-		messenger:    newMessenger(),
-		nameIndex:    make(map[string]*serviceEntry),
-		shutdownDone: make(chan struct{}),
-	}
+	o.cfg = cfg
+	o.messenger = newMessenger()
+	o.nameIndex = make(map[string]*serviceEntry)
+	o.shutdownDone = make(chan struct{})
 }
 
 // signalShutdownDone closes the Done channel at most once. Stop defers it on
@@ -591,6 +619,7 @@ func (o *Orchestrator) signalShutdownDone() {
 // therefore runs once whether or not svc implements Validator.
 // Thread-safe.
 func (o *Orchestrator) Register(svc Service, opts ...RegisterOption) error {
+	o.ensureInit()
 	if svc == nil {
 		return fmt.Errorf("%w: Register called with a nil Service", ErrNilService)
 	}
@@ -851,6 +880,7 @@ func (o *Orchestrator) lookupEntry(name string) *serviceEntry {
 // Busy reports that a membership operation has claimed it.
 // Thread-safe.
 func (o *Orchestrator) Busy(name string) bool {
+	o.ensureInit()
 	o.mu.RLock()
 	entry := o.lookupEntry(name)
 	o.mu.RUnlock()
@@ -931,6 +961,7 @@ func (o *Orchestrator) dependsOnRecursive(entry *serviceEntry, target string, vi
 // that some concurrent Start did.
 // Thread-safe.
 func (o *Orchestrator) Start() error {
+	o.ensureInit()
 	// Claim the lifecycle before entering startOnce. Without the claim a second
 	// caller could pass the o.started pre-check while the winner is still inside
 	// the closure (o.started is published there), block on startOnce.Do, and then
@@ -1251,6 +1282,7 @@ func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline 
 // cannot be restarted, and a subsequent Start returns ErrAlreadyStarted.
 // Registering after Stop returns ErrOrchestratorStopped instead.
 func (o *Orchestrator) Stop(timeout time.Duration) error {
+	o.ensureInit()
 	var stopErr error
 	o.stopOnce.Do(func() {
 		// Done is a shutdown-completed signal: it closes when this Stop returns,
@@ -1390,6 +1422,7 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 // only nil therefore registers no catchable signal and Run never returns. Pass
 // at least one real signal, or no argument to use the defaults.
 func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) error {
+	o.ensureInit()
 	if err := o.Start(); err != nil {
 		return err
 	}
@@ -1410,6 +1443,7 @@ func (o *Orchestrator) Run(stopTimeout time.Duration, signals ...os.Signal) erro
 // RegisterFunc registers a closure-based service under the given name.
 // Thread-safe.
 func (o *Orchestrator) RegisterFunc(name string, startFn func(ctx ServiceContext) error, stopFn func() error, opts ...RegisterOption) error {
+	o.ensureInit()
 	if startFn == nil {
 		return fmt.Errorf("%w: RegisterFunc called with a nil start function", ErrNilService)
 	}

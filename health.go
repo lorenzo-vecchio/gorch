@@ -72,6 +72,7 @@ func (s ServiceStatus) String() string {
 // Each probe gets a fresh deadline (HealthTimeout) and a panic is recovered and
 // returned as an error. Thread-safe.
 func (o *Orchestrator) Health() map[string]error {
+	o.ensureInit()
 	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
 	copy(entries, o.entries)

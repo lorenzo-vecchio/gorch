@@ -33,6 +33,7 @@ import (
 // shutdown has begun.
 // Thread-safe.
 func (o *Orchestrator) StartService(name string) error {
+	o.ensureInit()
 	// Serialize the start decision and its reservation with StopService,
 	// Unregister, StartGroup and Start (which all take membershipMu): the
 	// reservation must be claimed atomically with the checks below, or a second
@@ -180,6 +181,7 @@ func (o *Orchestrator) Unregister(name string, timeout time.Duration, opts ...St
 // then stops them outside it (user code never runs under the lock) against one
 // shared deadline, and finally removes them when remove is true.
 func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration, opts []StopOption) error {
+	o.ensureInit()
 	var cfg stopConfig
 	for _, opt := range opts {
 		opt(&cfg)

@@ -78,6 +78,7 @@ type Metrics struct {
 // not that a tick is working (see Statuses).
 // Thread-safe.
 func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
+	o.ensureInit()
 	o.mu.RLock()
 	entry, ok := o.nameIndex[name]
 	o.mu.RUnlock()
@@ -106,6 +107,7 @@ func (o *Orchestrator) Status(name string) (ServiceStatus, bool) {
 // commits StatusStarting, and a teardown shows StatusStopping. Poll Busy(name)
 // for the reservation. Thread-safe.
 func (o *Orchestrator) Statuses() map[string]ServiceStatus {
+	o.ensureInit()
 	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
 	copy(entries, o.entries)
@@ -125,6 +127,7 @@ func (o *Orchestrator) Statuses() map[string]ServiceStatus {
 // staged cron entry are both included; use RunningNames for the running subset.
 // Thread-safe.
 func (o *Orchestrator) Names() []string {
+	o.ensureInit()
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	names := make([]string, len(o.entries))
@@ -140,6 +143,7 @@ func (o *Orchestrator) Names() []string {
 // the number of StatusRunning services ("N of M running").
 // Thread-safe.
 func (o *Orchestrator) Count() int {
+	o.ensureInit()
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	return len(o.entries)
@@ -152,6 +156,7 @@ func (o *Orchestrator) Count() int {
 // taken under the same locks as Statuses, so it is consistent with the
 // StatusRunning entries of that map. Thread-safe.
 func (o *Orchestrator) CountRunning() int {
+	o.ensureInit()
 	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
 	copy(entries, o.entries)
@@ -173,6 +178,7 @@ func (o *Orchestrator) CountRunning() int {
 // CountRunning and the StatusRunning subset of Statuses: registered but
 // not-started entries and staged cron entries are omitted. Thread-safe.
 func (o *Orchestrator) RunningNames() []string {
+	o.ensureInit()
 	o.mu.RLock()
 	entries := make([]*serviceEntry, len(o.entries))
 	copy(entries, o.entries)
@@ -205,6 +211,7 @@ func (o *Orchestrator) RunningNames() []string {
 // DependenciesOf for the opposite direction. Returns ErrServiceNotFound for an
 // unknown name. Thread-safe.
 func (o *Orchestrator) Dependents(name string) ([]string, error) {
+	o.ensureInit()
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	entry := o.lookupEntry(name)
@@ -223,6 +230,7 @@ func (o *Orchestrator) Dependents(name string) ([]string, error) {
 // dependent is re-registered or removed. Returns ErrServiceNotFound for an
 // unknown name. Thread-safe.
 func (o *Orchestrator) DependenciesOf(name string) ([]string, error) {
+	o.ensureInit()
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	entry := o.lookupEntry(name)
@@ -243,6 +251,7 @@ func (o *Orchestrator) DependenciesOf(name string) ([]string, error) {
 // bound how long they wait (e.g. IsReady(ctx, name) with a deadline context).
 // Thread-safe.
 func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
+	o.ensureInit()
 	o.mu.RLock()
 	entry, ok := o.nameIndex[name]
 	o.mu.RUnlock()
@@ -277,6 +286,7 @@ func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
 // returns ErrOrchestratorStopped (or ErrOrchestratorStopping while Stop runs).
 // Thread-safe.
 func (o *Orchestrator) StartGroup(group string) error {
+	o.ensureInit()
 	o.membershipMu.Lock()
 	o.mu.Lock()
 	if err := o.membershipGateLocked(); err != nil {
@@ -376,6 +386,7 @@ func (o *Orchestrator) clearStarting(entries []*serviceEntry) {
 // selects nothing and returns nil. After Stop it returns ErrOrchestratorStopped
 // (or ErrOrchestratorStopping while Stop runs). Thread-safe.
 func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
+	o.ensureInit()
 	o.membershipMu.Lock()
 	o.mu.Lock()
 	if err := o.membershipGateLocked(); err != nil {
@@ -422,6 +433,7 @@ func (o *Orchestrator) StopGroup(group string, timeout time.Duration) error {
 // StatusesByGroup returns a map of service name to status for all services
 // in the named group. Thread-safe.
 func (o *Orchestrator) StatusesByGroup(group string) map[string]ServiceStatus {
+	o.ensureInit()
 	o.mu.RLock()
 	entries := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
@@ -442,6 +454,7 @@ func (o *Orchestrator) StatusesByGroup(group string) map[string]ServiceStatus {
 // StatusesByLabel returns a map of service name to status for all services
 // matching the given label key-value pair. Thread-safe.
 func (o *Orchestrator) StatusesByLabel(key, value string) map[string]ServiceStatus {
+	o.ensureInit()
 	o.mu.RLock()
 	entries := make([]*serviceEntry, 0)
 	for _, e := range o.entries {
@@ -464,6 +477,7 @@ func (o *Orchestrator) StatusesByLabel(key, value string) map[string]ServiceStat
 // found. A non-positive timeout does not wait: it returns immediately (only
 // succeeding if the status already matches).
 func (o *Orchestrator) WaitFor(name string, target ServiceStatus, timeout time.Duration) error {
+	o.ensureInit()
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -487,6 +501,7 @@ func (o *Orchestrator) WaitFor(name string, target ServiceStatus, timeout time.D
 // Metrics type for the definition of each counter; all of them are monotonic,
 // so compare two snapshots rather than reading absolute values.
 func (o *Orchestrator) Metrics() Metrics {
+	o.ensureInit()
 	return Metrics{
 		Starts:              o.metricsStarts.Load(),
 		Stops:               o.metricsStops.Load(),
@@ -513,6 +528,7 @@ func (o *Orchestrator) Metrics() Metrics {
 //     Stop's completion is guaranteed, not that every goroutine has exited.
 //   - A no-op Stop on an orchestrator that was never started closes it too.
 func (o *Orchestrator) Done() <-chan struct{} {
+	o.ensureInit()
 	return o.shutdownDone
 }
 

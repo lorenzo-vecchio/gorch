@@ -140,12 +140,15 @@ These guarantees are part of the public API and are relied upon by callers.
   (like `StartService`), `SubscribeWithBuffer` rejects a negative capacity with
   `ErrInvalidBufferSize`, and `Request`/`RequestAsync`/`TypedRequest` reject a nil
   context with `ErrNilContext`; none of these unwind.
-- **Construct an `Orchestrator` with `New`.** The `Orchestrator` zero value is
-  not usable: it has no registry or Messenger, so a zero-value instance must not
-  be registered against or started. By contrast a zero-value `Messenger` (for
-  example `var m Messenger` before any scope is created) is usable: its registry
-  is lazily initialised and `Publish`/`Subscribe`/`SubscribeWithBuffer`/`Drain`
-  are safe on it.
+- **An `Orchestrator` zero value is usable.** Build one with `New` to configure
+  it, or declare `var o Orchestrator`: the first public call lazily initialises a
+  zero-value instance with `New()`'s defaults (LogLevelInfo, health checks every
+  30s with a 5s probe timeout, a 30s failed-Start rollback budget), so it can be
+  registered against and started without panicking on a nil registry, Messenger,
+  or shutdown channel. A zero-value `Messenger` (for example `var m Messenger`
+  before any scope is created) is likewise usable: its registry is lazily
+  initialised and `Publish`/`Subscribe`/`SubscribeWithBuffer`/`Drain` are safe on
+  it.
 - **A blocked before-stop hook cannot strand a service.** `Stop`'s budget is
   split so the hook gets at most half of what remains; the service's own `Stop()`
   is always invoked, and a hook that overruns is reported as `ErrHookTimeout`
