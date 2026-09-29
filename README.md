@@ -181,6 +181,59 @@ Sentinel errors returned by the orchestrator:
 | `ErrOrchestratorStopping` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` is in progress. |
 | `ErrOrchestratorStopped` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` has completed. |
 
+### Sentinel taxonomy
+
+Sentinels are stable API surface, so each one is classified along two axes: a
+**class** and whether it is **retryable**.
+
+| Class | Retryable | Meaning | Sentinels |
+|-------|-----------|---------|-----------|
+| permanent | no | A bug in the caller's code or configuration; an identical call keeps failing until code or configuration changes. | `ErrDuplicateName`, `ErrNilService`, `ErrInvalidCron`, `ErrDependencyCycle`, `ErrDependencyNotFound`, `ErrServiceNotFound`, `ErrDependencyDepthExceeded`, `ErrUnsupportedOption`, `ErrReentrantMembership` |
+| transient | yes | A condition that may clear on its own or after another operation; retry once it does. | `ErrOrchestratorStopping`, `ErrOrchestratorNotStarted`, `ErrDependencyNotRunning`, `ErrDependencyRemoving`, `ErrHasDependents`, `ErrMembershipBusy`, `ErrStartAborted` |
+| terminal | no | The whole-orchestrator lifecycle has already begun or ended; by design the operation can never succeed. | `ErrAlreadyStarted`, `ErrOrchestratorStopped` |
+| environmental | no | User code or teardown overran a deadline and the outcome is unverified; the timed-out teardown is not retried. | `ErrStopTimeout`, `ErrHookTimeout` |
+
+Only a **transient** sentinel is retryable. Classification is `errors.Is`-based:
+`Start`, `Stop`, and the group ops join failures with `errors.Join`, so one
+returned error can match several sentinels (for example `ErrHookTimeout` and
+`ErrStopTimeout` together). A caller classifies like this:
+
+```go
+switch {
+case errors.Is(err, gorch.ErrMembershipBusy):
+    // transient: poll Busy(name), then retry
+case errors.Is(err, gorch.ErrStopTimeout):
+    // environmental: the teardown was abandoned; do not retry the same stop
+case errors.Is(err, gorch.ErrAlreadyStarted):
+    // terminal: the lifecycle is spent; do not retry
+default:
+    // permanent (a bug in the caller) unless a joined cause says otherwise
+}
+```
+
+Decisions behind the table ([#29](https://github.com/lorenzo-vecchio/gorch/issues/29)):
+
+- **`ErrHookTimeout` is a permanent companion, not a migration aid.**
+  `ErrStopTimeout` attributes the deadline, `ErrHookTimeout` its cause (a
+  before-stop hook that would not return); the pair is always joined so a caller
+  that only classifies `ErrStopTimeout` still matches.
+- **Reentrancy and contention are split.** `ErrReentrantMembership` is a
+  same-goroutine programming error — permanent, never retried; a reservation
+  held by *another* goroutine is the transient, retryable `ErrMembershipBusy`.
+- **`ErrHasDependents` answers one direction only.** It is returned by
+  `StopService`/`Unregister` when the *target* has running dependents. Naming a
+  dependency that is mid-removal is `ErrDependencyRemoving` instead, a distinct
+  transient condition.
+- **The not-found family is already uniform.** `ErrServiceNotFound` (the named
+  service), `ErrDependencyNotFound` (a named hard dependency), and
+  `ErrDependencyNotRunning` (a named hard dependency not yet running) all follow
+  `Err<Subject><Problem>`; no rename before the freeze.
+- **Every sentinel is reachable.** Each has a documented entry point and a
+  producer test. `TestSentinelsTable_EverySentinelHasATest` fails when a new
+  exported sentinel is added without a classification, and
+  `TestSentinelsTable_ProducibleFromDocumentedEntry` fails when one cannot be
+  produced from its entry point.
+
 ## Quick start
 
 ```go

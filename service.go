@@ -231,68 +231,118 @@ func WithCascadeStop() StopOption {
 	return func(c *stopConfig) { c.cascade = true }
 }
 
-// Sentinel errors
+// Sentinel errors. Every exported sentinel is classified so a caller can decide
+// how to react with errors.Is, without reading the orchestrator's internals.
+// The taxonomy has four classes:
+//
+//   - permanent: a bug in the caller's code or configuration; an identical call
+//     keeps failing until code or configuration changes. Not retryable.
+//   - transient: a condition that may clear on its own or after another
+//     operation; retry the same call once it clears (Busy observes a
+//     reservation). Retryable.
+//   - terminal: the whole-orchestrator lifecycle has already begun or ended; by
+//     design the operation can never succeed. Not retryable.
+//   - environmental: user code or teardown overran a deadline and the outcome is
+//     unverified; the timed-out teardown is not retried. Not retryable.
+//
+// Only a transient sentinel is retryable. Start, Stop, and the group ops
+// aggregate failures with errors.Join, so errors.Is walks the joined tree and
+// classifies every cause. See the README's sentinel taxonomy table for the full
+// mapping.
 var (
+	// ErrAlreadyStarted is terminal: the whole-orchestrator lifecycle is
+	// single-shot, so a Start after the first one (including after Stop) can
+	// never succeed. Not retryable.
 	ErrAlreadyStarted = errors.New("gorch: orchestrator already started")
-	ErrInvalidCron    = errors.New("gorch: invalid cron expression")
-	// ErrStopTimeout reports that a stop did not finish within the caller's
-	// timeout: the before/after-stop hooks, the service's own Stop(), or the
+	// ErrInvalidCron is permanent: the WithCron spec is malformed. Fix the spec;
+	// not retryable.
+	ErrInvalidCron = errors.New("gorch: invalid cron expression")
+	// ErrStopTimeout is environmental: a stop did not finish within the caller's
+	// timeout — the before/after-stop hooks, the service's own Stop(), or the
 	// wait for its instance to exit was still in flight. The service is left
 	// StatusStopping, not StatusStopped, and the stop is not counted in
-	// Metrics().Stops, because its teardown is unverified.
-	ErrStopTimeout   = errors.New("gorch: stop timed out waiting for services")
+	// Metrics().Stops, because its teardown is unverified. Not retryable: the
+	// timed-out teardown is abandoned. On a failed Start it means the bounded
+	// rollback budget was exceeded; the orchestrator is still left restartable.
+	ErrStopTimeout = errors.New("gorch: stop timed out waiting for services")
+	// ErrDuplicateName is permanent: two services share a WithName. Not
+	// retryable.
 	ErrDuplicateName = errors.New("gorch: duplicate service name")
-	ErrNilService    = errors.New("gorch: nil service")
-	// ErrHookTimeout is joined into the stop error when a before-stop hook
-	// overran the budget reserved for it. It always accompanies ErrStopTimeout,
-	// so a caller can tell a hook that would not return from a service whose
-	// own Stop() would not return.
-	ErrHookTimeout       = errors.New("gorch: stop hook timed out")
-	ErrDependencyCycle   = errors.New("gorch: dependency cycle detected")
-	ErrStartAborted      = errors.New("gorch: start aborted due to dependency failure")
+	// ErrNilService is permanent: a nil Service, or a nil start function passed
+	// to RegisterFunc. Not retryable.
+	ErrNilService = errors.New("gorch: nil service")
+	// ErrHookTimeout is environmental: it is always joined into the stop error
+	// with ErrStopTimeout because a before-stop hook overran the budget reserved
+	// for it. The pair attributes the deadline (ErrStopTimeout) and its cause
+	// (ErrHookTimeout), so a caller can tell a hook that would not return from a
+	// service whose own Stop() would not return. Callers that classify only
+	// ErrStopTimeout keep working. Not retryable.
+	ErrHookTimeout = errors.New("gorch: stop hook timed out")
+	// ErrDependencyCycle is permanent: a hard or soft dependency chain loops.
+	// Register rejects it up front; not retryable.
+	ErrDependencyCycle = errors.New("gorch: dependency cycle detected")
+	// ErrStartAborted is transient: a hard or soft dependency failed or was
+	// skipped, so the dependent never started. A failed Start does not consume
+	// the lifecycle and may be retried; the joined cause classifies the
+	// underlying failure. Retryable.
+	ErrStartAborted = errors.New("gorch: start aborted due to dependency failure")
+	// ErrUnsupportedOption is permanent: an incoherent option combination (for
+	// example WithSelfHeal with WithCron or WithRunOnce). Not retryable.
 	ErrUnsupportedOption = errors.New("gorch: unsupported option combination")
 
 	// Dynamic membership sentinels. See the Contract section of README.md.
+	// ErrServiceNotFound is permanent: no registered service has that name. Not
+	// retryable.
 	ErrServiceNotFound = errors.New("gorch: service not found")
-	// ErrHasDependents reports that a plain StopService/Unregister would break a
+	// ErrHasDependents is transient: a plain StopService/Unregister would break a
 	// hard dependent that is Running or Starting. The returned error names each
 	// blocker and its status; pass WithCascadeStop to tear those dependents down
-	// too. Dependents in any other status do not block.
-	ErrHasDependents        = errors.New("gorch: service has active dependents")
+	// too, or retry once they stop. Dependents in any other status do not block.
+	// Retryable.
+	ErrHasDependents = errors.New("gorch: service has active dependents")
+	// ErrOrchestratorStopping is transient: whole-orchestrator Stop is in
+	// progress; retry once it completes. Retryable.
 	ErrOrchestratorStopping = errors.New("gorch: orchestrator is stopping")
-	ErrOrchestratorStopped  = errors.New("gorch: orchestrator already stopped")
-	// ErrOrchestratorNotStarted is returned by StartService/StartGroup when the
-	// orchestrator has not been started yet: there is no scheduler or service
-	// context to start into.
+	// ErrOrchestratorStopped is terminal: whole-orchestrator Stop has completed,
+	// so the lifecycle cannot be re-entered. Not retryable.
+	ErrOrchestratorStopped = errors.New("gorch: orchestrator already stopped")
+	// ErrOrchestratorNotStarted is transient: StartService/StartGroup was called
+	// before the orchestrator started, so there is no scheduler or service
+	// context yet; retry after Start. Retryable.
 	ErrOrchestratorNotStarted = errors.New("gorch: orchestrator not started")
-	ErrDependencyNotRunning   = errors.New("gorch: dependency not running")
-	ErrDependencyNotFound     = errors.New("gorch: dependency not found")
-	// ErrDependencyRemoving is returned by Register when a hot add names a hard
-	// dependency that is mid-teardown (being stopped or removed concurrently).
-	// It is distinct from ErrHasDependents, which is only about the target's own
-	// running dependents blocking a stop; here the caller has no dependents at
-	// all. Treat it as a retryable "not now" condition.
+	// ErrDependencyNotRunning is transient: a hard dependency exists but is not
+	// StatusRunning; retry once it is. Retryable.
+	ErrDependencyNotRunning = errors.New("gorch: dependency not running")
+	// ErrDependencyNotFound is permanent: a hard dependency is not registered
+	// (dynamically removed, or never added). Not retryable.
+	ErrDependencyNotFound = errors.New("gorch: dependency not found")
+	// ErrDependencyRemoving is transient: Register named a hard dependency that
+	// is mid-teardown (being stopped or removed concurrently). It is distinct
+	// from ErrHasDependents, which is only about the target's own running
+	// dependents blocking a stop; here the caller has no dependents at all.
+	// Retry after the teardown completes. Retryable.
 	ErrDependencyRemoving = errors.New("gorch: dependency is being removed")
-	// ErrDependencyDepthExceeded is returned by Register when the walk that
-	// checks a new dependency for a cycle exceeds maxDependencyDepth edges. The
-	// registered graph is only expected to reach this depth under an unbounded
+	// ErrDependencyDepthExceeded is permanent: the walk that checks a new
+	// dependency for a cycle exceeded maxDependencyDepth edges. The registered
+	// graph is only expected to reach this depth under an unbounded
 	// registration/reload loop — registration is otherwise a startup-sized,
 	// acyclic graph. The cap turns what would be a fatal, unrecoverable stack
-	// overflow into a typed error the caller can classify and act on (refuse the
-	// registration, or prune/free the graph and retry).
+	// overflow into a typed error the caller can classify and act on. Prune the
+	// graph before registering again; the rejected call is not retryable.
 	ErrDependencyDepthExceeded = errors.New("gorch: dependency depth limit exceeded")
-	// ErrReentrantMembership is returned when a membership operation re-enters
+	// ErrReentrantMembership is permanent: a membership operation re-entered
 	// from a service's own Start or Stop callback on the same goroutine (for
 	// example, a service stopping itself from its Start). It is a programming
-	// error, not a recoverable state. A collision with a reservation held by
-	// another goroutine instead returns the retryable ErrMembershipBusy. It is
-	// exported so callers can classify the rejection with errors.Is.
+	// error, not a recoverable state: fix the code, do not retry. A collision
+	// with a reservation held by another goroutine instead returns the retryable
+	// ErrMembershipBusy. Exported so callers can classify the rejection with
+	// errors.Is.
 	ErrReentrantMembership = errors.New("gorch: reentrant membership operation")
-	// ErrMembershipBusy is returned when a membership operation is blocked by an
+	// ErrMembershipBusy is transient: a membership operation is blocked by an
 	// in-flight reservation on the target entry (another goroutine's Start,
-	// Stop, or group operation). It is transient and retryable: poll Busy(name)
-	// or retry once the reservation clears. Distinct from ErrReentrantMembership,
-	// which is a same-goroutine re-entry and a programming error.
+	// Stop, or group operation). Retryable: poll Busy(name) or retry once the
+	// reservation clears. Distinct from ErrReentrantMembership, a same-goroutine
+	// re-entry and a programming error.
 	ErrMembershipBusy = errors.New("gorch: membership operation blocked by an in-flight reservation")
 )
 
