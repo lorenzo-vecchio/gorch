@@ -3,6 +3,7 @@ package gorch
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -65,15 +66,74 @@ func (s *fuzzStubbornSvc) Start(ctx ServiceContext) error {
 
 func (s *fuzzStubbornSvc) Stop() error { return nil }
 
+// fuzzTrackSvc records how many times each instance was started and stopped, so
+// the fuzz can assert the stop obligation: an entry asked to stop must actually
+// have had Stop() called. Unlike a service that parks only on the context, Stop
+// releases the current Start through a per-instance channel, so the instance
+// genuinely exits on every stop path — including StopGroup, which runs Stop()
+// without cancelling the entry's context. starts and stops are per-entry
+// counters across restarts: a restart is a second Start, its stop a second Stop.
+type fuzzTrackSvc struct {
+	starts atomic.Int32
+	stops  atomic.Int32
+
+	mu     sync.Mutex
+	stopCh chan struct{}
+}
+
+func (s *fuzzTrackSvc) Start(ctx ServiceContext) error {
+	ch := make(chan struct{})
+	s.mu.Lock()
+	s.starts.Add(1)
+	s.stopCh = ch
+	s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+	case <-ch:
+	}
+	return ctx.Err()
+}
+
+func (s *fuzzTrackSvc) Stop() error {
+	s.mu.Lock()
+	s.stops.Add(1)
+	if s.stopCh != nil {
+		close(s.stopCh)
+		s.stopCh = nil
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// fuzzGateSvc is a runOnce gate that succeeds immediately. A persistent service
+// hard-depending on it is legal, and it puts that gate outside the persistent
+// subset that Start and Stop sort — the same out-of-subset shape as a group
+// member depending on a service in another group.
+type fuzzGateSvc struct{}
+
+func (s *fuzzGateSvc) Start(ServiceContext) error { return nil }
+func (s *fuzzGateSvc) Stop() error                { return nil }
+
 // FuzzMembershipTransitions drives a random add/start/stop/remove/crash/restart
 // sequence against a small dependency graph. Besides asserting no panic or
 // deadlock and no goroutine leak, it checks semantic properties grep-style
 // invariants miss: a successful stop leaves an honest status, never counts one
-// stop twice, and no cron tick survives a teardown.
+// stop twice, no cron tick survives a teardown, and a group stop both reports no
+// phantom cycle and actually stops every running member. The group "g" holds b
+// and d, and b hard-depends on a outside the group, so the topoSort subset bug
+// (counting a dependency that the operation will not visit as a cycle) has to
+// fail these obligations.
 func FuzzMembershipTransitions(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{0, 1, 2, 3, 4, 5, 6, 7})
 	f.Add([]byte{5, 5, 4, 3, 2, 1, 0, 2, 2, 0})
+	// 8 fires a cron tick at teardown; 9 stops group "g" (b's dependency is
+	// outside it); 10 restarts the group. The graph also always carries the
+	// self-heal crash (c) and the runOnce gate with its persistent dependent.
+	f.Add([]byte{8})
+	f.Add([]byte{9})
+	f.Add([]byte{10, 9})
+	f.Add([]byte{0, 9, 10, 9, 2})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// A self-heal crash must be observable on every surface at once: each
 		// OnCrash call and each Running→Crashed transition has a matching Crashes
@@ -90,15 +150,33 @@ func FuzzMembershipTransitions(f *testing.F) {
 			}),
 		)
 		_ = o.Register(&namedSvc{}, WithName("a"))
-		_ = o.Register(&namedSvc{}, WithName("b"), DependsOn("a"))
+		// b and d form group "g"; b's hard dependency a is outside it, so the
+		// group is a legal subset whose ordering must ignore the out-of-group
+		// edge. Both are instrumented so the stop obligation is checkable.
+		bSvc := &fuzzTrackSvc{}
+		_ = o.Register(bSvc, WithName("b"), DependsOn("a"), WithGroup("g"))
+		dSvc := &fuzzTrackSvc{}
+		_ = o.Register(dSvc, WithName("d"), DependsOn("b"), WithGroup("g"))
 		_ = o.Register(&crashSignalSvc{sig: make(chan struct{})}, WithName("c"),
 			DependsOn("b"),
 			WithSelfHeal(func() Service { return &crashSignalSvc{sig: make(chan struct{})} }),
 			WithBackoff(ConstantBackoff{Delay: 200 * time.Millisecond}),
 		)
+		// A runOnce gate with a persistent hard dependent: the gate is outside
+		// the persistent subset that Start and Stop sort, the shape that used to
+		// be mistaken for a cycle on those paths.
+		_ = o.Register(&fuzzGateSvc{}, WithName("gate"), WithRunOnce())
+		_ = o.Register(&namedSvc{}, WithName("gdep"), DependsOn("gate"))
 		cronSvc := &fuzzCronSvc{}
 		_ = o.Register(cronSvc, WithName("cron"), WithCron("* * * * * *", CronParallel))
-		_ = o.Start()
+		// Start must succeed on this legal graph. It is the first obligation a
+		// subset-ordering bug breaks: the persistent set excludes the runOnce
+		// gate gdep depends on, and treating that out-of-set edge as a cycle
+		// would fail the whole start.
+		if err := o.Start(); err != nil {
+			t.Fatalf("Start on a legal graph = %v, want nil", err)
+		}
+		tracked := map[string]*fuzzTrackSvc{"b": bSvc, "d": dSvc}
 
 		// assertNoReservationLeak pins the reservation lifecycle: once every
 		// membership op of an iteration has returned, no entry may still be
@@ -201,17 +279,59 @@ func FuzzMembershipTransitions(f *testing.F) {
 			}
 		}
 
+		// isActive reports whether name is in a live lifecycle state.
+		isActive := func(name string) bool {
+			s, ok := o.Status(name)
+			return ok && (s == StatusRunning || s == StatusStarting)
+		}
+
+		// stopGroupChecked drives a whole-group stop and asserts the two group
+		// obligations at once. (1) A legal group must stop without reporting a
+		// hard dependency outside it as a cycle. (2) Every member that was
+		// running must actually have had Stop() called and must no longer report
+		// a live status. Both are checked unconditionally: the original topoSort
+		// bug discarded the cycle error and stopped nothing, and the fallback fix
+		// still returns the error, so only holding the operation to both bars
+		// catches either form.
+		stopGroupChecked := func() {
+			type beforeState struct {
+				active bool
+				stops  int32
+			}
+			before := make(map[string]beforeState, len(tracked))
+			for name, s := range tracked {
+				before[name] = beforeState{active: isActive(name), stops: s.stops.Load()}
+			}
+			if err := o.StopGroup("g", 50*time.Millisecond); err != nil {
+				t.Fatalf("StopGroup stopped a legal group but returned %v", err)
+			}
+			for name, s := range tracked {
+				b := before[name]
+				if !b.active {
+					continue
+				}
+				if s.stops.Load() == b.stops {
+					t.Fatalf("StopGroup left running member %s without calling Stop()", name)
+				}
+				if isActive(name) {
+					t.Fatalf("StopGroup returned nil but member %s is still live", name)
+				}
+			}
+		}
+
 		var prev Metrics
 		const maxLate = 8
 		late := 0
 		for _, b := range data {
-			switch b % 9 {
+			switch b % 11 {
 			case 0:
 				_ = runOp(func() error { return o.StartService("a") })
 			case 1:
 				stopActiveChecked("a", func() error { return o.StopService("a", 50*time.Millisecond) })
 			case 2:
-				stopChecked("b", 3, func() error { return o.StopService("b", 50*time.Millisecond, WithCascadeStop()) })
+				// Cascade stops b plus its hard dependents c and d (and a
+				// background self-heal of c may add one more).
+				stopChecked("b", 4, func() error { return o.StopService("b", 50*time.Millisecond, WithCascadeStop()) })
 			case 3:
 				before := o.Metrics().Stops
 				if err := runOp(func() error { return o.Unregister("c", 50*time.Millisecond) }); err == nil {
@@ -266,6 +386,10 @@ func FuzzMembershipTransitions(f *testing.F) {
 					}
 				}
 				_ = runOp(func() error { return o.StartService("cron") })
+			case 9:
+				stopGroupChecked()
+			case 10:
+				_ = runOp(func() error { return o.StartGroup("g") })
 			}
 			// Every counter is monotonic: no operation may decrement one. A
 			// restart that was mistakenly accounted as a stop, or a stop counted
@@ -281,6 +405,16 @@ func FuzzMembershipTransitions(f *testing.F) {
 			assertNoReservationLeak()
 			assertOwnerMapsConsistent()
 		}
+		// Snapshot which tracked members are live before shutdown, so the whole
+		// Stop can be held to the same obligation as a group stop.
+		type liveState struct {
+			active bool
+			stops  int32
+		}
+		stopObligation := make(map[string]liveState, len(tracked))
+		for name, s := range tracked {
+			stopObligation[name] = liveState{active: isActive(name), stops: s.stops.Load()}
+		}
 		_ = runOp(func() error { return o.Stop(2 * time.Second) })
 		assertNoReservationLeak()
 		for name, s := range o.Statuses() {
@@ -292,6 +426,29 @@ func FuzzMembershipTransitions(f *testing.F) {
 		case <-o.Done():
 		case <-time.After(2 * time.Second):
 			t.Fatal("goroutines did not wind down after Stop")
+		}
+
+		// Whole-Stop obligation: every tracked member that was running when
+		// shutdown began had Stop() called and is no longer live. It is checked
+		// as "Stop() was called at least once per stopped member", not as
+		// stops == starts: the library can briefly overlap an old instance with
+		// a restart, so one Stop() may cover more than one Start() for the same
+		// entry. That is a separate known defect (duplicated instance spawning),
+		// not the stop obligation this fuzz is pinning.
+		for name, s := range tracked {
+			if s.starts.Load() > 0 && s.stops.Load() == 0 {
+				t.Fatalf("entry %s: %d starts but Stop() was never called", name, s.starts.Load())
+			}
+			before := stopObligation[name]
+			if !before.active {
+				continue
+			}
+			if s.stops.Load() == before.stops {
+				t.Fatalf("whole Stop left running entry %s without calling Stop()", name)
+			}
+			if isActive(name) {
+				t.Fatalf("entry %s still live after whole Stop", name)
+			}
 		}
 
 		// Every owner is either released by its instance/tick or swept by the
