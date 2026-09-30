@@ -279,6 +279,10 @@ func (o *Orchestrator) IsReady(ctx context.Context, name string) bool {
 // Each selected entry is reserved via its starting flag, so a concurrent teardown
 // is rejected rather than stopping an entry about to be started.
 //
+// Each member is started through the same path StartService uses for its kind: a
+// persistent or runOnce member via its Start, a cron member by (re)installing
+// its schedule, never by running its Start as a persistent instance.
+//
 // Returns ErrOrchestratorNotStarted before Start, exactly like StartService:
 // without a service context a member's Start would otherwise reach a nil parent
 // context. An unknown or empty group selects nothing and returns nil: a group is
@@ -320,6 +324,18 @@ func (o *Orchestrator) StartGroup(group string) error {
 		if s := o.statusOf(e); s == StatusRunning || s == StatusStarting {
 			continue
 		}
+		// StopGroup runs Stop() without cancelling the entry's context, so a
+		// persistent instance can still be exiting while the status already
+		// reads StatusStopped. Starting again would spawn a second instance and
+		// leak the wait group (the wgDone latch releases only one). Treat a live
+		// instance channel as already running, exactly like StartService.
+		if done := e.getDone(); done != nil {
+			select {
+			case <-done:
+			default:
+				continue
+			}
+		}
 		e.starting.Store(true)
 		reserved = append(reserved, e)
 	}
@@ -343,7 +359,7 @@ func (o *Orchestrator) StartGroup(group string) error {
 			if !startable[entry] {
 				continue
 			}
-			if err := o.startOneService(entry); err != nil {
+			if err := o.startGroupEntry(entry); err != nil {
 				// Roll back the members already started in earlier levels so a
 				// mid-group failure leaves no partially started group.
 				o.rollbackGroupStart(started)
@@ -353,6 +369,20 @@ func (o *Orchestrator) StartGroup(group string) error {
 		}
 	}
 	return nil
+}
+
+// startGroupEntry starts one group member through the same path StartService
+// uses for that member's kind. A cron member is (re)scheduled through
+// startCronEntry: startOneService would launch the cron service's Start
+// continuously and leave its schedule uninstalled, so a StartGroup after a
+// StopService on that member would silently turn a scheduled service into an
+// always-on one. Persistent and runOnce members share startOneService, the
+// same as Start's own phases.
+func (o *Orchestrator) startGroupEntry(entry *serviceEntry) error {
+	if entry.cfg.cronSpec != "" {
+		return o.startCronEntry(entry)
+	}
+	return o.startOneService(entry)
 }
 
 // rollbackGroupStart stops the members a failed StartGroup already started, in
