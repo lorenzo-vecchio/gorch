@@ -59,7 +59,7 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 | Method group | Concurrent with `Start`/`Stop` |
 |--------------|-------------------------------|
 | `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A hot add made while `Start` runs lands either in `Start`'s snapshot or, after it, live as `StatusRegistered` (never auto-started); before `Start` it is part of the static graph. It is rejected with `ErrOrchestratorStopping` while `Stop` runs and `ErrOrchestratorStopped` after `Stop`. |
-| `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning`; an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). It never restarts a live instance: to replace one, `StopService` and then `StartService` — and `StopService` is itself refused with `ErrHasDependents` while a hard dependent is `Running` or `Starting`, unless `WithCascadeStop` is used, so restarting a depended-on service bounces those dependents first. The start decision and its reservation are claimed atomically under the membership lock (released before any user code), so concurrent `StartService` calls cannot double-start or orphan an instance. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with another goroutine's reservation returns the transient `ErrMembershipBusy` (poll `Busy`); re-entering from the entry's own `Start` returns `ErrReentrantMembership`. |
+| `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning` (or is a `runOnce` gate that reached `StatusSucceeded`, which satisfies the edge); an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). It never restarts a live instance: to replace one, `StopService` and then `StartService` — and `StopService` is itself refused with `ErrHasDependents` while a hard dependent is `Running` or `Starting`, unless `WithCascadeStop` is used, so restarting a depended-on service bounces those dependents first. The start decision and its reservation are claimed atomically under the membership lock (released before any user code), so concurrent `StartService` calls cannot double-start or orphan an instance. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with another goroutine's reservation returns the transient `ErrMembershipBusy` (poll `Busy`); re-entering from the entry's own `Start` returns `ErrReentrantMembership`. |
 | `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents`, returned as a `*HasDependentsError` that names each blocker; every other dependent status — `Stopping`, `Registered`, `Crashed`, `Stopped`, `Succeeded` — does not block, so a plain stop proceeds and leaves the dependent untouched. With `WithCascadeStop`, every transitive hard dependent is stopped/removed in reverse topological order, except one already `Stopping`, which is left to its own in-flight teardown rather than stopped a second time (no double `Stop()` or hooks). A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
 | `Start`, `Stop` | Yes — against each other. The lifecycle is single-shot and each entry point is guarded by its own `sync.Once`. Concurrent `Start` calls are claimed atomically: the caller that wins the claim runs the start and every other caller returns `ErrAlreadyStarted` immediately, without waiting for the winner, so a `nil` return always identifies the call that actually ran it. Concurrent `Stop` calls are a no-op for the losers: the first runs the shutdown, the others return `nil` once it completes and do not observe its errors. After a successful `Stop` neither can run again; a failed `Start` does not consume the lifecycle and may be retried. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
 | `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Dependents`, `DependenciesOf`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Dependents`/`DependenciesOf` walk the hard-dependency edges under the graph lock and return snapshots. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation, and is the only observable for the reservation window. |
@@ -170,7 +170,9 @@ These guarantees are part of the public API and are relied upon by callers.
   `StatusStopped` is committed only once the whole teardown is verified complete,
   so `Status()`/`Statuses()` never claim a service stopped while it may still be
   alive. `WaitFor(name, StatusStopped, …)` therefore does not succeed for a
-  timed-out stop.
+  timed-out stop. A succeeded `runOnce` gate is the one entry that never enters
+  `StatusStopping`: it keeps `StatusSucceeded` even when its stop times out,
+  because there is no live instance being misreported.
 
 Sentinel errors returned by the orchestrator:
 
@@ -193,7 +195,7 @@ Sentinel errors returned by the orchestrator:
 | `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
 | `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break a hard dependent that is `Running` or `Starting`. Returned as a `*HasDependentsError` whose `Name` is the target and whose `Dependents` names each blocker (the same set as `Dependents(name)`). Pass `WithCascadeStop` to tear those dependents down too. Dependents in `Stopping`, `Registered`, `Crashed`, `Stopped`, or `Succeeded` do not block. |
 | `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
-| `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is not `StatusRunning`. |
+| `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is neither `StatusRunning` nor a `runOnce` gate in `StatusSucceeded`. |
 | `ErrDependencyRemoving` | `Register` | A hot-added service names a hard dependency that is being torn down (being stopped/removed concurrently); retry after the teardown completes. |
 | `ErrDependencyDepthExceeded` | `Register` | A dependency walk needed to check for a cycle ran deeper than the 10 000-edge limit. The registered graph is a bounded, startup-sized acyclic graph; reaching this depth means an unbounded registration/reload loop has grown it. The walk stops with this sentinel instead of overflowing the goroutine stack (a fatal error). Free or prune the graph and retry. |
 | `ErrOrchestratorStopping` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` is in progress. |
@@ -418,7 +420,8 @@ bounded and an overrun is reported as `ErrHookTimeout` while the service's own
 budget — a hook overran, `Stop()` was capped away, or the instance had not yet
 exited — leaves the entry `StatusStopping` rather than `StatusStopped`, and is
 not counted in `Metrics().Stops`; `StatusStopped` is committed only once the
-teardown is verified complete.
+teardown is verified complete. A succeeded `runOnce` gate is exempt: it keeps
+`StatusSucceeded` throughout, timeout or not.
 
 Bounding a stop means walking away from user code that will not return. A
 before-stop hook or a `Stop()` that outlives its budget is abandoned in its
@@ -582,11 +585,11 @@ part of either: a start claimed but not yet committed to `StatusStarting` still
 reads as the previous status, so poll `Busy(name)` to see an in-flight
 reservation.
 
-`ServiceStatus` values: `StatusRegistered`, `StatusStarting`, `StatusRunning`, `StatusStopping`, `StatusStopped`, `StatusCrashed`, `StatusSucceeded`. Each has a `String()` method. `StatusSucceeded` marks a one-shot service whose `Start` completed without error (a successful gate); dependents are not aborted by it. For a cron entry, `StatusRunning` means the schedule is installed, not that a tick is working or healthy.
+`ServiceStatus` values: `StatusRegistered`, `StatusStarting`, `StatusRunning`, `StatusStopping`, `StatusStopped`, `StatusCrashed`, `StatusSucceeded`. Each has a `String()` method. `StatusSucceeded` marks a one-shot service whose `Start` completed without error (a successful gate); dependents are not aborted by it, and it is permanent — a later stop runs the gate's `Stop()` but leaves it `StatusSucceeded` rather than overwriting it with `StatusStopped`, so its success is never erased. For a cron entry, `StatusRunning` means the schedule is installed, not that a tick is working or healthy.
 
 ### One-shot / init services
 
-`WithRunOnce` marks a service as a one-shot init task. It runs before persistent services and transitions to `StatusSucceeded` when `Start` returns. `Stop()` is called at orchestrator shutdown (make it idempotent). If `Start` returns an error, startup aborts.
+`WithRunOnce` marks a service as a one-shot init task. It runs before persistent services and transitions to `StatusSucceeded` when `Start` returns. A gate that succeeded keeps `StatusSucceeded` through any later stop: `Stop()`, a `StopService`/`Unregister`/cascade, or whole-orchestrator `Stop` still run `Stop()` (make it idempotent), but never demote the gate to `StatusStopped`. If `Start` returns an error, startup aborts.
 
 ```go
 orch.Register(migrator, gorch.WithRunOnce())
