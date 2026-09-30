@@ -1018,7 +1018,7 @@ func (o *Orchestrator) Start() error {
 		o.logCh = logCh
 		o.logQuit = logQuit
 		o.logPumpDone = logPumpDone
-		o.cronSched = cron.New(cron.WithSeconds())
+		o.cronSched = newCronScheduler()
 		entries = make([]*serviceEntry, len(o.entries))
 		copy(entries, o.entries)
 		nameIndex := make(map[string]*serviceEntry, len(o.nameIndex))
