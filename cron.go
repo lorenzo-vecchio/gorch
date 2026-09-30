@@ -70,16 +70,34 @@ func (o *Orchestrator) invokeCron(entry *serviceEntry, gen uint64) {
 
 type CronMode int
 
-// cronSpecParser mirrors the parser cron.New(WithSeconds()) installs, so a spec
-// accepted by validateCronSpec can always be scheduled later.
-var cronSpecParser = cron.NewParser(
-	cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
-)
+// newCronParser builds the parser for the cron grammar gorch accepts: six
+// fields with seconds (Second | Minute | Hour | Dom | Month | Dow), plus the
+// @descriptor forms such as @daily and @every 5s.
+func newCronParser() cron.Parser {
+	return cron.NewParser(
+		cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
+	)
+}
+
+// cronSpecParser is the single parser built by newCronParser. validateCronSpec
+// validates with it and newCronScheduler installs this same value in the live
+// scheduler, so a spec accepted at Register time is always schedulable later:
+// there is no second, hand-maintained parser to drift out of sync (issue #34).
+var cronSpecParser = newCronParser()
+
+// newCronScheduler builds the live scheduler with cronSpecParser, the parser
+// validateCronSpec uses. It is the only place a scheduler is constructed, so the
+// registration-time grammar and the scheduling grammar cannot diverge.
+func newCronScheduler() *cron.Cron {
+	return cron.New(cron.WithParser(cronSpecParser))
+}
 
 // validateCronSpec rejects a malformed cron expression without installing a
 // schedule. Dynamic Register uses it so a hot-added cron entry can be staged
 // (registered now, started later) without ticking while it reports
-// StatusRegistered.
+// StatusRegistered. It parses with cronSpecParser — the exact parser
+// newCronScheduler installs — so acceptance and schedulability agree by
+// construction.
 func validateCronSpec(spec string) error {
 	if _, err := cronSpecParser.Parse(spec); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidCron, err)
