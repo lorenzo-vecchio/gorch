@@ -341,6 +341,26 @@ func (o *Orchestrator) runStopSequence(entry *serviceEntry, hookDeadline time.Ti
 	return errors.Join(hookErr, stopErr), complete
 }
 
+// beginStop enters the teardown state machine and reports whether the entry was
+// active (Running or Starting) when the teardown began. It normally commits the
+// transient StatusStopping. A runOnce gate that already reached StatusSucceeded
+// is the one exception: "succeeded" is a permanent fact about the gate that a
+// later stop must not erase, so the status is left untouched and finishStop
+// likewise skips the terminal StatusStopped. The gate has no live instance to
+// stop, so reporting it as Stopping would both misrepresent it and let a
+// teardown retroactively turn a satisfied dependency into a failed one.
+func (o *Orchestrator) beginStop(entry *serviceEntry) (wasActive bool) {
+	o.statusMu.Lock()
+	s := entry.status
+	wasActive = s == StatusRunning || s == StatusStarting
+	o.statusMu.Unlock()
+
+	if s != StatusSucceeded {
+		o.setStatus(entry, StatusStopping)
+	}
+	return wasActive
+}
+
 // stopOneServiceDeadline is stopOneService with an additional hard caller
 // deadline that bounds the whole stop — the before/after hooks and the service's
 // own Stop() — not only Stop(). The effective Stop() cap remains the smaller of
@@ -353,22 +373,19 @@ func (o *Orchestrator) runStopSequence(entry *serviceEntry, hookDeadline time.Ti
 // service's Stop(): the service is always given a chance to release its
 // resources, and a hook that overruns is reported as ErrHookTimeout.
 //
-// The entry is left StatusStopping; only a sequence that ran to completion (no
-// caller-deadline expiry, no overrunning hook, no capped-away Stop()) is
-// reported complete. The caller commits the terminal status with finishStop once
-// it has also verified the instance exited, so a timed-out stop never claims
-// StatusStopped for a service that may still be alive.
+// The entry is left StatusStopping (a succeeded gate keeps StatusSucceeded);
+// only a sequence that ran to completion (no caller-deadline expiry, no
+// overrunning hook, no capped-away Stop()) is reported complete. The caller
+// commits the terminal status with finishStop once it has also verified the
+// instance exited, so a timed-out stop never claims StatusStopped for a service
+// that may still be alive.
 //
 // When the caller deadline wins, the sequence goroutine is abandoned, logged at
 // Error level and counted in Metrics().AbandonedGoroutines. An inner hook or
 // Stop() abandoned earlier in the same sequence is counted separately, once per
 // genuinely-abandoned goroutine.
 func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time.Time) (wasActive, completed bool, stopErr error) {
-	o.statusMu.RLock()
-	wasActive = entry.status == StatusRunning || entry.status == StatusStarting
-	o.statusMu.RUnlock()
-
-	o.setStatus(entry, StatusStopping)
+	wasActive = o.beginStop(entry)
 
 	completed = true
 	if deadline.IsZero() {
@@ -411,7 +428,17 @@ func (o *Orchestrator) stopOneServiceDeadline(entry *serviceEntry, deadline time
 // finished and the instance goroutine is known to have exited. A timed-out stop
 // leaves the entry StatusStopping instead, so Status() never claims a service
 // stopped while it may still be alive.
+//
+// A runOnce gate already in StatusSucceeded is left there: starting and stopping
+// the orchestrator does not undo the fact that the gate did its job, and
+// StatusStopped would both erase that distinction and read as a failed
+// dependency to a later dependent start. beginStop skipped the StatusStopping
+// transition for the same reason, so the gate's status is stable across its
+// stop.
 func (o *Orchestrator) finishStop(entry *serviceEntry, wasActive bool) {
+	if o.statusOf(entry) == StatusSucceeded {
+		return
+	}
 	o.setStatus(entry, StatusStopped)
 	if wasActive {
 		o.accountStop(entry)

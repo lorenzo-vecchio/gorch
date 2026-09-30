@@ -25,11 +25,13 @@ import (
 // concurrent StopService/Unregister cannot interleave between the checks and the
 // start to double-start or orphan an instance.
 //
-// Every hard dependency (DependsOn) must be StatusRunning first. Returns
-// ErrServiceNotFound for an unknown name, ErrDependencyNotFound for a missing
-// hard dependency, ErrDependencyNotRunning when a hard dependency is not
-// running, ErrOrchestratorNotStarted before the orchestrator is started, and
-// ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
+// Every hard dependency (DependsOn) must be StatusRunning, or a runOnce gate
+// that has already reached StatusSucceeded, which satisfies the edge because a
+// gate that did its job is not a failed dependency. Returns ErrServiceNotFound
+// for an unknown name, ErrDependencyNotFound for a missing hard dependency,
+// ErrDependencyNotRunning when a hard dependency is neither running nor a
+// succeeded gate, ErrOrchestratorNotStarted before the orchestrator is started,
+// and ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
 // shutdown has begun.
 // Thread-safe.
 func (o *Orchestrator) StartService(name string) error {
@@ -86,14 +88,18 @@ func (o *Orchestrator) StartService(name string) error {
 	}
 
 	// Hard dependencies must exist (they may have been unregistered) and be
-	// running before the dependent starts (C12).
+	// running before the dependent starts (C12). A runOnce gate that reached
+	// StatusSucceeded also satisfies the edge: the gate's job is done and
+	// stopping it must not retroactively block its dependents. No other status
+	// does: a gate that was skipped/crashed (and so never succeeded) still fails
+	// its dependents, exactly like a non-running persistent dependency.
 	for _, dep := range entry.cfg.dependsOn {
 		depEntry := o.lookupEntry(dep)
 		if depEntry == nil {
 			unlock()
 			return fmt.Errorf("%w: %s -> %s", ErrDependencyNotFound, name, dep)
 		}
-		if s := o.statusOf(depEntry); s != StatusRunning {
+		if s := o.statusOf(depEntry); s != StatusRunning && s != StatusSucceeded {
 			unlock()
 			return fmt.Errorf("%w: %s depends on %s (%s)", ErrDependencyNotRunning, name, dep, s)
 		}

@@ -37,7 +37,10 @@ const (
 	StatusCrashed
 	// StatusSucceeded marks a runOnce service whose Start completed without
 	// error: it is a successful gate, distinct from StatusStopped so dependents
-	// are not aborted by a gate that did its job.
+	// are not aborted by a gate that did its job. It is permanent — a later stop
+	// runs the gate's Stop() but leaves this status, never demoting it to
+	// StatusStopped — and a hard dependency in this state satisfies a dependent's
+	// StartService.
 	StatusSucceeded
 )
 

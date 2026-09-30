@@ -96,6 +96,13 @@
 //   - A stop that times out is reported honestly: the entry stays
 //     StatusStopping rather than StatusStopped, and the incomplete stop is not
 //     counted in Metrics().Stops.
+//   - StatusSucceeded is permanent: a runOnce gate that succeeded keeps its
+//     status when it is later stopped (by Stop, StopService, Unregister, or a
+//     cascade). Its Stop() still runs — make it idempotent — but the gate is
+//     never demoted to StatusStopped, so its success is not erased and a
+//     hard-depending service can still start afterwards: StartService accepts a
+//     dependency that is either StatusRunning or a runOnce gate in
+//     StatusSucceeded.
 //   - A teardown goroutine abandoned because a deadline won — a before-stop
 //     hook or Stop() that did not return in time, or a failed-Start wait that
 //     outlived its rollback budget — is logged at Error level naming the
