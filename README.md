@@ -17,7 +17,7 @@ Requires Go 1.25+.
 ## Features
 
 - **Service lifecycle** — Start/Stop with context cancellation and graceful shutdown.
-- **Dynamic membership** — `Register` adds a service to a running orchestrator, and `StartService`/`StopService`/`Unregister` start, stop, and remove services while it runs; `WithCascadeStop` extends a removal to hard dependents, and `Dependents`/`DependenciesOf` expose the dependency graph before you act.
+- **Dynamic membership** — `Register` adds a service to a running orchestrator, and `StartService`/`StopService`/`Unregister` start, stop, and remove services while it runs; `ReplaceService` swaps a service's implementation without removing its name (so dependents are not bounced), `WithCascadeStop` extends a removal to hard dependents, and `Dependents`/`DependenciesOf` expose the dependency graph before you act.
 - **Run() convenience** — single call starts, blocks on OS signals, then stops.
 - **Dependency ordering** — declare dependencies with `DependsOn`, cycle detection at registration, topological start and reverse-topological stop.
 - **Start timeout** — per-service start deadline via `WithStartTimeout`, with a `DefaultStartTimeout` config default.
@@ -61,6 +61,7 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 | `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A hot add made while `Start` runs lands either in `Start`'s snapshot or, after it, live as `StatusRegistered` (never auto-started); before `Start` it is part of the static graph. It is rejected with `ErrOrchestratorStopping` while `Stop` runs and `ErrOrchestratorStopped` after `Stop`. |
 | `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning` (or is a `runOnce` gate that reached `StatusSucceeded`, which satisfies the edge); an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). It never restarts a live instance: to replace one, `StopService` and then `StartService` — and `StopService` is itself refused with `ErrHasDependents` while a hard dependent is `Running` or `Starting`, unless `WithCascadeStop` is used, so restarting a depended-on service bounces those dependents first. The start decision and its reservation are claimed atomically under the membership lock (released before any user code), so concurrent `StartService` calls cannot double-start or orphan an instance. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with another goroutine's reservation returns the transient `ErrMembershipBusy` (poll `Busy`); re-entering from the entry's own `Start` returns `ErrReentrantMembership`. |
 | `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents`, returned as a `*HasDependentsError` that names each blocker; every other dependent status — `Stopping`, `Registered`, `Crashed`, `Stopped`, `Succeeded` — does not block, so a plain stop proceeds and leaves the dependent untouched. With `WithCascadeStop`, every transitive hard dependent is stopped/removed in reverse topological order, except one already `Stopping`, which is left to its own in-flight teardown rather than stopped a second time (no double `Stop()` or hooks). A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
+| `ReplaceService` | Yes — atomically swaps a registered service's implementation while keeping its name in the graph, so hard dependents are not torn down or blocked. Serialized against `StartService`/`StopService`/`Unregister` and the group ops by the membership lock and the entry reservation. Unlike `StopService`, it applies no dependent guard and never cascades: `WithCascadeStop` is rejected with `ErrUnsupportedOption` and `Orphans` is accepted as a no-op. The old instance is torn down exactly as `StopService` would tear down the target, and only if that completes cleanly is `svc` installed and a fresh instance started; a timeout or a `Stop()` error aborts the swap and leaves the old implementation in place. `svc` goes through `Validator.Validate()`. The same hard-dependency gate as `StartService` applies, and the entry's registration-time config is frozen. Returns `ErrOrchestratorNotStarted` before `Start`, `ErrServiceNotFound` for an unknown name, and is gated by shutdown like the other membership ops; a collision returns `ErrMembershipBusy` and a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
 | `Start`, `Stop` | Yes — against each other. The lifecycle is single-shot and each entry point is guarded by its own `sync.Once`. Concurrent `Start` calls are claimed atomically: the caller that wins the claim runs the start and every other caller returns `ErrAlreadyStarted` immediately, without waiting for the winner, so a `nil` return always identifies the call that actually ran it. Concurrent `Stop` calls are a no-op for the losers: the first runs the shutdown, the others return `nil` once it completes and do not observe its errors. After a successful `Stop` neither can run again; a failed `Start` does not consume the lifecycle and may be retried. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
 | `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Dependents`, `DependenciesOf`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Dependents`/`DependenciesOf` walk the hard-dependency edges under the graph lock and return snapshots. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation, and is the only observable for the reservation window. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
@@ -88,8 +89,12 @@ These guarantees are part of the public API and are relied upon by callers.
   `StatusRegistered` (it is not auto-started), and `StartService`,
   `StopService`, and `Unregister` start, stop, and remove services while the
   orchestrator runs. `StopService` keeps the entry registered so it can be
-  started again; `Unregister` removes it from the graph. Both cancel the
-  service's context and release its Messenger subscriptions, which are scoped to
+  started again; `Unregister` removes it from the graph. `ReplaceService` also
+  keeps the entry registered and swaps only its implementation, so its hard
+  dependents are neither torn down nor blocked: the name stays resolvable
+  throughout and a dependent is ready again as soon as the replacement is up.
+  `StopService` and `Unregister` both cancel the service's context and release
+  its Messenger subscriptions, which are scoped to
   the instance or tick that created them; a persistent service's instance and any
   in-flight cron ticks are then awaited until they exit. A tick abandoned for
   outliving the deadline still has its subscriptions released: teardown drains
@@ -183,23 +188,23 @@ Sentinel errors returned by the orchestrator:
 | `ErrDependencyCycle` | `Register`, `Start`, `Stop` (defensive), `StartGroup`, `StopGroup` | A hard or soft dependency chain loops. `Register` rejects it up front; `Start`, `Stop`, and the group ops re-check their selected subset and surface it defensively if a cycle survived registration. |
 | `ErrStartAborted` | `Start` | A hard/soft dependency failed or was skipped. |
 | `ErrInvalidCron` | `Register` (static and hot add), `Start` (defensive re-check) | A `WithCron` spec is empty or invalid. `Register` validates the spec on both paths, so the same spec is accepted or rejected identically; `Start` re-checks defensively in case an entry's spec was changed after registration. A sub-second `@every` interval (including `@every 0s`) is *not* invalid: the underlying parser clamps it to one second. |
-| `ErrUnsupportedOption` | `Register` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`. |
-| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A stop did not finish within the caller's timeout: the before/after-stop hooks, `Stop()`, or the wait for the instance to exit was still in flight. On the stop methods the entry is left `StatusStopping` (not `StatusStopped`) and the stop is not counted in `Metrics().Stops`. On a failed `Start` it means the bounded rollback budget was exceeded; the rollback still resets the snapshotted entries to `StatusRegistered`, leaving the orchestrator retryable. |
-| `ErrHookTimeout` | `Stop`, `StopService`, `Unregister`, `Start` (failed-start rollback) | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. On the stop methods the teardown is unverified, so the entry stays `StatusStopping`; on a failed `Start` the rollback resets it to `StatusRegistered`. |
-| `ErrNilService` | `Register`, `RegisterFunc` | A nil `Service`, or a nil `Start` closure passed to `RegisterFunc`. |
-| `ErrOrchestratorNotStarted` | `StartService`, `StartGroup` | Called before the orchestrator was started, so there is no service context or scheduler yet. |
-| `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
-| `ErrMembershipBusy` | `StartService`, `StopService`, `Unregister` | A membership op collided with a reservation held by another goroutine's in-flight `Start`/`Stop`/group operation. Transient: poll `Busy(name)` or retry once the reservation clears. |
+| `ErrUnsupportedOption` | `Register`, `ReplaceService` | `WithSelfHeal` combined with `WithCron`/`WithRunOnce`; `WithCascadeStop` passed to `ReplaceService` (replace never cascades). |
+| `ErrStopTimeout` | `Stop`, `StopService`, `Unregister`, `ReplaceService`, `Start` (failed-start rollback) | A stop did not finish within the caller's timeout: the before/after-stop hooks, `Stop()`, or the wait for the instance to exit was still in flight. On the stop methods the entry is left `StatusStopping` (not `StatusStopped`) and the stop is not counted in `Metrics().Stops`. `ReplaceService` aborts the swap and keeps the old implementation. On a failed `Start` it means the bounded rollback budget was exceeded; the rollback still resets the snapshotted entries to `StatusRegistered`, leaving the orchestrator retryable. |
+| `ErrHookTimeout` | `Stop`, `StopService`, `Unregister`, `ReplaceService`, `Start` (failed-start rollback) | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. On the stop methods the teardown is unverified, so the entry stays `StatusStopping` (and `ReplaceService` does not swap); on a failed `Start` the rollback resets it to `StatusRegistered`. |
+| `ErrNilService` | `Register`, `RegisterFunc`, `ReplaceService` | A nil `Service`, or a nil `Start` closure passed to `RegisterFunc`. |
+| `ErrOrchestratorNotStarted` | `StartService`, `StartGroup`, `ReplaceService` | Called before the orchestrator was started, so there is no service context or scheduler yet. |
+| `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
+| `ErrMembershipBusy` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | A membership op collided with a reservation held by another goroutine's in-flight `Start`/`Stop`/group operation. Transient: poll `Busy(name)` or retry once the reservation clears. |
 | `ErrInvalidBufferSize` | `SubscribeWithBuffer` | The buffer capacity was negative. A permanent caller bug: fix the size, do not retry. |
 | `ErrNilContext` | `Request`, `RequestAsync`, `TypedRequest` | A nil `context.Context` was passed. A permanent caller bug: pass `context.Background()` for no cancellation or deadline, do not retry. |
-| `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister` | No registered service has that name. |
+| `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | No registered service has that name. |
 | `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break a hard dependent that is `Running` or `Starting`. Returned as a `*HasDependentsError` whose `Name` is the target and whose `Dependents` names each blocker (the same set as `Dependents(name)`). Pass `WithCascadeStop` to tear those dependents down too. Dependents in `Stopping`, `Registered`, `Crashed`, `Stopped`, or `Succeeded` do not block. |
-| `ErrDependencyNotFound` | `StartService`, `Register` | A hard dependency is not registered (dynamically removed, or never added). |
-| `ErrDependencyNotRunning` | `StartService` | A hard dependency exists but is neither `StatusRunning` nor a `runOnce` gate in `StatusSucceeded`. |
+| `ErrDependencyNotFound` | `StartService`, `Register`, `ReplaceService` | A hard dependency is not registered (dynamically removed, or never added). |
+| `ErrDependencyNotRunning` | `StartService`, `ReplaceService` | A hard dependency exists but is neither `StatusRunning` nor a `runOnce` gate in `StatusSucceeded`. |
 | `ErrDependencyRemoving` | `Register` | A hot-added service names a hard dependency that is being torn down (being stopped/removed concurrently); retry after the teardown completes. |
 | `ErrDependencyDepthExceeded` | `Register` | A dependency walk needed to check for a cycle ran deeper than the 10 000-edge limit. The registered graph is a bounded, startup-sized acyclic graph; reaching this depth means an unbounded registration/reload loop has grown it. The walk stops with this sentinel instead of overflowing the goroutine stack (a fatal error). Free or prune the graph and retry. |
-| `ErrOrchestratorStopping` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` is in progress. |
-| `ErrOrchestratorStopped` | `Register`, `StartService`, `StopService`, `Unregister`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` has completed. |
+| `ErrOrchestratorStopping` | `Register`, `StartService`, `StopService`, `Unregister`, `ReplaceService`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` is in progress. |
+| `ErrOrchestratorStopped` | `Register`, `StartService`, `StopService`, `Unregister`, `ReplaceService`, `StartGroup`, `StopGroup` | Whole-orchestrator `Stop` has completed. |
 
 ### Sentinel taxonomy
 
@@ -367,6 +372,16 @@ _ = orch.StopService("late", 5*time.Second)
 // Stop and remove: it leaves Names()/Statuses(), and its cron schedule and
 // Messenger subscriptions are released.
 _ = orch.Unregister("late", 5*time.Second)
+```
+
+Swap a service's implementation without removing its name, so hard dependents
+are not torn down or blocked (`StopService` + `StartService` would bounce them
+and expose a window where the name is not `Running`):
+
+```go
+// Reload a changed service: the entry stays in the graph throughout, api keeps
+// running, and reads IsReady false only while the swap is in progress.
+_ = orch.ReplaceService("db", newDBSvc, 5*time.Second)
 ```
 
 A plain stop refuses to break a hard dependent that is `Running` or `Starting`:

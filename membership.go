@@ -88,21 +88,10 @@ func (o *Orchestrator) StartService(name string) error {
 	}
 
 	// Hard dependencies must exist (they may have been unregistered) and be
-	// running before the dependent starts (C12). A runOnce gate that reached
-	// StatusSucceeded also satisfies the edge: the gate's job is done and
-	// stopping it must not retroactively block its dependents. No other status
-	// does: a gate that was skipped/crashed (and so never succeeded) still fails
-	// its dependents, exactly like a non-running persistent dependency.
-	for _, dep := range entry.cfg.dependsOn {
-		depEntry := o.lookupEntry(dep)
-		if depEntry == nil {
-			unlock()
-			return fmt.Errorf("%w: %s -> %s", ErrDependencyNotFound, name, dep)
-		}
-		if s := o.statusOf(depEntry); s != StatusRunning && s != StatusSucceeded {
-			unlock()
-			return fmt.Errorf("%w: %s depends on %s (%s)", ErrDependencyNotRunning, name, dep, s)
-		}
+	// running before the dependent starts (C12).
+	if err := o.checkHardDependenciesLocked(entry); err != nil {
+		unlock()
+		return err
 	}
 
 	// Idempotent for an already-running persistent/cron entry (runOnce is the
@@ -151,6 +140,28 @@ func (o *Orchestrator) StartService(name string) error {
 	}
 }
 
+// checkHardDependenciesLocked rejects a start when a hard dependency of entry is
+// missing or not satisfied. A runOnce gate that reached StatusSucceeded
+// satisfies the edge: the gate's job is done and stopping it must not
+// retroactively block its dependents. No other status does: a gate that was
+// skipped/crashed (and so never succeeded) still fails its dependents, exactly
+// like a non-running persistent dependency. It is shared by StartService and
+// ReplaceService so both gate a fresh instance on the same edge condition. The
+// caller must hold o.mu (it looks entries up through the graph and reads their
+// statuses).
+func (o *Orchestrator) checkHardDependenciesLocked(entry *serviceEntry) error {
+	for _, dep := range entry.cfg.dependsOn {
+		depEntry := o.lookupEntry(dep)
+		if depEntry == nil {
+			return fmt.Errorf("%w: %s -> %s", ErrDependencyNotFound, entry.name, dep)
+		}
+		if s := o.statusOf(depEntry); s != StatusRunning && s != StatusSucceeded {
+			return fmt.Errorf("%w: %s depends on %s (%s)", ErrDependencyNotRunning, entry.name, dep, s)
+		}
+	}
+	return nil
+}
+
 // StopService stops a registered service without removing it. The entry stays
 // in Names()/Statuses(), can be started again with StartService, and its
 // Messenger subscriptions are released on stop.
@@ -180,6 +191,161 @@ func (o *Orchestrator) StopService(name string, timeout time.Duration, opts ...S
 // Blocking and cascade semantics match StopService. Thread-safe.
 func (o *Orchestrator) Unregister(name string, timeout time.Duration, opts ...StopOption) error {
 	return o.tearDown(name, true, timeout, opts)
+}
+
+// ReplaceService swaps the implementation of a registered service without
+// removing its name from the graph, so hard dependents are neither torn down nor
+// blocked. It is the reload primitive: the name is never absent from Names(),
+// Statuses(), Dependents(name), or the name index, so a concurrent Register,
+// Status, Dependents, or IsReady always observes a registered entry — never a
+// gap — and a hard dependent stays StatusRunning across the swap (its IsReady
+// reads false only while the target is not Running, and true again once the new
+// instance is up).
+//
+// Unlike StopService followed by StartService, ReplaceService applies no
+// dependent guard and never cascades: it tears down only the target's current
+// instance, installs svc as the entry's implementation, and starts a fresh
+// instance through the same per-kind path StartService uses (persistent, cron,
+// or runOnce). WithCascadeStop is rejected with ErrUnsupportedOption because
+// replace must not bounce dependents; Orphans is accepted and has no effect,
+// since replace already leaves dependents running. The entry's registration-time
+// config — name, hard/soft dependencies, cron spec and mode, runOnce, group,
+// labels, hooks, timeouts, and self-heal factory — is frozen: only the
+// implementation is swapped. A self-heal entry therefore resurrects its
+// registration-time factory on a later crash; to change the factory, Unregister
+// and Register again.
+//
+// The old instance is torn down exactly as StopService would tear the target
+// down — its contexts cancelled, the before/after-stop hooks and its Stop() run,
+// its instance or cron ticks awaited, and its Messenger owners drained — within
+// timeout (a non-positive timeout waits indefinitely, and a per-service
+// WithStopTimeout still caps Stop()). Every per-instance counter is reset for
+// the replacement: retry, health-failure, stability window, cron stop
+// accounting, and the wait-group latch. If the teardown does not complete — a
+// timeout, or a Stop() that returned an error — the swap is aborted and the
+// entry is left exactly as the teardown left it: the old implementation is not
+// replaced and the new instance is not started. svc is validated through
+// Validator.Validate() before the old instance is touched, exactly as a service
+// passed to Register would be.
+//
+// As with StartService, the orchestrator must be started and every hard
+// dependency must be StatusRunning or a runOnce gate in StatusSucceeded.
+// Returns ErrOrchestratorNotStarted before Start, ErrServiceNotFound for an
+// unknown name, ErrDependencyNotFound/ErrDependencyNotRunning for a missing or
+// non-running hard dependency, ErrNilService for a nil svc,
+// ErrUnsupportedOption for WithCascadeStop, and
+// ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
+// shutdown has begun. A collision with another goroutine's in-flight
+// reservation returns the transient ErrMembershipBusy (poll Busy); a re-entry
+// from the target's own Start/Stop returns ErrReentrantMembership. Thread-safe.
+func (o *Orchestrator) ReplaceService(name string, svc Service, timeout time.Duration, opts ...StopOption) error {
+	o.ensureInit()
+	if svc == nil {
+		return fmt.Errorf("%w: ReplaceService called with a nil Service", ErrNilService)
+	}
+	var cfg stopConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	// Replace keeps the entry and never touches dependents, so a cascade — which
+	// would tear them down — is incoherent with the operation's whole point.
+	// Orphans is deliberately accepted: replace already never refuses on a
+	// running dependent, so it is the operation's fixed behaviour, not an opt-in.
+	if cfg.cascade {
+		return fmt.Errorf("%w: WithCascadeStop cannot be combined with ReplaceService", ErrUnsupportedOption)
+	}
+
+	// Serialize the reservation with every other membership op, exactly as
+	// StartService does, and release the lock before any user code (Validate,
+	// hooks, Stop, Start) runs.
+	o.membershipMu.Lock()
+	o.mu.Lock()
+	if err := o.membershipGateLocked(); err != nil {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		return err
+	}
+	if !o.started {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		return ErrOrchestratorNotStarted
+	}
+	entry := o.lookupEntry(name)
+	if entry == nil {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
+	}
+	// Classify reentrancy before contention (as tearDown does), so a membership
+	// op re-entered from this entry's own Start/Stop is a programming error
+	// rather than a transient collision.
+	goid := curGoroutineID()
+	if entry.lifecycleOwnedBy(goid) {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		return fmt.Errorf("%w: %s", ErrReentrantMembership, name)
+	}
+	// A teardown in progress or a start reserved by another goroutine is a
+	// transient collision: the caller retries once the reservation clears.
+	if entry.removing.Load() || entry.starting.Load() {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		return fmt.Errorf("%w: %s", ErrMembershipBusy, name)
+	}
+	// Never start a fresh instance behind a hard dependency that is gone or not
+	// running; the same gate StartService applies.
+	if err := o.checkHardDependenciesLocked(entry); err != nil {
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		return err
+	}
+	// Reserve the entry for the whole swap — teardown, Validate, and the fresh
+	// start — so a colliding membership op is rejected busy instead of racing
+	// the entry through it.
+	entry.starting.Store(true)
+	o.mu.Unlock()
+	o.membershipMu.Unlock()
+	defer entry.starting.Store(false)
+
+	// Validate is user code: run it under no orchestrator lock, and before the
+	// old instance is touched so a rejected replacement leaves the running
+	// service untouched.
+	if v, ok := svc.(Validator); ok {
+		if err := callErr(v.Validate); err != nil {
+			return fmt.Errorf("gorch: service %s validation failed: %w", name, err)
+		}
+	}
+
+	// Tear the old instance down for the target alone: no dependent guard, no
+	// cascade. A teardown that does not complete cleanly aborts the swap, so a
+	// half-torn-down instance is never replaced. drainService is the safety net
+	// for an abandoned instance whose deferred owner release never ran.
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	if err := o.stopEntry(entry, deadline); err != nil {
+		o.drainService(entry)
+		return err
+	}
+	o.drainService(entry)
+
+	// Swap the implementation and clear the previous instance's history. The
+	// registration identity (cfg, name, svc-independent config) is untouched:
+	// replace changes the implementation, not the entry.
+	entry.setSvc(svc)
+	entry.setRetryCount(0)
+	entry.setHealthFailures(0)
+	entry.setStableSince(time.Time{})
+	entry.stopsCounted.Store(false)
+
+	switch {
+	case entry.cfg.cronSpec != "":
+		return o.startCronEntry(entry)
+	default:
+		// startOneService handles both persistent and runOnce entries.
+		return o.startOneService(entry)
+	}
 }
 
 // tearDown implements StopService and Unregister. It computes the hard-dependent

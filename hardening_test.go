@@ -159,6 +159,7 @@ func TestNoPublicAPI_Panics(t *testing.T) {
 		mustNotPanic(t, "zero StartService", func() { _ = o.StartService("nope") })
 		mustNotPanic(t, "zero StopService", func() { _ = o.StopService("nope", time.Second) })
 		mustNotPanic(t, "zero Unregister", func() { _ = o.Unregister("nope", time.Second) })
+		mustNotPanic(t, "zero ReplaceService", func() { _ = o.ReplaceService("nope", &namedSvc{}, time.Second) })
 		mustNotPanic(t, "zero StartGroup", func() { _ = o.StartGroup("g") })
 		mustNotPanic(t, "zero StopGroup", func() { _ = o.StopGroup("g", time.Second) })
 		mustNotPanic(t, "zero WaitFor", func() { _ = o.WaitFor("nope", StatusRunning, time.Millisecond) })
