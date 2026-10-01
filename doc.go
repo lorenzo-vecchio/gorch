@@ -164,6 +164,15 @@
 //     StatusRunning to StatusCrashed (firing OnCrash and incrementing
 //     Metrics().Crashes) and is returned to StatusRunning once the new instance
 //     is live.
+//   - A self-heal restart's best-effort cleanup of the dead instance is
+//     bounded. It runs the same before/after-stop hooks and Stop() as a
+//     caller-initiated teardown — so a hook that releases a lease is retried on
+//     every crash, not only on an explicit stop — but, with no caller to supply
+//     a budget, the before-stop hook is capped by the per-service
+//     WithStopTimeout (30s when unset). An overrunning hook is abandoned,
+//     logged and counted in Metrics().AbandonedGoroutines, and the restart
+//     still proceeds. Instance spawning has a single path, so a start and a
+//     restart install the same per-instance state.
 //   - Metrics() is a snapshot of monotonic lifecycle counters. Each counter has
 //     a fixed meaning: Starts counts lifecycle starts (one per instance launched
 //     or cron schedule installed, invocations not successes); Stops counts

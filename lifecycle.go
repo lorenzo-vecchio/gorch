@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// defaultRestartStopTimeout bounds the before-stop hook of a self-heal
+// restart's best-effort cleanup when the service sets no WithStopTimeout. A
+// restart has no caller to supply a budget, but the hook must still be bounded
+// or a hook that never returns would strand the restart goroutine forever
+// (#56); 30s matches the default failed-Start rollback budget.
+const defaultRestartStopTimeout = 30 * time.Second
+
 func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	// A removed (or mid-teardown) entry was selected before Unregister deleted
 	// it (e.g. a StartGroup reservation): never revive it.
@@ -159,44 +166,7 @@ func (o *Orchestrator) startOneService(entry *serviceEntry) error {
 	// Create a detachable start context. If timeout is set, we use a separate
 	// context for the race window rather than wrapping the service context.
 	startErrCh := make(chan error, 1)
-
-	go func() {
-		var exitErr error
-		defer func() {
-			if r := recover(); r != nil {
-				sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
-				exitErr = fmt.Errorf("panic: %v", r)
-			}
-			if entry.cfg.factory != nil {
-				// Self-heal: an exit (even an instant error) is handled by
-				// handleServiceDone's restart policy. Signal success before the
-				// (possibly blocking) restart logic so a start timeout never
-				// aborts Start for a service that self-heals.
-				select {
-				case startErrCh <- nil:
-				default:
-				}
-				o.handleServiceDone(entry, sc, exitErr, owner.id)
-				close(done)
-				return
-			}
-			// No self-heal: update status before signalling so a dependent's
-			// status check deterministically sees Crashed/Stopped, not Running.
-			o.handleServiceDone(entry, sc, exitErr, owner.id)
-			select {
-			case startErrCh <- exitErr:
-			default:
-			}
-			close(done)
-		}()
-		id := curGoroutineID()
-		entry.startGoid.Store(id)
-		defer entry.startGoid.CompareAndSwap(id, 0)
-		exitErr = entry.getSvc().Start(sc)
-		if exitErr != nil && exitErr != context.Canceled {
-			sc.Logger.Error("service returned error", "error", exitErr.Error())
-		}
-	}()
+	o.spawnInstance(entry, sc, done, owner.id, startErrCh)
 
 	if timeout > 0 {
 		select {
@@ -339,6 +309,23 @@ func (o *Orchestrator) runStopSequence(entry *serviceEntry, hookDeadline time.Ti
 	}
 	complete := !errors.Is(hookErr, ErrHookTimeout) && stopReturned
 	return errors.Join(hookErr, stopErr), complete
+}
+
+// restartStopHookDeadline returns the deadline for the before-stop hook in a
+// self-heal restart's cleanup sequence. The restart has no caller budget, so it
+// reuses the per-service WithStopTimeout when set and falls back to
+// defaultRestartStopTimeout otherwise; the hook gets half of it, mirroring how
+// stopOneServiceDeadline splits the caller's deadline (the service's own Stop()
+// keeps its full per-service timeout through stopServiceBounded). A hook that
+// overruns the deadline is abandoned and reported as ErrHookTimeout, and the
+// restart proceeds regardless — a failed cleanup is not a reason to leave the
+// service dead.
+func (o *Orchestrator) restartStopHookDeadline(entry *serviceEntry) time.Time {
+	budget := entry.cfg.stopTimeout
+	if budget <= 0 {
+		budget = defaultRestartStopTimeout
+	}
+	return time.Now().Add(budget / 2)
 }
 
 // beginStop enters the teardown state machine and reports whether the entry was
@@ -605,26 +592,67 @@ func (o *Orchestrator) nonPersistentEntries() []*serviceEntry {
 	return out
 }
 
-// runService runs a persistent service's Start to completion, recovering panics
-// and handing the exit to handleServiceDone. done is closed once both the Start
-// call and the self-heal decision have finished.
-func (o *Orchestrator) runService(entry *serviceEntry, sc ServiceContext, done chan struct{}, ownerID uint64) {
-	var exitErr error
-	defer func() {
-		if r := recover(); r != nil {
-			sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
-			exitErr = fmt.Errorf("panic: %v", r)
+// spawnInstance launches one running instance and owns its exit. It is the
+// single instance-spawning path — startOneService (Start, StartService,
+// StartGroup) and the self-heal restart both call it — so the goroutine body,
+// the panic recovery, the wait-group semantics and the fresh owner/messenger
+// state a live instance carries cannot diverge between a start and a restart.
+// (v0.9.0 consolidated registration the same way.)
+//
+// entry.getSvc() is read inside the goroutine, so the caller must have installed
+// the service the instance runs before calling spawnInstance and must not
+// replace it until done is closed.
+//
+// done is closed once both the Start call and the handleServiceDone decision
+// have finished, so a teardown can wait for exactly this run. When startErrCh is
+// non-nil the start outcome is reported on it (non-blocking) before the possibly
+// blocking handleServiceDone; a self-heal exit reports success so a start
+// timeout never aborts Start for a service that comes straight back, while a
+// non-self-heal exit reports its real error after the status is committed. A
+// restart passes a nil startErrCh.
+func (o *Orchestrator) spawnInstance(entry *serviceEntry, sc ServiceContext, done chan struct{}, ownerID uint64, startErrCh chan error) {
+	go func() {
+		var exitErr error
+		defer func() {
+			if r := recover(); r != nil {
+				sc.Logger.Error("service panicked", "panic", fmt.Sprint(r))
+				exitErr = fmt.Errorf("panic: %v", r)
+			}
+			if entry.cfg.factory != nil {
+				// Self-heal: an exit (even an instant error) is handled by
+				// handleServiceDone's restart policy. Signal success before the
+				// (possibly blocking) restart logic.
+				signalStartErr(startErrCh, nil)
+				o.handleServiceDone(entry, sc, exitErr, ownerID)
+				close(done)
+				return
+			}
+			// No self-heal: update status before signalling so a dependent's
+			// status check deterministically sees Crashed/Stopped, not Running.
+			o.handleServiceDone(entry, sc, exitErr, ownerID)
+			signalStartErr(startErrCh, exitErr)
+			close(done)
+		}()
+		id := curGoroutineID()
+		entry.startGoid.Store(id)
+		defer entry.startGoid.CompareAndSwap(id, 0)
+		exitErr = entry.getSvc().Start(sc)
+		if exitErr != nil && exitErr != context.Canceled {
+			sc.Logger.Error("service returned error", "error", exitErr.Error())
 		}
-		o.handleServiceDone(entry, sc, exitErr, ownerID)
-		close(done)
 	}()
+}
 
-	id := curGoroutineID()
-	entry.startGoid.Store(id)
-	defer entry.startGoid.CompareAndSwap(id, 0)
-	exitErr = entry.getSvc().Start(sc)
-	if exitErr != nil && exitErr != context.Canceled {
-		sc.Logger.Error("service returned error", "error", exitErr.Error())
+// signalStartErr reports a start outcome on ch without blocking. A nil ch (a
+// self-heal restart) and a full ch are both no-ops, so the reporting never
+// stalls the instance's exit.
+func signalStartErr(ch chan error, err error) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- err:
+	default:
 	}
 }
 
@@ -814,7 +842,16 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	// Stopped for a clean or cancelled one) and must not be driven back through
 	// the teardown state machine, which would emit a spurious Stopping→Stopped
 	// and report a self-heal restart as an ordinary stop.
-	_, _ = o.runStopSequence(entry, time.Time{})
+	//
+	// The cleanup runs the before-stop hook and the after-stop hook too: they
+	// surround the dead instance's Stop(), exactly as on a caller-initiated
+	// teardown, so a hook that releases a lease or deregisters from a load
+	// balancer still observes the instance that just died (documented on
+	// WithOnBeforeStop/WithOnAfterStop). Unlike a caller stop, a restart has no
+	// caller-supplied deadline, so the hook is bounded by the per-service
+	// WithStopTimeout (defaultRestartStopTimeout when unset); a hook that
+	// overruns is abandoned, logged and counted but never delays the restart.
+	_, _ = o.runStopSequence(entry, o.restartStopHookDeadline(entry))
 	// The restarted instance gets its own stop-metric latch.
 	entry.stopsCounted.Store(false)
 
@@ -846,7 +883,7 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 	// the service is actually up. Set before the goroutine starts, so a
 	// concurrent StartService sees a running entry and stays idempotent.
 	o.setStatus(entry, StatusRunning)
-	go o.runService(entry, newSc, newDone, restartOwner.id)
+	o.spawnInstance(entry, newSc, newDone, restartOwner.id, nil)
 	o.metricsRestarts.Add(1)
 }
 

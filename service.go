@@ -180,13 +180,24 @@ func WithOnAfterStart(fn func(name string, err error)) RegisterOption {
 
 // WithOnBeforeStop sets a per-service hook called just before Stop().
 // If the hook returns an error, Stop() is still called.
+//
+// The hook also runs on every self-heal restart, immediately before the library
+// calls the dead instance's Stop() to release its resources: the restart reuses
+// the same teardown sequence, so a hook that releases a lease or deregisters the
+// instance from a load balancer runs on every crash rather than only on a
+// caller-initiated stop. The hook is then bounded by the per-service
+// WithStopTimeout (30s when unset) so a hook that never returns cannot strand
+// the restart: it is abandoned, logged and counted in
+// Metrics().AbandonedGoroutines, and the restart proceeds.
 func WithOnBeforeStop(fn func(name string) error) RegisterOption {
 	return func(cfg *registerConfig) {
 		cfg.onBeforeStop = fn
 	}
 }
 
-// WithOnAfterStop sets a per-service hook called after Stop() returns.
+// WithOnAfterStop sets a per-service hook called after Stop() returns. Like
+// WithOnBeforeStop it also runs on every self-heal restart, after the dead
+// instance's Stop() has returned.
 func WithOnAfterStop(fn func(name string, err error)) RegisterOption {
 	return func(cfg *registerConfig) {
 		cfg.onAfterStop = fn
@@ -217,7 +228,9 @@ func DependsOnSoft(names ...string) RegisterOption {
 }
 
 // WithStopTimeout sets a per-service timeout on Stop(). If Stop() does not
-// return within this duration, the orchestrator proceeds with shutdown.
+// return within this duration, the orchestrator proceeds with shutdown. It also
+// bounds the before-stop hook of a self-heal restart's cleanup (the hook gets
+// half of it); when unset the restart falls back to a 30s default.
 func WithStopTimeout(d time.Duration) RegisterOption {
 	return func(cfg *registerConfig) { cfg.stopTimeout = d }
 }
