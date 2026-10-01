@@ -90,6 +90,16 @@
 //     reject a nil context with ErrNilContext. An unknown or empty group selects
 //     nothing and returns nil (a group is a filter tag, not an entity), and
 //     StopGroup before Start is a no-op, consistent with StopService/Unregister.
+//   - UnregisterGroup removes every member of a group — cron and runOnce members
+//     included — as the group-level analogue of Unregister. A plain call refuses
+//     to break a Running or Starting hard dependent outside the group with
+//     ErrHasDependents (the typed *HasDependentsError names the member depended
+//     on and the outside blockers); WithCascadeStop removes the transitive hard
+//     dependents outside the group too, and Orphans instead leaves them Running
+//     but degraded. The two options are mutually exclusive and rejected with
+//     ErrUnsupportedOption. Removal aggregates stop failures with errors.Join and
+//     proceeds even when a member's Stop() fails — every member is removed — and
+//     an unknown or empty group is a nil no-op, agreeing with StartGroup/StopGroup.
 //   - An Orchestrator zero value is usable: its first public call lazily
 //     initialises it with the same defaults as New(), so `var o Orchestrator`
 //     behaves like New() and no public entry point panics on an uninitialised
