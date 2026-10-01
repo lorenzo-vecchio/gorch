@@ -3,24 +3,16 @@ package gorch
 import (
 	"context"
 	"errors"
-	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// waitUntil polls cond until it holds or the deadline expires. It spins with
-// Gosched rather than sleeping, so a test synchronizes on the condition itself
-// instead of on a wall-clock guess.
+// waitUntil polls cond until it holds or the deadline expires. It delegates to
+// the shared waitForCondition (3s) so the suite has one polling implementation.
 func waitUntil(t *testing.T, cond func() bool, msg string) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out: " + msg)
-		}
-		runtime.Gosched()
-	}
+	waitForCondition(t, 3*time.Second, cond, msg)
 }
 
 // waitRecv waits for one value on ch, failing on timeout.

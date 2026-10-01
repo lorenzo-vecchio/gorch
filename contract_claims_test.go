@@ -899,17 +899,11 @@ func TestStatusesByLabel_And_ByGroup(t *testing.T) {
 	}
 }
 
-// waitFor polls cond every millisecond up to timeout, failing the test if it
-// never becomes true. It is a safety net for a channel-driven assertion, not the
+// waitFor polls cond up to timeout, failing the test if it never becomes true.
+// It delegates to the shared waitForCondition so the suite has one polling
+// implementation; it is a safety net for a channel-driven assertion, not the
 // synchronization itself.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal(msg)
+	waitForCondition(t, timeout, cond, msg)
 }
