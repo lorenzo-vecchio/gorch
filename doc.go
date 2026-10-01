@@ -26,13 +26,28 @@
 // process and nothing more. It does not persist state across restarts, retry
 // with deduplication, or guarantee delivery of messages.
 //
+// # Restarting
+//
+// The whole-orchestrator lifecycle is single-shot by design, not by omission:
+// after a successful Stop neither Start nor Register can be used again. The
+// supported way to reload configuration or rebuild a subsystem in place is to
+// own the reloadable part in a sub-orchestrator wrapped by an adapter service —
+// the AppOrchestrator pattern shown in examples/nested — and rebuild that
+// sub-orchestrator through the membership API (StopService + StartService, or
+// ReplaceService) while the outer orchestrator keeps running. Each replacement
+// sub-orchestrator is constructed fresh, so its single-shot lifecycle is never
+// abused and the state machine is never asked to reset itself. This covers the
+// common "reload without a process restart" need without touching the
+// highest-defect-density part of the code.
+//
 // # Contract
 //
 //   - Membership is dynamic: Register may add a service to a running
 //     orchestrator, and StartService, StopService, and Unregister start, stop,
 //     and remove services while it runs. Only the whole-orchestrator lifecycle
 //     is single-shot: after a successful Stop the orchestrator cannot be
-//     restarted.
+//     restarted. See the Restarting section above for the supported
+//     in-process reload pattern.
 //   - Done is a shutdown-completed signal: its channel closes once Stop (or
 //     Run, which calls Stop) has returned, and not before. It is not a "every
 //     goroutine has exited" guarantee — a timed-out Stop still closes it while
