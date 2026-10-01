@@ -1,0 +1,43 @@
+name: Test
+
+# The unit suite on every pull request and on main, with the guarantee set the
+# test-suite overhaul (issue #54) settled on:
+#
+#   - -race: the suite must be race-clean, never optionally.
+#   - -count=1: defeat the test cache when validating, so a green run means the
+#     code under test was actually executed.
+#   - -shuffle=on: tests must not depend on execution order or shared state.
+#   - coverage exactly 100.0%: a floor carried over from the release gate.
+#
+# The wall time is printed by the shell `time` so a future addition that makes
+# the suite quietly slow is visible in the job log.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+
+      - run: go build ./...
+
+      - name: Unit tests (race, shuffled, uncached, coverage)
+        run: time go test . -race -count=1 -shuffle=on -coverprofile=coverage.out
+
+      - name: Coverage gate (exactly 100.0%)
+        run: |
+          total=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          if [ "$total" != "100.0" ]; then
+            echo "Coverage is $total%, need 100.0%"
+            exit 1
+          fi
+
+      - run: go vet ./...
