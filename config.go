@@ -125,12 +125,16 @@ func WithGlobalOnAfterStart(fn func(name string, err error)) Option {
 	return func(c *config) { c.OnAfterStart = fn }
 }
 
-// WithGlobalOnBeforeStop sets a global hook called just before each service's Stop.
+// WithGlobalOnBeforeStop sets a global hook called just before each service's
+// Stop. Like the per-service WithOnBeforeStop, it also runs on every self-heal
+// restart, before the dead instance's Stop().
 func WithGlobalOnBeforeStop(fn func(name string) error) Option {
 	return func(c *config) { c.OnBeforeStop = fn }
 }
 
-// WithGlobalOnAfterStop sets a global hook called after each service's Stop returns.
+// WithGlobalOnAfterStop sets a global hook called after each service's Stop
+// returns. Like the per-service WithOnAfterStop, it also runs on every
+// self-heal restart, after the dead instance's Stop().
 func WithGlobalOnAfterStop(fn func(name string, err error)) Option {
 	return func(c *config) { c.OnAfterStop = fn }
 }

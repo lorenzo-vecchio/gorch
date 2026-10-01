@@ -631,6 +631,8 @@ orch.Register(svc, gorch.WithOnBeforeStart(func(name string) error {
 }))
 ```
 
+Both the global and the per-service **before-stop** and **after-stop** hooks also run on every self-heal restart, immediately around the dead instance's `Stop()`: a hook that releases a lease or deregisters the instance from a load balancer therefore fires on every crash, not only on an explicit stop. A restart has no caller-supplied timeout, so its before-stop hook is capped by the service's `WithStopTimeout` (30s when unset); a hook that overruns is abandoned — logged and counted in `Metrics().AbandonedGoroutines` — and the restart proceeds.
+
 ### Self-healing with backoff & retry
 
 Self-heal restarts crashed services with backoff, retry limits, and a stability window.
