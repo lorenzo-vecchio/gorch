@@ -45,6 +45,25 @@
 //     atomically, so concurrent calls start exactly one instance and a collision
 //     with another goroutine's in-flight reservation is the transient
 //     ErrMembershipBusy (a runOnce entry is the deliberate re-run exception).
+//   - ReplaceService swaps a registered service's implementation without
+//     removing its name from the graph, so its hard dependents are neither torn
+//     down nor blocked: a concurrent Register/Status/Dependents/IsReady always
+//     sees the entry — never a gap — while a dependent stays StatusRunning and
+//     reads IsReady false only while the target is not Running. It tears down
+//     only the target's instance (running the hooks and Stop() within the
+//     caller's timeout), installs the new implementation, resets the
+//     per-instance counters, and starts a fresh instance through the same
+//     per-kind path as StartService. The entry's registration-time config
+//     (dependencies, cron spec/mode, runOnce, group, labels, hooks, timeouts,
+//     and self-heal factory) is frozen; to change the factory, Unregister and
+//     Register again. Unlike a plain stop, replace never cascades and never
+//     refuses on a running dependent: WithCascadeStop is rejected with
+//     ErrUnsupportedOption, while Orphans is accepted as a no-op because it is
+//     already replace's fixed behaviour. A teardown that does not complete
+//     cleanly (a deadline or a Stop() error) aborts the swap, leaving the old
+//     implementation in place. The new service runs through Validator.Validate()
+//     before the old instance is touched, and the same hard-dependency gate as
+//     StartService applies.
 //   - Concurrent Start calls are claimed atomically: the caller that wins the
 //     claim runs the lifecycle's start and every other caller returns
 //     ErrAlreadyStarted immediately without waiting for it, so a nil return
