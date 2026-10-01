@@ -44,6 +44,10 @@ jobs:
           (cd "$RUNNER_TEMP/base" && go test . -run '^$' -bench . -benchmem -cpu=4 -count=6) > "$RUNNER_TEMP/base.txt"
 
       - name: Install benchstat
+        # benchstat needs a Go newer than the module's 1.25 floor, so let the
+        # toolchain switch download one; the library itself stays on 1.25.
+        env:
+          GOTOOLCHAIN: auto
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260929162123-406019bb8b68
 
       - name: Time regression vs base
