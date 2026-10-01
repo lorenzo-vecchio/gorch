@@ -147,6 +147,12 @@
 //     dependencies neither block nor are reported. WithCascadeStop tears the
 //     dependents down in reverse topological order; a dependent already Stopping
 //     is left to its own in-flight teardown rather than stopped a second time.
+//     Orphans is the explicit opposite: an opt-in that stops only the target and
+//     leaves running hard dependents degraded. They keep StatusRunning, but
+//     IsReady reports them not ready for as long as a hard dependency is neither
+//     Running nor a succeeded runOnce gate; the orphan becomes ready again on its
+//     own once the dependency is back. Orphans and WithCascadeStop are mutually
+//     exclusive and the pair is rejected with ErrUnsupportedOption.
 //   - The cycle check walks each node once, so a diamond costs O(V+E) rather
 //     than one walk per path. The walk is depth-capped: a chain deeper than
 //     10000 edges fails registration with

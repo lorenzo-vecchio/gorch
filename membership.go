@@ -192,6 +192,13 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	// Orphans and cascade answer the same question oppositely — leave the
+	// dependents running or tear them down — so the pair is incoherent. Reject it
+	// up front, before the target is even looked up, so the classification does
+	// not depend on what is registered.
+	if cfg.cascade && cfg.orphans {
+		return fmt.Errorf("%w: WithCascadeStop cannot be combined with Orphans", ErrUnsupportedOption)
+	}
 
 	// Serialize teardown *selection* so a concurrent StopGroup/Unregister cannot
 	// pick the same entries mid-flight (C3, D16). The lock is released before any
@@ -215,11 +222,17 @@ func (o *Orchestrator) tearDown(name string, remove bool, timeout time.Duration,
 	// first and the target last (reverse topological order).
 	ordered := o.hardDependentsOrderLocked(entry)
 	set := ordered
+	// Orphans is the one opt-in that skips the refusal: the target is stopped
+	// while its active hard dependents are deliberately left running. It still
+	// narrows the set to the target itself, exactly like a plain stop, so nothing
+	// else is torn down.
 	if !cfg.cascade {
-		if blockers := o.activeDependentsLocked(entry, ordered); len(blockers) > 0 {
-			o.mu.Unlock()
-			o.membershipMu.Unlock()
-			return &HasDependentsError{Name: name, Dependents: blockers}
+		if !cfg.orphans {
+			if blockers := o.activeDependentsLocked(entry, ordered); len(blockers) > 0 {
+				o.mu.Unlock()
+				o.membershipMu.Unlock()
+				return &HasDependentsError{Name: name, Dependents: blockers}
+			}
 		}
 		// Without cascade only the target itself is stopped/removed; a
 		// non-running dependent stays registered untouched.
