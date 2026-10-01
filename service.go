@@ -228,7 +228,7 @@ func WithStartCondition(fn func() bool) RegisterOption {
 	return func(cfg *registerConfig) { cfg.startCondition = fn }
 }
 
-// StopOption configures StopService and Unregister.
+// StopOption configures StopService, Unregister, and UnregisterGroup.
 type StopOption func(*stopConfig)
 
 // stopConfig holds the resolved stop options.
@@ -244,6 +244,8 @@ type stopConfig struct {
 // Starting (ErrHasDependents, with the message naming each blocker and its
 // status). A dependent already Stopping is left to its own in-flight teardown,
 // never stopped twice. Soft dependencies never block and are never cascaded.
+// UnregisterGroup reads it against each group member, so the cascade covers the
+// transitive hard dependents that lie outside the group too.
 func WithCascadeStop() StopOption {
 	return func(c *stopConfig) { c.cascade = true }
 }
@@ -262,9 +264,10 @@ func WithCascadeStop() StopOption {
 // Orphans is the explicit "take this down and let the survivors degrade" mode
 // (the kubectl delete --cascade=orphan analogue); the default stays the refusal,
 // because a hard dependent opted into aborting when its dependency goes away. It
-// is mutually exclusive with WithCascadeStop — a stop cannot both leave the
-// dependents alone and tear them down — and the pair is rejected with
-// ErrUnsupportedOption.
+// applies to UnregisterGroup the same way, leaving each member's outside hard
+// dependents Running but degraded. It is mutually exclusive with WithCascadeStop
+// — a stop cannot both leave the dependents alone and tear them down — and the
+// pair is rejected with ErrUnsupportedOption.
 func Orphans() StopOption {
 	return func(c *stopConfig) { c.orphans = true }
 }

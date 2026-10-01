@@ -510,6 +510,39 @@ func (o *Orchestrator) hardDependentsOrderLocked(target *serviceEntry) []*servic
 	return order
 }
 
+// externalDependentsLocked returns the transitive hard dependents of the members
+// set that are not themselves members, in reverse topological order: a dependent
+// precedes the member it reaches through DependsOn. It is the cross-group
+// expansion UnregisterGroup applies with WithCascadeStop — the outside entries a
+// group removal would otherwise strand. memberNames is the set of member names,
+// so a transitive dependent that is itself a member is walked (its own dependents
+// still count) but not returned. The caller must hold o.mu.
+func (o *Orchestrator) externalDependentsLocked(members []*serviceEntry, memberNames map[string]bool) []*serviceEntry {
+	var order []*serviceEntry
+	seen := make(map[string]bool)
+	var visit func(e *serviceEntry)
+	visit = func(e *serviceEntry) {
+		if seen[e.name] {
+			return
+		}
+		seen[e.name] = true
+		for _, d := range o.entries {
+			for _, dep := range d.cfg.dependsOn {
+				if dep == e.name {
+					visit(d)
+				}
+			}
+		}
+		if !memberNames[e.name] {
+			order = append(order, e)
+		}
+	}
+	for _, m := range members {
+		visit(m)
+	}
+	return order
+}
+
 // activeDependentsLocked returns the names of the hard dependents in set, other
 // than target, that are Starting or Running: the ones a plain stop would break.
 // Every other status is non-blocking: a Stopping dependent is already going
