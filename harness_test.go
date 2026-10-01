@@ -501,6 +501,9 @@ func TestHarness_RecordingServiceRecordsLifecycle(t *testing.T) {
 	if n := svc.countKind(evExit); n != 1 {
 		t.Errorf("exit events = %d, want 1", n)
 	}
+	if err := svc.exitError(); !errors.Is(err, context.Canceled) {
+		t.Errorf("exit error = %v, want context.Canceled", err)
+	}
 	want := []string{"start#1", "exit#1", "stop#1"}
 	if got := svc.eventLog(); !equalStringSlices(got, want) {
 		t.Errorf("event log = %v, want %v", got, want)
@@ -537,6 +540,12 @@ func TestHarness_BlockingServiceGatesStartAndStop(t *testing.T) {
 	if err := <-stopDone; err != nil {
 		t.Fatalf("Stop = %v, want nil", err)
 	}
+	if got := svc.startCount(); got != 1 {
+		t.Errorf("start count = %d, want 1", got)
+	}
+	if got := svc.stopCount(); got != 1 {
+		t.Errorf("stop count = %d, want 1", got)
+	}
 }
 
 // TestHarness_BlockingHookParksUntilReleased proves the hook double lets a test
@@ -560,6 +569,22 @@ func TestHarness_BlockingHookParksUntilReleased(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("hook did not return after release")
+	}
+
+	// afterStart is the after-start variant: it parks the same way and is safe
+	// on a goroutine the test owns.
+	after := make(chan struct{})
+	go func() { h.afterStart("svc", nil); close(after) }()
+	select {
+	case <-h.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("after-start hook did not signal entry")
+	}
+	h.releaseHook()
+	select {
+	case <-after:
+	case <-time.After(3 * time.Second):
+		t.Fatal("after-start hook did not return after release")
 	}
 }
 
