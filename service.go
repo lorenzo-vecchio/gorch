@@ -234,6 +234,7 @@ type StopOption func(*stopConfig)
 // stopConfig holds the resolved stop options.
 type stopConfig struct {
 	cascade bool
+	orphans bool
 }
 
 // WithCascadeStop extends StopService/Unregister to the target's transitive
@@ -245,6 +246,27 @@ type stopConfig struct {
 // never stopped twice. Soft dependencies never block and are never cascaded.
 func WithCascadeStop() StopOption {
 	return func(c *stopConfig) { c.cascade = true }
+}
+
+// Orphans lets StopService/Unregister proceed when the target has Running or
+// Starting hard dependents, instead of refusing with ErrHasDependents. Those
+// dependents are left running but degraded: they keep StatusRunning, while
+// IsReady reports them not ready for as long as a declared hard dependency is
+// neither Running nor a runOnce gate that reached StatusSucceeded — the same
+// edge condition StartService enforces. StartService of the orphan therefore
+// keeps failing with ErrDependencyNotRunning (or ErrDependencyNotFound if the
+// dependency was unregistered) until the dependency is back, and the orphan
+// becomes ready again automatically once it is. Soft dependencies are never
+// involved: they neither block nor are left degraded.
+//
+// Orphans is the explicit "take this down and let the survivors degrade" mode
+// (the kubectl delete --cascade=orphan analogue); the default stays the refusal,
+// because a hard dependent opted into aborting when its dependency goes away. It
+// is mutually exclusive with WithCascadeStop — a stop cannot both leave the
+// dependents alone and tear them down — and the pair is rejected with
+// ErrUnsupportedOption.
+func Orphans() StopOption {
+	return func(c *stopConfig) { c.orphans = true }
 }
 
 // Sentinel errors. Every exported sentinel is classified so a caller can decide
