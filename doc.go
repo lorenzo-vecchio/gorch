@@ -26,6 +26,10 @@
 // process and nothing more. It does not persist state across restarts, retry
 // with deduplication, or guarantee delivery of messages.
 //
+// # Requirements
+//
+// gorch requires Go 1.25+.
+//
 // # Restarting
 //
 // The whole-orchestrator lifecycle is single-shot by design, not by omission:
