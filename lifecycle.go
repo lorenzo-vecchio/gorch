@@ -858,6 +858,21 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 		return
 	}
 
+	// The dead incarnation is gone for good, so release its per-service context
+	// before the cleanup. For a self-heal entry the teardown context is shared
+	// across incarnations (only StopService/Unregister/Stop cancel it), so an
+	// uncancelled instance context stays registered as one of its children for
+	// the entry's whole lifetime — one retained context per restart, unbounded in
+	// a zero-backoff crash loop (#109). Cancelling before Stop() mirrors
+	// stopEntry, which cancels the live instance before calling its Stop(), and
+	// is idempotent: the health-threshold path that already cancelled this
+	// context to trigger the exit is unaffected. The teardown context itself is
+	// deliberately left live so a later StopService still aborts the next
+	// incarnation.
+	if cancel := entry.getCancel(); cancel != nil {
+		cancel()
+	}
+
 	// Best-effort cleanup of the old instance: its Stop() releases resources.
 	// The status was already resolved for the exit (Crashed for a real crash,
 	// Stopped for a clean or cancelled one) and must not be driven back through
