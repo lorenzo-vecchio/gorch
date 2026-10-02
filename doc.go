@@ -145,7 +145,11 @@
 //     entry StatusRunning means the
 //     schedule is installed, not that a tick is working: a tick that returns an
 //     error or panics only logs and increments Metrics().CronFailures, and
-//     IsReady and Health inherit that scheduling-fact reading.
+//     IsReady and Health inherit that scheduling-fact reading. For a persistent
+//     entry, StatusRunning (and Metrics().Starts) marks the launch decision and
+//     is committed before the instance goroutine invokes Start: it says an
+//     instance is live, not that Start's body has begun, and is therefore not a
+//     handshake for the first Start invocation.
 //   - A panic from a lifecycle hook, Validator, start condition, or probe is
 //     recovered and reported as an error (or as unhealthy/unready), so a
 //     misbehaving callback never unwinds through a public entry point.

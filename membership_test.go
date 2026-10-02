@@ -803,7 +803,16 @@ func TestStartService_OnRunning_DoesNotOrphanInstance(t *testing.T) {
 	}
 
 	var beforeHooks, afterHooks atomic.Int32
+	// startEntered is closed once the instance's Start() is actually invoked.
+	// StatusRunning and Metrics().Starts are committed before the instance
+	// goroutine calls Start (lifecycle.go), so the status alone cannot prove the
+	// invocation happened; this handshake does. The Once guards a defective
+	// double-start so the regression fails on the assertion below rather than
+	// panicking in the waiter.
+	startEntered := make(chan struct{})
+	var startOnce sync.Once
 	svc := &testSvc{startFn: func(ctx context.Context) error {
+		startOnce.Do(func() { close(startEntered) })
 		<-ctx.Done()
 		return ctx.Err()
 	}}
@@ -816,6 +825,14 @@ func TestStartService_OnRunning_DoesNotOrphanInstance(t *testing.T) {
 		t.Fatalf("StartService: %v", err)
 	}
 	waitForStatus(t, o, "x", StatusRunning)
+	// The start path commits StatusRunning (and Metrics().Starts) before the
+	// instance goroutine runs Start, so wait for the invocation itself rather
+	// than inferring it from the status; only then is startCalls load-stable.
+	select {
+	case <-startEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() was never invoked for the running instance")
+	}
 
 	for i := 0; i < 5; i++ {
 		if err := o.StartService("x"); err != nil {
