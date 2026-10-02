@@ -483,6 +483,85 @@ func FuzzMembershipTransitions(f *testing.F) {
 	})
 }
 
+// FuzzFailedStartOwners extends the #20 owner-map obligation to the failed-Start
+// rollback: for any input, after a Start that fails while a service ignores
+// cancellation and outlives the rollback budget, neither owner map may retain an
+// id, and repeated failed Starts may not accumulate one. The abandoned instance
+// is still live when the assertion runs, so only the rollback's drain — not the
+// instance's own deferred release — can have cleared the maps. Each attempt
+// re-runs the same failed Start, the shape that leaked an id per retry before
+// the rollback drained.
+func FuzzFailedStartOwners(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0})
+	f.Add([]byte{2, 1, 0, 2})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		attempts := 1
+		if len(data) > 0 {
+			attempts += int(data[0]) % 3
+		}
+		o := New(WithHealthChecksDisabled(), WithFailedStartTimeout(30*time.Millisecond))
+
+		release := make(chan struct{})
+		released := false
+		subs := make(chan (<-chan any), attempts)
+		returned := make(chan struct{}, attempts)
+		stubborn := &abandonStartSvc{release: release, subs: subs, returned: returned}
+		if err := o.Register(stubborn, WithName("stubborn")); err != nil {
+			t.Fatal(err)
+		}
+		// The gate depends on stubborn, so stubborn starts first and is the
+		// service the failing level's rollback must tear down.
+		if err := o.Register(&namedSvc{}, WithName("gate"), DependsOn("stubborn"),
+			WithOnBeforeStart(func(string) error { return errors.New("gate closed") })); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if !released {
+				close(release)
+			}
+		})
+
+		entry := entryNamed(t, o, "stubborn")
+		if got := rootOwnerCount(o); got != 0 {
+			t.Fatalf("baseline root owners = %d, want 0", got)
+		}
+		for i := 0; i < attempts; i++ {
+			if err := o.Start(); !errors.Is(err, ErrStopTimeout) {
+				t.Fatalf("attempt %d: Start = %v, want ErrStopTimeout from the abandoned-instance wait", i, err)
+			}
+			// The instance is still blocked: only the drain can have cleared the
+			// maps. Read the subscription it registered to pin the drain too.
+			if n := len(returned); n != 0 {
+				t.Fatalf("attempt %d: %d abandoned instance(s) returned early", i, n)
+			}
+			if got := rootOwnerCount(o); got != 0 {
+				t.Fatalf("attempt %d: root owners = %d after failed Start, want 0", i, got)
+			}
+			if got := totalEntryOwnerCount(o); got != 0 {
+				t.Fatalf("attempt %d: entry owner sum = %d after failed Start, want 0", i, got)
+			}
+			<-subs
+			if ids := entryOwnerIDs(entry); len(ids) != 0 {
+				t.Fatalf("attempt %d: stubborn entry owners = %v after failed Start, want none", i, ids)
+			}
+		}
+
+		close(release)
+		released = true
+		for i := 0; i < attempts; i++ {
+			select {
+			case <-returned:
+			case <-time.After(time.Second):
+				t.Fatalf("abandoned instance %d did not unwind after release", i)
+			}
+		}
+		if got := rootOwnerCount(o); got != 0 {
+			t.Fatalf("root owners = %d after the abandoned instances unwound, want 0", got)
+		}
+	})
+}
+
 // FuzzStopTimeoutStatus drives a stop against a service that ignores context
 // cancellation, so the stop times out with the instance goroutine still live. It
 // asserts the semantic obligation the deadline path must never break: while the

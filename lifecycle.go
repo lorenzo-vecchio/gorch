@@ -247,6 +247,20 @@ func (o *Orchestrator) stopStartedServices(entries []*serviceEntry, deadline tim
 			}
 		}
 	}
+	// Drain every Messenger owner the snapshot registered, mirroring teardown's
+	// stop-then-drain pairing (stopEntry/drainService). A service that ignored
+	// cancellation and outlives the rollback never runs its deferred
+	// releaseOwner, so without this its owner id — and every subscription under
+	// it — would survive in both owner maps. Because a failed Start is
+	// retryable, that leak would grow by one id per abandoned attempt; draining
+	// once the stop attempts are done retires the ids regardless. The snapshot
+	// entries are still reserved here (clearStarting is deferred until the
+	// Start closure returns), so no concurrent StartService can mint a fresh
+	// owner this loop would wrongly drain. drainService marks each owner dead,
+	// so the abandoned instance's scoped view cannot resubscribe afterwards.
+	for _, entry := range entries {
+		o.drainService(entry)
+	}
 	// Stop log-pump: signal it to drain buffered entries and exit.
 	if o.logQuit != nil {
 		close(o.logQuit)

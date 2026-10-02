@@ -164,11 +164,11 @@
 //     runs, so the counter is the only visibility into a leak user code can
 //     cause by ignoring the contract.
 //   - Messenger subscriptions are scoped to the instance or cron tick that
-//     created them, and their owner is released on every exit path. Teardown
-//     drains every live owner id of an entry, so an owner whose goroutine is
-//     abandoned — its deferred release skipped — is still released. Owner ids
-//     are monotonic and never reused, so a drained id cannot be reminted into a
-//     later view.
+//     created them, and their owner is released on every exit path. Both
+//     teardown and the failed-Start rollback drain every live owner id of an
+//     entry, so an owner whose goroutine is abandoned — its deferred release
+//     skipped — is still released. Owner ids are monotonic and never reused, so
+//     a drained id cannot be reminted into a later view.
 //   - A self-heal crash is observable before the restart: the entry transitions
 //     StatusRunning to StatusCrashed (firing OnCrash and incrementing
 //     Metrics().Crashes) and is returned to StatusRunning once the new instance
@@ -241,7 +241,9 @@
 //     WithFailedStartTimeout. Overrunning the budget reports ErrStopTimeout. The
 //     reset is best-effort — a goroutine that
 //     ignores cancellation may outlive the failed Start — so the orchestrator is
-//     left restartable and Start can be retried.
+//     left restartable and Start can be retried. The rollback still drains every
+//     owner id such an abandoned instance registered, so retrying a failing
+//     Start does not accumulate owner ids (or their subscriptions).
 //   - Unregister discards the removed service's per-instance state — instance
 //     and teardown contexts, exit channel, retry and health counters, stability
 //     window, liveness and accounting flags, owner ids, and cron accounting —
