@@ -504,7 +504,11 @@ unscheduled) cron entry both count and both read `StatusRegistered`, so
 `Count()` is "registered", not "live". For "N of M running", use the
 `StatusRunning` subset: `CountRunning()` of `Count()`, or `RunningNames()`. For a
 cron entry `StatusRunning` means the schedule is installed, not that a tick is
-working (see [Cron modes](#cron-modes)). `Done()` is a shutdown-completed signal:
+working (see [Cron modes](#cron-modes)). For a persistent service,
+`StatusRunning` and `Metrics().Starts` are committed when the instance is
+launched, before its `Start` runs on the instance goroutine: they say an instance
+is live, not that `Start`'s body has begun, so neither is a handshake for the
+first `Start` invocation. `Done()` is a shutdown-completed signal:
 it closes once `Stop` returns — even if every service was unregistered first, or
 a timed-out stop abandoned a goroutine — and stays open until then.
 
