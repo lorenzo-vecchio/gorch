@@ -1,7 +1,10 @@
 package gorch
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/gob"
 	"fmt"
 	"sync"
 	"testing"
@@ -30,41 +33,94 @@ import (
 // -cpu=4 pins GOMAXPROCS so the "-4" benchmark-name suffix matches the CI run;
 // -ignore cpu on the benchstat side absorbs the machine description. Without
 // both, benchstat silently emits no comparison at all.
+//
+// Deterministic, time-driven measurements (health tick, cron tick, restart
+// backoff) do not live here because they cannot be expressed as -bench numbers
+// without benchmarking time.Sleep; they are in bench_schedule_test.go, under
+// testing/synctest.
 
-// BenchmarkStartStop50Services measures the full lifecycle cost of starting and
-// gracefully stopping 50 trivial persistent services.
-func BenchmarkStartStop50Services(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		o := New(WithHealthChecksDisabled())
-		for j := 0; j < 50; j++ {
-			if err := o.Register(&namedSvc{name: fmt.Sprintf("svc-%02d", j)}, WithName(fmt.Sprintf("svc-%02d", j))); err != nil {
-				b.Fatal(err)
-			}
-		}
-		if err := o.Start(); err != nil {
-			b.Fatal(err)
-		}
-		if err := o.Stop(10 * time.Second); err != nil {
-			b.Fatal(err)
+// benchPayload is the request/reply payload used by the Request and typed
+// benchmarks. Registering it with gob (once, below) lets the untyped Request
+// path carry it through the interface-valued encode.
+type benchPayload struct {
+	Value int
+}
+
+var benchPayloadOnce sync.Once
+
+func registerBenchPayload() {
+	benchPayloadOnce.Do(func() { gob.Register(benchPayload{}) })
+}
+
+// ── Lifecycle ──
+
+// BenchmarkLifecycleScaling measures one full start+stop cycle per service and
+// reports the derived ns/svc metric, so "what does one more service cost" has a
+// direct answer and a superlinear term is visible. The flat graph isolates the
+// per-service overhead; the chain graph adds the dependency walk, isolating the
+// topoSort level scan (O(V²) today, tracked on #23/#39).
+func BenchmarkLifecycleScaling(b *testing.B) {
+	for _, shape := range []string{"flat", "chain"} {
+		for _, n := range []int{1, 10, 100, 1000} {
+			b.Run(fmt.Sprintf("%s/n=%d", shape, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					o := New(WithHealthChecksDisabled())
+					registerTopology(b, o, shape, n)
+					if err := o.Start(); err != nil {
+						b.Fatal(err)
+					}
+					if err := o.Stop(30 * time.Second); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/svc")
+			})
 		}
 	}
 }
 
-// BenchmarkMessengerPublish measures hot-path publish throughput to a single
-// subscriber, then drains the buffered messages outside the timed loop.
-func BenchmarkMessengerPublish(b *testing.B) {
-	m := newMessenger()
-	ch, _, err := m.SubscribeWithBuffer("bench", b.N+1)
-	if err != nil {
-		b.Fatal(err)
+// registerTopology registers n named services on o: independent (flat) or each
+// depending on the previous one (chain). It fails the benchmark on error.
+func registerTopology(b *testing.B, o *Orchestrator, shape string, n int) {
+	b.Helper()
+	prev := ""
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("svc-%04d", i)
+		opts := []RegisterOption{WithName(name)}
+		if shape == "chain" && prev != "" {
+			opts = append(opts, DependsOn(prev))
+		}
+		if err := o.Register(&namedSvc{}, opts...); err != nil {
+			b.Fatal(err)
+		}
+		prev = name
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		m.Publish(i, "bench")
-	}
-	b.StopTimer()
-	for i := 0; i < b.N; i++ {
-		<-ch
+}
+
+// BenchmarkGoroutineBaseline is the primitive gorch replaces: N goroutines that
+// park on a context and are torn down by cancel+WaitGroup. It gives the README a
+// calibration point — the orchestration overhead over plain goroutines — rather
+// than an unanchored absolute number.
+func BenchmarkGoroutineBaseline(b *testing.B) {
+	for _, n := range []int{1, 10, 100, 1000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				ctx, cancel := context.WithCancel(context.Background())
+				var wg sync.WaitGroup
+				for j := 0; j < n; j++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						<-ctx.Done()
+					}()
+				}
+				cancel()
+				wg.Wait()
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/svc")
+		})
 	}
 }
 
@@ -80,6 +136,7 @@ func BenchmarkTopoSort(b *testing.B) {
 			entries[i].cfg.dependsOn = []string{fmt.Sprintf("n%03d", i-1)}
 		}
 	}
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := o.topoSort(entries); err != nil {
@@ -87,6 +144,251 @@ func BenchmarkTopoSort(b *testing.B) {
 		}
 	}
 }
+
+// ── Publish ──
+
+// BenchmarkMessengerPublish is the publish matrix: subscribers ∈ {0,1,8,64} ×
+// consumer ∈ {draining, stalled} × publisher ∈ {single, parallel} × delivery ∈
+// {targeted, broadcast}. The 0 case is the early-exit path; stalled never reads,
+// so the buffer fills and every Publish takes the documented drop branch;
+// draining makes a consumer keep up; parallel is the RWMutex contention case;
+// broadcast iterates every topic × owner. The subscriber buffer is the real
+// default (16), not the b.N-sized buffer the old benchmark allocated.
+func BenchmarkMessengerPublish(b *testing.B) {
+	for _, broadcast := range []bool{false, true} {
+		for _, subs := range []int{0, 1, 8, 64} {
+			for _, consumer := range []string{"draining", "stalled"} {
+				for _, parallel := range []bool{false, true} {
+					name := fmt.Sprintf("delivery=%s/subs=%d/%s/publisher=%s",
+						broadcastLabel(broadcast), subs, consumer, publisherLabel(parallel))
+					b.Run(name, func(b *testing.B) {
+						benchMessengerPublish(b, subs, consumer == "draining", broadcast, parallel)
+					})
+				}
+			}
+		}
+	}
+}
+
+func broadcastLabel(broadcast bool) string {
+	if broadcast {
+		return "broadcast"
+	}
+	return "targeted"
+}
+
+func publisherLabel(parallel bool) string {
+	if parallel {
+		return "parallel"
+	}
+	return "single"
+}
+
+func benchMessengerPublish(b *testing.B, subs int, draining, broadcast, parallel bool) {
+	b.Helper()
+	b.ReportAllocs()
+
+	m := newMessenger()
+	chans := make([]<-chan any, 0, subs)
+	unsubs := make([]func(), 0, subs)
+	for i := 0; i < subs; i++ {
+		ch, unsub := m.Subscribe("bench")
+		chans = append(chans, ch)
+		unsubs = append(unsubs, unsub)
+	}
+
+	var consumerWG sync.WaitGroup
+	if draining {
+		for _, ch := range chans {
+			consumerWG.Add(1)
+			go func(ch <-chan any) {
+				defer consumerWG.Done()
+				for range ch {
+				}
+			}(ch)
+		}
+	}
+
+	publish := func(i int) {
+		if broadcast {
+			m.Publish(i)
+			return
+		}
+		m.Publish(i, "bench")
+	}
+
+	b.ResetTimer()
+	if parallel {
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				publish(i)
+				i++
+			}
+		})
+	} else {
+		for i := 0; i < b.N; i++ {
+			publish(i)
+		}
+	}
+	b.StopTimer()
+
+	// Drain closes every subscriber channel, releasing the draining goroutines;
+	// the unsubscribes are then no-ops.
+	m.Drain()
+	consumerWG.Wait()
+	for _, unsub := range unsubs {
+		unsub()
+	}
+}
+
+// ── Request / reply ──
+
+// benchEcho responds to every request on topic by publishing the same payload
+// back to the request's ReplyTopic. It lives until m.Drain closes its channel.
+func benchEcho(m *Messenger, topic string) {
+	ch, _ := m.Subscribe(topic)
+	go func() {
+		for v := range ch {
+			msg, ok := v.(Message)
+			if !ok {
+				continue
+			}
+			m.Publish(Message{Payload: msg.Payload, Topic: msg.Topic}, msg.ReplyTopic)
+		}
+	}()
+}
+
+// BenchmarkRequest measures the full untyped round trip against an echo
+// responder: gob encode, reply-topic mint, subscribe, publish, and decode.
+func BenchmarkRequest(b *testing.B) {
+	registerBenchPayload()
+	b.ReportAllocs()
+	m := newMessenger()
+	benchEcho(m, "bench")
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := m.Request(ctx, benchPayload{Value: i}, "bench"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	m.Drain()
+}
+
+// BenchmarkRequestAsync measures the full async round trip: the same fixed
+// per-call cost as Request plus the forwarding goroutine and the extra
+// receive/send hop.
+func BenchmarkRequestAsync(b *testing.B) {
+	registerBenchPayload()
+	b.ReportAllocs()
+	m := newMessenger()
+	benchEcho(m, "bench")
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ch, err := m.RequestAsync(ctx, benchPayload{Value: i}, "bench")
+		if err != nil {
+			b.Fatal(err)
+		}
+		<-ch
+	}
+	b.StopTimer()
+	m.Drain()
+}
+
+// BenchmarkRequestEncode prices the gob encode half of the Request fixed cost,
+// so the reporter can attribute the round trip to encode vs routing.
+func BenchmarkRequestEncode(b *testing.B) {
+	payload := benchPayload{Value: 42}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(&payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkReplyTopicMint prices the reply-topic mint (crypto/rand read plus
+// hex formatting) — the other fixed cost a Request pays before it routes.
+func BenchmarkReplyTopicMint(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = newUUID(rand.Reader)
+	}
+}
+
+// BenchmarkSubscribeRouting prices the subscribe/unsubscribe of a reply topic
+// under the root lock, isolating the routing cost from encode and mint.
+func BenchmarkSubscribeRouting(b *testing.B) {
+	b.ReportAllocs()
+	m := newMessenger()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, unsub := m.Subscribe("reply")
+		unsub()
+	}
+}
+
+// ── Typed messaging ──
+
+// BenchmarkTypedPublish prices the gob encode plus routing of TypedPublish,
+// separated from the raw (non-serializing) Publish path.
+func BenchmarkTypedPublish(b *testing.B) {
+	b.ReportAllocs()
+	m := newMessenger()
+	if err := RegisterType[benchPayload](m); err != nil {
+		b.Fatal(err)
+	}
+	ch, _ := TypedSubscribe[benchPayload](m, "bench")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range ch {
+		}
+	}()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		TypedPublish(m, benchPayload{Value: i}, "bench")
+	}
+	b.StopTimer()
+	m.Drain()
+	<-done
+}
+
+// BenchmarkTypedRequest measures a typed round trip: encode request, route,
+// decode request, encode response, route, decode response.
+func BenchmarkTypedRequest(b *testing.B) {
+	b.ReportAllocs()
+	m := newMessenger()
+	if err := RegisterType[benchPayload](m); err != nil {
+		b.Fatal(err)
+	}
+	reqCh, _ := TypedSubscribeRequest[benchPayload](m, "bench")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for env := range reqCh {
+			TypedRespond(m, benchPayload{Value: env.Value.Value + 1}, env.ReplyTopic)
+		}
+	}()
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := TypedRequest[benchPayload, benchPayload](m, ctx, benchPayload{Value: i}, "bench"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	m.Drain()
+	<-done
+}
+
+// ── Contended introspection ──
 
 // churnOrchestrator builds and starts an orchestrator with n trivial services,
 // then spawns one background goroutine per service that repeatedly stops and
@@ -134,6 +436,7 @@ func churnOrchestrator(b *testing.B, n int) (*Orchestrator, func()) {
 func BenchmarkStatusesChurn(b *testing.B) {
 	o, cleanup := churnOrchestrator(b, 8)
 	defer cleanup()
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = o.Statuses()
@@ -145,6 +448,7 @@ func BenchmarkStatusesChurn(b *testing.B) {
 func BenchmarkNamesChurn(b *testing.B) {
 	o, cleanup := churnOrchestrator(b, 8)
 	defer cleanup()
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = o.Names()
@@ -214,6 +518,7 @@ func BenchmarkRegister_ReloadChurn(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer o.Stop(5 * time.Second)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		name := fmt.Sprintf("churn-%d", i)
@@ -223,5 +528,73 @@ func BenchmarkRegister_ReloadChurn(b *testing.B) {
 		if err := o.Unregister(name, time.Second); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// ── Hook pipeline and construction ──
+
+func benchNoopBefore(string) error { return nil }
+func benchNoopAfter(string, error) {}
+
+// BenchmarkStartStopHooks prices the hook machinery itself rather than a hook
+// body, by running a one-service start+stop with zero hooks versus all four
+// global and per-service hooks registered.
+func BenchmarkStartStopHooks(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		b.Run(fmt.Sprintf("hooks=%v", enabled), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				opts := []Option{WithHealthChecksDisabled()}
+				ropts := []RegisterOption{WithName("svc")}
+				if enabled {
+					opts = append(opts,
+						WithGlobalOnBeforeStart(benchNoopBefore),
+						WithGlobalOnAfterStart(benchNoopAfter),
+						WithGlobalOnBeforeStop(benchNoopBefore),
+						WithGlobalOnAfterStop(benchNoopAfter),
+					)
+					ropts = append(ropts,
+						WithOnBeforeStart(benchNoopBefore),
+						WithOnAfterStart(benchNoopAfter),
+						WithOnBeforeStop(benchNoopBefore),
+						WithOnAfterStop(benchNoopAfter),
+					)
+				}
+				o := New(opts...)
+				if err := o.Register(&namedSvc{}, ropts...); err != nil {
+					b.Fatal(err)
+				}
+				if err := o.Start(); err != nil {
+					b.Fatal(err)
+				}
+				if err := o.Stop(5 * time.Second); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkNew prices constructing an orchestrator with many functional
+// options, so option-application cost is visible next to construction itself.
+func BenchmarkNew(b *testing.B) {
+	opts := []Option{
+		WithHealthChecks(time.Second, WithProbeTimeout(time.Second), WithFailureThreshold(5)),
+		WithDefaultStartTimeout(time.Second),
+		WithFailedStartTimeout(time.Minute),
+		WithLogLevel(LogLevelWarn),
+		WithGlobalOnBeforeStart(benchNoopBefore),
+		WithGlobalOnAfterStart(benchNoopAfter),
+		WithGlobalOnBeforeStop(benchNoopBefore),
+		WithGlobalOnAfterStop(benchNoopAfter),
+		WithOnStateChange(func(string, ServiceStatus, ServiceStatus) {}),
+		WithOnCrash(func(string, error) {}),
+		WithBeforeHealthCheck(func(string) error { return nil }),
+		WithAfterHealthCheck(func(string, error) {}),
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = New(opts...)
 	}
 }
