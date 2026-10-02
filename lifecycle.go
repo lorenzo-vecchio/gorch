@@ -733,10 +733,15 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 		return
 	}
 
-	// Check if context was cancelled (orchestrator shutting down).
+	// Check if context was cancelled (orchestrator shutting down), mirroring the
+	// non-self-heal branch above: Stop() owns the status transitions through
+	// stopOneService (running→stopping→stopped) and accounts the stop, so the
+	// instance exiting on shutdown must not commit StatusStopped first. Committing
+	// it here would turn a terminal status back into Stopping and skip the stop
+	// accounting, making the sequence and Metrics().Stops depend on whether this
+	// handler or Stop's loop reached the entry first.
 	select {
 	case <-o.ctx.Done():
-		o.setStatus(entry, StatusStopped)
 		o.mu.Lock()
 		if !entry.wgDone {
 			entry.wgDone = true
