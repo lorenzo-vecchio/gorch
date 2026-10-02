@@ -1404,6 +1404,16 @@ func (o *Orchestrator) Stop(timeout time.Duration) error {
 			case <-done:
 				allDone = true
 			case <-time.After(remaining):
+				// The final-wait helper is abandoned: it is neither counted nor
+				// logged anywhere else, so account for it here rather than
+				// under-reporting the leak this metric exists to expose. The
+				// wait is orchestrator-wide, so attribute the log to a stopped
+				// entry when one exists. Counted exactly once, monotonic.
+				var reporter *serviceEntry
+				if len(pending) > 0 {
+					reporter = pending[0].entry
+				}
+				o.recordAbandoned(reporter, "abandoning final wait: instance goroutines or the log-pump did not exit before the stop deadline")
 				stopErr = errors.Join(stopErr, ErrStopTimeout)
 			}
 		}

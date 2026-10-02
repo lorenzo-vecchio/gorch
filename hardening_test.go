@@ -2061,6 +2061,64 @@ func TestAbandonedGoroutines_HappyPathStaysZero(t *testing.T) {
 	_ = o.Stop(time.Second)
 }
 
+// TestStop_AbandonedFinalWait_IsCountedAndLogged pins the whole-Stop final-wait
+// accounting (#66): when the shutdown deadline wins because a service goroutine
+// ignores cancellation, the helper goroutine waiting on o.wg is abandoned. It
+// must be counted in Metrics().AbandonedGoroutines (delta exactly one) and logged
+// at Error level, like every other deadline-abandoned teardown goroutine. The
+// service's own Stop() returns promptly and there is no per-service
+// WithStopTimeout, so the only abandoned goroutine is the final wait, making the
+// delta exact rather than incidental.
+func TestStop_AbandonedFinalWait_IsCountedAndLogged(t *testing.T) {
+	tl := &testLogger{}
+	o := New(WithHealthChecksDisabled(), WithLogger(tl))
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	entered := make(chan struct{})
+	exited := make(chan struct{})
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			t.Error("the deliberately-leaked instance never exited after release")
+		}
+	})
+
+	svc := &testSvc{
+		startFn: func(context.Context) error {
+			close(entered)
+			<-release // deliberately ignores cancellation: the instance never exits
+			close(exited)
+			return nil
+		},
+	}
+	if err := o.Register(svc, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("service Start never ran")
+	}
+
+	before := o.Metrics().AbandonedGoroutines
+	err := o.Stop(100 * time.Millisecond)
+	if !errors.Is(err, ErrStopTimeout) {
+		t.Fatalf("Stop = %v, want ErrStopTimeout for a service that ignores cancellation", err)
+	}
+	if got := o.Metrics().AbandonedGoroutines - before; got != 1 {
+		t.Fatalf("AbandonedGoroutines delta = %d, want exactly 1 for the abandoned final wait", got)
+	}
+	if !hasErrorForService(tl, "s") {
+		t.Fatal("the abandoned final wait was not logged at Error level naming the service")
+	}
+}
+
 // ── Issue #26: per-entry state destroyed by Unregister and clean re-add ──
 
 // readWgDone reads the wait-group latch under the orchestrator lock.

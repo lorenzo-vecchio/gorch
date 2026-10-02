@@ -444,7 +444,8 @@ teardown is verified complete. A succeeded `runOnce` gate is exempt: it keeps
 Bounding a stop means walking away from user code that will not return. A
 before-stop hook or a `Stop()` that outlives its budget is abandoned in its
 goroutine, logged at `Error` level naming the service, and counted in
-`Metrics().AbandonedGoroutines`; the same applies to each wait a failed `Start`
+`Metrics().AbandonedGoroutines`; the same applies to the whole-`Stop` final wait
+for the instance goroutines and the log-pump, and to each wait a failed `Start`
 abandons when its rollback budget expires. `Done()` closes as soon as `Stop`
 returns even while such a goroutine still runs, so the counter is the only
 visibility into it. The library cannot
@@ -925,7 +926,7 @@ No manual gob encoding is required anywhere in user code.
 | `Restarts` | Self-heal re-launches: a fresh instance spawned after an instance exited on its own (crash, clean return, or a health-threshold cancellation) without a caller-initiated teardown. |
 | `HealthFails` | Failed periodic health probes, incremented once per failed probe rather than once per service that crossed the failure threshold. Probes issued on demand by `Health()` are not counted; the counter instruments the supervision loop. |
 | `CronFailures` | Cron tick invocations that failed: the tick's `Start` returned a non-`context.Canceled` error, or panicked. A tick skipped by `CronSkip` while the previous invocation is still running, and a tick cancelled by teardown, are not failures. Ticks are not counted as `Starts`, so this is the counter for per-tick cron activity. |
-| `AbandonedGoroutines` | Teardown goroutines abandoned because a deadline won: a blocking hook or `Stop()`, or a failed-`Start` wait that outlived its rollback budget. Monotonic — never decremented, since there is no reliable signal that an abandoned goroutine later returned — so a non-zero value means user code may be leaked for the process lifetime. |
+| `AbandonedGoroutines` | Teardown goroutines abandoned because a deadline won: a blocking hook or `Stop()`, the whole-`Stop` final wait for the instance goroutines and the log-pump, or a failed-`Start` wait that outlived its rollback budget. Monotonic — never decremented, since there is no reliable signal that an abandoned goroutine later returned — so a non-zero value means user code may be leaked for the process lifetime. |
 
 ```go
 stats := orch.Metrics()
