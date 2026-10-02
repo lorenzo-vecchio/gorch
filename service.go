@@ -395,16 +395,21 @@ var (
 	// ErrReentrantMembership is permanent: a membership operation re-entered
 	// from a service's own Start or Stop callback on the same goroutine (for
 	// example, a service stopping itself from its Start). It is a programming
-	// error, not a recoverable state: fix the code, do not retry. A collision
-	// with a reservation held by another goroutine instead returns the retryable
+	// error, not a recoverable state: fix the code, do not retry. The whole
+	// callback counts, not only the reservation window: a persistent service
+	// owns its Start goroutine for the instance's lifetime. A collision with a
+	// reservation held by another goroutine instead returns the retryable
 	// ErrMembershipBusy. Exported so callers can classify the rejection with
 	// errors.Is.
 	ErrReentrantMembership = errors.New("gorch: reentrant membership operation")
 	// ErrMembershipBusy is transient: a membership operation is blocked by an
-	// in-flight reservation on the target entry (another goroutine's Start,
-	// Stop, or group operation). Retryable: poll Busy(name) or retry once the
-	// reservation clears. Distinct from ErrReentrantMembership, a same-goroutine
-	// re-entry and a programming error.
+	// in-flight reservation on the target entry — another goroutine's start
+	// transaction, teardown, or group operation. Retryable: poll Busy(name) or
+	// retry once the reservation clears. A running persistent service is not
+	// reserved (its instance Start may still run) and a cron tick in flight does
+	// not reserve its entry, so neither makes a stop return this sentinel.
+	// Distinct from ErrReentrantMembership, a same-goroutine re-entry and a
+	// programming error.
 	ErrMembershipBusy = errors.New("gorch: membership operation blocked by an in-flight reservation")
 )
 

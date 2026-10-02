@@ -16,19 +16,24 @@ import (
 // re-run exception.
 //
 // StartService does not restart a live instance: to replace one, call
-// StopService and then StartService. A start that is already reserved — by
-// another StartService, a StartGroup, or the entry's own in-flight Start — is
-// rejected with the transient ErrMembershipBusy; a start re-entered from the
-// entry's own Start on the same goroutine is the programming error
-// ErrReentrantMembership. The reservation is claimed atomically with the start
-// decision under the membership lock (released before any user code), so a
-// concurrent StopService/Unregister cannot interleave between the checks and the
-// start to double-start or orphan an instance.
+// StopService and then StartService. A start that collides with a reservation
+// held by another goroutine — an in-flight start transaction, or a teardown
+// that has claimed the entry but not yet removed it — is rejected with the
+// transient ErrMembershipBusy (poll Busy). A start re-entered from the target's
+// own Start or Stop on the same goroutine is the permanent programming error
+// ErrReentrantMembership: a persistent service owns its Start goroutine for the
+// whole instance lifetime, so a self-start from that callback stays a re-entry
+// even after the reservation cleared and the entry reached StatusRunning. The
+// reservation is claimed atomically with the start decision under the membership
+// lock (released before any user code), so a concurrent StopService/Unregister
+// cannot interleave between the checks and the start to double-start or orphan
+// an instance.
 //
 // Every hard dependency (DependsOn) must be StatusRunning, or a runOnce gate
 // that has already reached StatusSucceeded, which satisfies the edge because a
 // gate that did its job is not a failed dependency. Returns ErrServiceNotFound
-// for an unknown name, ErrDependencyNotFound for a missing hard dependency,
+// for an unknown (or already removed) name, ErrDependencyNotFound for a missing
+// hard dependency,
 // ErrDependencyNotRunning when a hard dependency is neither running nor a
 // succeeded gate, ErrOrchestratorNotStarted before the orchestrator is started,
 // and ErrOrchestratorStopping/ErrOrchestratorStopped once whole-orchestrator
@@ -68,22 +73,25 @@ func (o *Orchestrator) StartService(name string) error {
 		unlock()
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
 	}
-	// A stopped entry is looked up before it is unregistered: treat a teardown in
-	// progress as already gone so nothing can restart it (C11).
-	if entry.removing.Load() {
+	// Classify reentrancy before contention, exactly as StopService/Unregister,
+	// ReplaceService, and UnregisterGroup do: a membership op re-entered from
+	// the target's own Start or Stop on the same goroutine is the permanent
+	// programming error, never the retryable collision. A persistent service's
+	// Start owns its goroutine for the whole instance lifetime, so a self-start
+	// from that callback is a re-entry even after the reservation cleared and
+	// the entry reached StatusRunning.
+	goid := curGoroutineID()
+	if entry.lifecycleOwnedBy(goid) {
 		unlock()
-		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
+		return fmt.Errorf("%w: %s", ErrReentrantMembership, name)
 	}
-	if entry.starting.Load() {
-		// A start reservation can be held either by this entry's own Start
-		// (same goroutine: a genuine re-entry, a programming error) or by
-		// another goroutine's start (a transient collision the caller may
-		// retry). Only goroutine identity can tell them apart.
-		owned := entry.lifecycleOwnedBy(curGoroutineID())
+	// A reservation held by another goroutine — an in-flight start transaction
+	// or a teardown — is a transient collision the caller may retry (poll Busy).
+	// An entry mid-teardown is rejected here rather than reported gone: it is
+	// still registered, so a StopService (as opposed to an Unregister) leaves it
+	// startable once the teardown completes.
+	if entry.removing.Load() || entry.starting.Load() {
 		unlock()
-		if owned {
-			return fmt.Errorf("%w: %s", ErrReentrantMembership, name)
-		}
 		return fmt.Errorf("%w: %s", ErrMembershipBusy, name)
 	}
 

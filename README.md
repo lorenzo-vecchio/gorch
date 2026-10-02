@@ -59,11 +59,11 @@ table below summarizes what may run concurrently with a live `Start`/`Stop`.
 | Method group | Concurrent with `Start`/`Stop` |
 |--------------|-------------------------------|
 | `Register`, `RegisterFunc` | Before `Start` the registry is static (whole graph validated at once). A hot add made while `Start` runs lands either in `Start`'s snapshot or, after it, live as `StatusRegistered` (never auto-started); before `Start` it is part of the static graph. It is rejected with `ErrOrchestratorStopping` while `Stop` runs and `ErrOrchestratorStopped` after `Stop`. |
-| `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning` (or is a `runOnce` gate that reached `StatusSucceeded`, which satisfies the edge); an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). It never restarts a live instance: to replace one, `StopService` and then `StartService` — and `StopService` is itself refused with `ErrHasDependents` while a hard dependent is `Running` or `Starting`, unless `WithCascadeStop` is used, so restarting a depended-on service bounces those dependents first. The start decision and its reservation are claimed atomically under the membership lock (released before any user code), so concurrent `StartService` calls cannot double-start or orphan an instance. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with another goroutine's reservation returns the transient `ErrMembershipBusy` (poll `Busy`); re-entering from the entry's own `Start` returns `ErrReentrantMembership`. |
+| `StartService` | Yes — starts a registered service once every hard dependency is `StatusRunning` (or is a `runOnce` gate that reached `StatusSucceeded`, which satisfies the edge); an already-`Running` persistent/cron entry is a no-op (a `runOnce` entry is the deliberate re-run exception). It never restarts a live instance: to replace one, `StopService` and then `StartService` — and `StopService` is itself refused with `ErrHasDependents` while a hard dependent is `Running` or `Starting`, unless `WithCascadeStop` is used, so restarting a depended-on service bounces those dependents first. The start decision and its reservation are claimed atomically under the membership lock (released before any user code), so concurrent `StartService` calls cannot double-start or orphan an instance. Returns `ErrOrchestratorNotStarted` before `Start`, and is rejected with an error once whole-orchestrator `Stop` has begun. A hard dependency must have been registered before the dependent, both statically and on a hot add. Colliding with a reservation held by *another* goroutine — an in-flight start transaction, or a teardown that has claimed the entry but not yet removed it — returns the transient `ErrMembershipBusy` (poll `Busy`); a start re-entered from the target's own `Start` or `Stop` on the same goroutine returns the permanent `ErrReentrantMembership`. A persistent service owns its `Start` goroutine for the instance's lifetime, so a self-start from that callback stays a re-entry even after the reservation cleared. |
 | `StopService`, `Unregister` | Yes — stop (keep registered) or stop-and-remove a service while the lifecycle runs. Serialized against each other and against `StartGroup`/`StopGroup` by the membership lock. A hard dependent that is `Running` or `Starting` blocks the call with `ErrHasDependents`, returned as a `*HasDependentsError` that names each blocker; every other dependent status — `Stopping`, `Registered`, `Crashed`, `Stopped`, `Succeeded` — does not block, so a plain stop proceeds and leaves the dependent untouched. With `WithCascadeStop`, every transitive hard dependent is stopped/removed in reverse topological order, except one already `Stopping`, which is left to its own in-flight teardown rather than stopped a second time (no double `Stop()` or hooks). A collision with another goroutine's in-flight reservation returns the transient `ErrMembershipBusy` (poll `Busy`), while a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
 | `ReplaceService` | Yes — atomically swaps a registered service's implementation while keeping its name in the graph, so hard dependents are not torn down or blocked. Serialized against `StartService`/`StopService`/`Unregister` and the group ops by the membership lock and the entry reservation. Unlike `StopService`, it applies no dependent guard and never cascades: `WithCascadeStop` is rejected with `ErrUnsupportedOption` and `Orphans` is accepted as a no-op. The old instance is torn down exactly as `StopService` would tear down the target, and only if that completes cleanly is `svc` installed and a fresh instance started; a timeout or a `Stop()` error aborts the swap and leaves the old implementation in place. `svc` goes through `Validator.Validate()`. The same hard-dependency gate as `StartService` applies, and the entry's registration-time config is frozen. Returns `ErrOrchestratorNotStarted` before `Start`, `ErrServiceNotFound` for an unknown name, and is gated by shutdown like the other membership ops; a collision returns `ErrMembershipBusy` and a re-entry from the target's own `Start`/`Stop` returns `ErrReentrantMembership`. |
 | `Start`, `Stop` | Yes — against each other. The lifecycle is single-shot and each entry point is guarded by its own `sync.Once`. Concurrent `Start` calls are claimed atomically: the caller that wins the claim runs the start and every other caller returns `ErrAlreadyStarted` immediately, without waiting for the winner, so a `nil` return always identifies the call that actually ran it. Concurrent `Stop` calls are a no-op for the losers: the first runs the shutdown, the others return `nil` once it completes and do not observe its errors. After a successful `Stop` neither can run again; a failed `Start` does not consume the lifecycle and may be retried. `Stop`'s `timeout` bounds the whole shutdown, including every service's before/after-stop hooks and `Stop()` call. |
-| `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Dependents`, `DependenciesOf`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Dependents`/`DependenciesOf` walk the hard-dependency edges under the graph lock and return snapshots. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation, and is the only observable for the reservation window. |
+| `Status`, `Statuses`, `Names`, `Count`, `CountRunning`, `RunningNames`, `Dependents`, `DependenciesOf`, `Busy` | Yes — safe to read while services run, while membership churns, and during shutdown. `Count`/`Names`/`Statuses` are the **registered** surface (a hot-added, not-yet-started entry and a staged cron entry both appear as `StatusRegistered`); `CountRunning`/`RunningNames` are the `StatusRunning` subset, so `"N of M running"` is `CountRunning()` of `Count()`. `Dependents`/`DependenciesOf` walk the hard-dependency edges under the graph lock and return snapshots. `Busy(name)` is the predicate for the transient `ErrMembershipBusy`: it reports whether a registered entry currently holds an in-flight reservation — an active start transaction or teardown — and is the only observable for that window. It is not "a live instance": once a persistent service's goroutine is spawned the transaction is complete and `Busy` is false for the rest of the instance's life, and a cron entry is never busy while its schedule is installed, so neither a running persistent service nor an in-flight cron tick makes a stop return `ErrMembershipBusy`. |
 | `Health`, `IsReady`, `WaitFor` | Yes — each probe/tick takes its own read lock; `IsReady` honors the caller's `ctx`. |
 | `Metrics`, `Done` | Yes — atomic counters and a shutdown-completed channel created once in `New` and returned unchanged. |
 | `StartGroup`, `StopGroup` | Drive one group per orchestrator. Serialized with `StopService`/`Unregister` by the membership lock; a group start reserves each member and rolls back the members it already started if a later one fails, and a group stop honours a concurrent start's reservation by skipping that entry. `StartGroup` before `Start` returns `ErrOrchestratorNotStarted` (a member would otherwise build its context from a nil parent), while `StopGroup` before `Start` is a no-op returning `nil`, consistent with `StopService`/`Unregister`. An unknown or empty group selects nothing and returns `nil`: a group is a filter tag, not a registered entity. Both are gated by shutdown (`ErrOrchestratorStopping`/`ErrOrchestratorStopped`). Group ops are not synchronized with the whole-orchestrator `Start`/`Stop` beyond those gates: do not drive them from inside a concurrent `Start`/`Stop`. |
@@ -116,9 +116,12 @@ These guarantees are part of the public API and are relied upon by callers.
   dependent to its own teardown instead of stopping it twice. Soft dependencies
   never block and are never cascaded. A membership
   op re-entered from the target's own `Start`/`Stop` returns
-  `ErrReentrantMembership` (a programming error), while one colliding with
-  another goroutine's in-flight reservation returns the retryable
-  `ErrMembershipBusy`; `Busy(name)` observes the latter without racing.
+  `ErrReentrantMembership` (a programming error), while one colliding with a
+  reservation held by another goroutine — an in-flight start transaction or
+  teardown — returns the retryable `ErrMembershipBusy`; `Busy(name)` observes
+  the latter without racing. The reservation is the membership transaction, not
+  a service's own callback: a running persistent service and an in-flight cron
+  tick are not reserved, so stopping them is an ordinary stop.
 - **Whole-orchestrator lifecycle is single-shot.** After a successful `Stop`,
   neither `Start` nor `Register` can be used again; `Start` returns
   `ErrAlreadyStarted` and `Register` returns `ErrOrchestratorStopped`. A failed
@@ -193,11 +196,11 @@ Sentinel errors returned by the orchestrator:
 | `ErrHookTimeout` | `Stop`, `StopService`, `Unregister`, `ReplaceService`, `Start` (failed-start rollback) | A before-stop hook overran the share of the deadline reserved for it. Always joined with `ErrStopTimeout`, so callers that only classify whole-stop timeouts still match. On the stop methods the teardown is unverified, so the entry stays `StatusStopping` (and `ReplaceService` does not swap); on a failed `Start` the rollback resets it to `StatusRegistered`. |
 | `ErrNilService` | `Register`, `RegisterFunc`, `ReplaceService` | A nil `Service`, or a nil `Start` closure passed to `RegisterFunc`. |
 | `ErrOrchestratorNotStarted` | `StartService`, `StartGroup`, `ReplaceService` | Called before the orchestrator was started, so there is no service context or scheduler yet. |
-| `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
-| `ErrMembershipBusy` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | A membership op collided with a reservation held by another goroutine's in-flight `Start`/`Stop`/group operation. Transient: poll `Busy(name)` or retry once the reservation clears. |
+| `ErrReentrantMembership` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | A membership op re-entered from the target's own `Start`/`Stop` on the same goroutine (e.g. a service stopping itself from its `Start`). The whole callback counts, so a persistent service self-starting from its `Start` is a re-entry for the instance's lifetime, not the running-service no-op an external caller gets. A programming error: fix the code, do not retry. Group ops skip a reserved entry instead of returning it. |
+| `ErrMembershipBusy` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | A membership op collided with a reservation held by another goroutine — an in-flight start transaction, a teardown, or a group operation. Not a running persistent service or an in-flight cron tick (those are ordinary stops). Transient: poll `Busy(name)` or retry once the reservation clears. |
 | `ErrInvalidBufferSize` | `SubscribeWithBuffer` | The buffer capacity was negative. A permanent caller bug: fix the size, do not retry. |
 | `ErrNilContext` | `Request`, `RequestAsync`, `TypedRequest` | A nil `context.Context` was passed. A permanent caller bug: pass `context.Background()` for no cancellation or deadline, do not retry. |
-| `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | No registered service has that name. |
+| `ErrServiceNotFound` | `StartService`, `StopService`, `Unregister`, `ReplaceService` | No registered service has that name (or it has already been `Unregister`ed). An entry mid-teardown is still registered and reports `ErrMembershipBusy`, not this. |
 | `ErrHasDependents` | `StopService`, `Unregister` | A stop/removal would break a hard dependent that is `Running` or `Starting`. Returned as a `*HasDependentsError` whose `Name` is the target and whose `Dependents` names each blocker (the same set as `Dependents(name)`). Pass `WithCascadeStop` to tear those dependents down too. Dependents in `Stopping`, `Registered`, `Crashed`, `Stopped`, or `Succeeded` do not block. |
 | `ErrDependencyNotFound` | `StartService`, `Register`, `ReplaceService` | A hard dependency is not registered (dynamically removed, or never added). |
 | `ErrDependencyNotRunning` | `StartService`, `ReplaceService` | A hard dependency exists but is neither `StatusRunning` nor a `runOnce` gate in `StatusSucceeded`. |
@@ -453,11 +456,27 @@ A membership operation can be blocked by an in-flight reservation on the target,
 and the sentinel tells the caller which situation it is in. A genuine
 same-goroutine re-entry — a service calling a membership op on itself from its
 own `Start` or `Stop` — is a programming error and returns
-`ErrReentrantMembership`; it must never be retried. A collision with a
-reservation held by *another* goroutine's in-flight `Start`/`Stop`/group
-operation is benign and transient, and returns `ErrMembershipBusy`: the
-reservation is released when that operation returns, so poll `Busy(name)` (or
-retry) instead of racing.
+`ErrReentrantMembership`; it must never be retried. The whole callback counts:
+a persistent service owns its `Start` goroutine for the instance's lifetime, so
+`StartService("self")` from that goroutine is a re-entry even after the entry
+reached `StatusRunning`, not the idempotent no-op an *external* caller gets. A
+collision with a reservation held by *another* goroutine's in-flight start
+transaction, teardown, or group operation is benign and transient, and returns
+`ErrMembershipBusy`: the reservation is released when that operation returns, so
+poll `Busy(name)` (or retry) instead of racing.
+
+**The reservation is the membership transaction, not a live instance.** A
+persistent service's user `Start` runs in the instance goroutine for the whole
+time the service is up, long after the start transaction committed; the entry is
+`StatusRunning` and `Busy(name)` is `false` throughout. Stopping such a service
+is therefore an ordinary stop (`nil`, or `ErrStopTimeout` if it will not exit),
+never `ErrMembershipBusy`. A cron entry likewise holds no reservation while its
+schedule is installed: a tick in flight is reached through the schedule's shared
+context, not through a reservation, so `Busy(name)` is `false` and a stop
+cancels the tick rather than colliding. `Busy` turns `true` only while a
+`StartService`/`StartGroup`/`ReplaceService` start transaction, or a
+`StopService`/`Unregister`/`StopGroup` teardown, has claimed the entry and has
+not yet returned.
 
 **Status reports the lifecycle, `Busy` reports the reservation.** The two are
 deliberately separate, and the gap between them is the reservation window:
@@ -581,7 +600,7 @@ runningCount := orch.CountRunning()        // number of StatusRunning services (
 runningNames := orch.RunningNames()        // []string of StatusRunning services
 blockers, err := orch.Dependents("db")     // transitive hard dependents blocking a stop (reverse topo)
 deps, err := orch.DependenciesOf("api")    // direct hard dependencies in declaration order
-busy := orch.Busy("db")                    // true if an in-flight reservation blocks membership ops
+busy := orch.Busy("db")                    // true while another goroutine's start/teardown transaction holds "db"
 ```
 
 `Count`, `Names`, and `Statuses` are the **registered** surface: an entry appears

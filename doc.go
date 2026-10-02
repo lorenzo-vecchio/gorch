@@ -58,8 +58,13 @@
 //     and never restarts a live instance: replacing one is the explicit
 //     StopService + StartService. Its start decision and reservation are claimed
 //     atomically, so concurrent calls start exactly one instance and a collision
-//     with another goroutine's in-flight reservation is the transient
-//     ErrMembershipBusy (a runOnce entry is the deliberate re-run exception).
+//     with a reservation held by another goroutine — an in-flight start
+//     transaction or teardown — is the transient ErrMembershipBusy (a runOnce
+//     entry is the deliberate re-run exception). A membership op re-entered from
+//     the target's own Start/Stop on the same goroutine is instead the permanent
+//     ErrReentrantMembership; a persistent service owns its Start goroutine for
+//     the instance's lifetime, so a self-start from that callback stays a
+//     re-entry even after the reservation cleared.
 //   - ReplaceService swaps a registered service's implementation without
 //     removing its name from the graph, so its hard dependents are neither torn
 //     down nor blocked: a concurrent Register/Status/Dependents/IsReady always
@@ -127,10 +132,13 @@
 //     read the hard-dependency edges in the reverse and forward directions
 //     respectively: Dependents is the blocking set a plain stop is refused on,
 //     so it excludes soft and non-blocking dependents, while DependenciesOf is
-//     the direct hard dependencies. A start reservation is not
+//     the direct hard dependencies. A reservation is not
 //     encoded in status: an entry actively starting still reports its prior
 //     status until startOneService commits StatusStarting, so poll Busy(name)
-//     for an in-flight reservation. For a cron entry StatusRunning means the
+//     for an in-flight reservation. Busy is the membership transaction, not a
+//     live instance: a running persistent service and a cron entry with a tick
+//     in flight are not reserved, so neither makes a stop collide. For a cron
+//     entry StatusRunning means the
 //     schedule is installed, not that a tick is working: a tick that returns an
 //     error or panics only logs and increments Metrics().CronFailures, and
 //     IsReady and Health inherit that scheduling-fact reading.
@@ -215,9 +223,13 @@
 //   - A membership op blocked by an in-flight reservation is classified by
 //     cause: re-entry from the target's own Start/Stop on the same goroutine is
 //     a programming error and returns ErrReentrantMembership, while a collision
-//     with another goroutine's reservation is transient and returns the
-//     retryable ErrMembershipBusy. Busy(name) is the predicate a caller can poll
-//     to observe the reservation instead of racing.
+//     with a reservation held by another goroutine (a start transaction or a
+//     teardown) is transient and returns the retryable ErrMembershipBusy.
+//     Busy(name) is the predicate a caller can poll to observe the reservation
+//     instead of racing. The re-entry rule covers the whole callback, so a
+//     persistent service self-starting from its Start is a re-entry for the
+//     instance's lifetime, and the reservation is the transaction, so a running
+//     persistent service or an in-flight cron tick is never busy.
 //   - A failed Start rolls back within a bounded budget: services that had
 //     started are stopped in reverse topological order (the same order as Stop),
 //     so a dependency is never torn down before its dependent regardless of

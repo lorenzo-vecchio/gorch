@@ -648,6 +648,120 @@ func TestBusy(t *testing.T) {
 	}
 }
 
+// TestBusy_DuringPersistentStart pins the reservation boundary for a persistent
+// service: the reservation is the start transaction, not the instance's user
+// Start. Once the instance goroutine is spawned the entry is StatusRunning and
+// Busy is false for the rest of its life, stopping it is an ordinary stop, and a
+// self-start from its own Start goroutine is a re-entry (the whole callback is
+// owned), not the idempotent no-op an external caller gets.
+func TestBusy_DuringPersistentStart(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	entered := make(chan struct{})
+	nested := make(chan error, 1)
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		nested <- o.StartService("p")
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	if err := o.Register(svc, WithName("p")); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("p"); err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("persistent Start never ran")
+	}
+
+	if o.Busy("p") {
+		t.Error("a persistent service whose Start is running must not report busy")
+	}
+	if s, _ := o.Status("p"); s != StatusRunning {
+		t.Errorf("status while Start runs = %v, want %v", s, StatusRunning)
+	}
+
+	select {
+	case err := <-nested:
+		if !errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("StartService from own Start = %v, want ErrReentrantMembership", err)
+		}
+		if errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("StartService from own Start = %v, must not be ErrMembershipBusy", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartService from own Start did not return")
+	}
+
+	if err := o.StopService("p", time.Second); err != nil {
+		t.Fatalf("StopService on a running persistent service = %v, want nil (ordinary stop)", err)
+	}
+	if s, _ := o.Status("p"); s != StatusStopped {
+		t.Errorf("status after stop = %v, want %v", s, StatusStopped)
+	}
+}
+
+// TestBusy_DuringCronTick pins the reservation boundary for a cron entry: a tick
+// in flight is reached through the schedule's shared context, never through a
+// reservation, so Busy is false and the entry stays StatusRunning. A self-start
+// from the tick's own goroutine is a re-entry.
+func TestBusy_DuringCronTick(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer o.Stop(time.Second)
+
+	entered := make(chan struct{})
+	nested := make(chan error, 1)
+	var once sync.Once
+	svc := &testSvc{startFn: func(ctx context.Context) error {
+		once.Do(func() {
+			nested <- o.StartService("c")
+			close(entered)
+		})
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	if err := o.Register(svc, WithName("c"), WithCron("* * * * * *", CronParallel)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartService("c"); err != nil {
+		t.Fatalf("StartService cron: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cron tick never ran")
+	}
+
+	if o.Busy("c") {
+		t.Error("a cron entry with a tick in flight must not report busy")
+	}
+	if s, _ := o.Status("c"); s != StatusRunning {
+		t.Errorf("status with a tick in flight = %v, want %v", s, StatusRunning)
+	}
+
+	select {
+	case err := <-nested:
+		if !errors.Is(err, ErrReentrantMembership) {
+			t.Fatalf("StartService from own tick = %v, want ErrReentrantMembership", err)
+		}
+		if errors.Is(err, ErrMembershipBusy) {
+			t.Fatalf("StartService from own tick = %v, must not be ErrMembershipBusy", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartService from own tick did not return")
+	}
+}
+
 // TestCascade_StartingDependentBlocks pins the dependency guard's boundary: a
 // hard dependent that is Starting (a reserved, explicit state) blocks a plain
 // stop exactly like a Running one, and cascade overrides it.
