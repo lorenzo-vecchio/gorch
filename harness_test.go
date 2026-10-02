@@ -484,15 +484,28 @@ func assertNoLeak(t *testing.T, o *Orchestrator, base leakBaseline) {
 // ── harness self-tests ──
 
 // TestHarness_RecordingServiceRecordsLifecycle proves the workhorse records
-// starts, stops, exits and their order, so the matrix tests can trust it.
+// starts, stops, exits and their order, so the matrix tests can trust it. The
+// double is driven directly rather than through Stop(): the orchestrator
+// cancels every instance context while it tears the graph down, so whether a
+// cancelled instance records its exit before or after Stop() records the stop
+// is a scheduling race, not a contract. Asserting the order through the
+// orchestrator would make this a test of the scheduler instead of the double.
 func TestHarness_RecordingServiceRecordsLifecycle(t *testing.T) {
-	o := newGraph(t).service("svc", newRecordingService()).start()
-
-	svc := mustEntry(t, o, "svc").getSvc().(*recordingService)
+	svc := newRecordingService()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ServiceContext{Context: ctx}) }()
 	waitForCondition(t, 3*time.Second, func() bool { return svc.startCount() == 1 }, "service to start")
 
-	if got := o.Stop(3 * time.Second); got != nil {
-		t.Fatalf("Stop = %v, want nil", got)
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("Stop = %v, want nil", err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = %v, want context.Canceled", err)
+	}
+	if svc.startCount() != 1 {
+		t.Errorf("start count = %d, want 1", svc.startCount())
 	}
 	if svc.stopCount() != 1 {
 		t.Errorf("stop count = %d, want 1", svc.stopCount())
@@ -504,7 +517,7 @@ func TestHarness_RecordingServiceRecordsLifecycle(t *testing.T) {
 	if err := svc.exitError(); !errors.Is(err, context.Canceled) {
 		t.Errorf("exit error = %v, want context.Canceled", err)
 	}
-	want := []string{"start#1", "exit#1", "stop#1"}
+	want := []string{"start#1", "stop#1", "exit#1"}
 	if got := svc.eventLog(); !equalStringSlices(got, want) {
 		t.Errorf("event log = %v, want %v", got, want)
 	}
