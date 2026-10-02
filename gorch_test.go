@@ -1560,7 +1560,7 @@ func TestLogPump(t *testing.T) {
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
-		go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+		go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 
 		o.logCh <- logEntry{
 			time:    time.Date(2026, 1, 2, 15, 4, 5, 123456789, time.UTC),
@@ -1603,7 +1603,7 @@ func TestLogPump(t *testing.T) {
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
-		go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+		go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 
 		o.logCh <- logEntry{
 			time:    time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC),
@@ -1636,7 +1636,7 @@ func TestLogPump(t *testing.T) {
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
-		go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+		go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 
 		o.logCh <- logEntry{
 			time:    time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC),
@@ -1672,7 +1672,7 @@ func TestLogPump(t *testing.T) {
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
-		go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+		go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 
 		o.logCh <- logEntry{
 			time:    time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC),
@@ -1705,7 +1705,7 @@ func TestLogPump(t *testing.T) {
 		o.logCh = make(chan logEntry, 256)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
-		go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+		go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 
 		o.logCh <- logEntry{
 			time:  time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC),
@@ -1754,7 +1754,7 @@ func TestLogPump(t *testing.T) {
 		o.logPumpDone = make(chan struct{})
 		done := make(chan struct{})
 		go func() {
-			o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+			o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 			close(done)
 		}()
 		close(o.logQuit)
@@ -1783,7 +1783,7 @@ func TestLogPump_DrainsBufferedOnQuit(t *testing.T) {
 		o.logCh <- logEntry{time: time.Now(), level: LogLevelInfo, service: "svc", msg: "buffered"}
 	}
 	close(o.logQuit)
-	go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+	go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 	<-o.logPumpDone
 
 	w.Close()
@@ -2003,6 +2003,57 @@ func TestMessenger_SubscribePublish(t *testing.T) {
 		}
 		wg.Wait()
 	})
+}
+
+// TestRunService_LogPumpCapturesStderrAtStart pins the log-pump's destination
+// to the os.Stderr value captured when the pump started: reassigning os.Stderr
+// afterwards must not redirect an already-running pump (which would also race
+// the reassignment, since the pump writes from its own goroutine).
+func TestRunService_LogPumpCapturesStderrAtStart(t *testing.T) {
+	firstR, firstW, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = firstW
+	defer func() { os.Stderr = old }()
+
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	emitted := make(chan struct{})
+
+	o := New(WithLogLevel(LogLevelError))
+	if err := o.RegisterFunc("svc", func(ctx ServiceContext) error {
+		close(ready)
+		<-release
+		ctx.Logger.Error("after-reassignment")
+		close(emitted)
+		return nil
+	}, nil); err != nil {
+		t.Fatalf("RegisterFunc: %v", err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	<-ready
+
+	secondR, secondW, _ := os.Pipe()
+	os.Stderr = secondW
+
+	close(release)
+	<-emitted
+	if err := o.Stop(2 * time.Second); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	_ = firstW.Close()
+	_ = secondW.Close()
+	firstOut, _ := io.ReadAll(firstR)
+	secondOut, _ := io.ReadAll(secondR)
+
+	if !strings.Contains(string(firstOut), "after-reassignment") {
+		t.Fatalf("pump did not write to the stderr captured at start; first pipe got %q", firstOut)
+	}
+	if strings.Contains(string(secondOut), "after-reassignment") {
+		t.Fatalf("pump followed a later os.Stderr reassignment; second pipe got %q", secondOut)
+	}
 }
 
 // ── runService error logging ──
@@ -6748,7 +6799,7 @@ func TestStartGroup_Complete(t *testing.T) {
 		o.logCh = make(chan logEntry, 1)
 		o.logQuit = make(chan struct{})
 		o.logPumpDone = make(chan struct{})
-		go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+		go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 
 		s1 := &testSvc{
 			startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
@@ -6869,7 +6920,7 @@ func TestStartGroup_PartialFailureRollsBack(t *testing.T) {
 	o.logCh = make(chan logEntry, 1)
 	o.logQuit = make(chan struct{})
 	o.logPumpDone = make(chan struct{})
-	go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+	go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 	defer func() {
 		o.cancel()
 		close(o.logQuit)
@@ -7109,7 +7160,7 @@ func TestStopGroup_StopError(t *testing.T) {
 	o.logCh = make(chan logEntry, 1)
 	o.logQuit = make(chan struct{})
 	o.logPumpDone = make(chan struct{})
-	go o.logPump(o.logCh, o.logQuit, o.logPumpDone)
+	go o.logPump(os.Stderr, o.logCh, o.logQuit, o.logPumpDone)
 	o.statusMu = sync.RWMutex{}
 
 	e := &serviceEntry{
