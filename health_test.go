@@ -476,7 +476,8 @@ func TestRunHealthChecks_NonHealthCheckerSkipped(t *testing.T) {
 	o.runHealthChecks() // should skip e1 without panic
 }
 
-// ── BeforeHealthCheck / AfterHealthCheck ──
+// TestHealthCheckHooks pins the BeforeHealthCheck/AfterHealthCheck hooks: the
+// periodic loop fires before each probe and reports the probe result after it.
 func TestHealthCheckHooks(t *testing.T) {
 	o := New(
 		WithHealthChecks(50*time.Millisecond, WithProbeTimeout(500*time.Millisecond), WithFailureThreshold(3)),
