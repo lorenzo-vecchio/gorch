@@ -3,6 +3,8 @@ package gorch
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -54,6 +56,36 @@ func totalEntryOwnerCount(o *Orchestrator) int {
 		total += len(entryOwnerIDs(e))
 	}
 	return total
+}
+
+// ownerMapsConsistentSnapshot returns a single consistent view of both owner
+// maps: the root Messenger's live owner count and the summed live owner count
+// across every registered entry, read under one root-lock hold.
+//
+// The root map and the entry maps are mutated by separate locks, and newOwner
+// registers in the root before recording on the entry while every release path
+// removes from the entry before draining the root. Reading the root count and
+// the entry counts under separate locks therefore lets a sampler observe a
+// half-applied newOwner — root already inserted, entry not yet recorded — which
+// shows up as a spurious "root < entry" even though the implementation is
+// correct (#72). Holding the root lock across both reads blocks registerOwner
+// and drainOwner for the whole snapshot, so the transition cannot be sampled
+// mid-flight. No owner path holds an entry lock while taking the root lock
+// (releaseOwner and drainService release ownerMu before calling drainOwner), so
+// this lock order cannot deadlock.
+func ownerMapsConsistentSnapshot(o *Orchestrator) (root, total int) {
+	o.mu.RLock()
+	entries := make([]*serviceEntry, len(o.entries))
+	copy(entries, o.entries)
+	o.mu.RUnlock()
+
+	m := o.messenger.root()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, e := range entries {
+		total += len(entryOwnerIDs(e))
+	}
+	return len(m.owners), total
 }
 
 // restartProbeSvc blocks in Start until the test crashes it (or the entry's
@@ -475,4 +507,88 @@ func TestOwners_DrainedOwnerCannotResubscribe(t *testing.T) {
 	}
 
 	_ = o.Stop(time.Second)
+}
+
+// TestOwnerMapsConsistentSnapshot_DetectsStaleEntryOwner pins the detector the
+// fuzz invariant is built on: the atomic snapshot must still report root < entry
+// when an entry holds an id the root map never saw — the stale-entry state a
+// release path that drained the root before the entry would leave. Without this,
+// making the check race-free could have hollowed it out into one that no longer
+// catches a genuine missed release.
+func TestOwnerMapsConsistentSnapshot_DetectsStaleEntryOwner(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	if err := o.Register(&namedSvc{}, WithName("s")); err != nil {
+		t.Fatal(err)
+	}
+	entry := entryNamed(t, o, "s")
+
+	// No owners anywhere: the pair is consistent (0 >= 0).
+	if root, total := ownerMapsConsistentSnapshot(o); root < total {
+		t.Fatalf("empty snapshot = root %d, entry sum %d, want root >= entry", root, total)
+	}
+
+	// A matched owner on both maps is consistent and exactly one on each side.
+	owner := o.newOwner(entry)
+	if root, total := ownerMapsConsistentSnapshot(o); root != 1 || total != 1 {
+		t.Fatalf("matched snapshot = root %d, entry sum %d, want 1 and 1", root, total)
+	}
+
+	// Record an id on the entry without registering it in the root: the stale
+	// state a missed root release leaves. The snapshot must expose root < entry,
+	// the condition the fuzz assertion turns into a failure.
+	entry.addOwner(1 << 62)
+	root, total := ownerMapsConsistentSnapshot(o)
+	if root >= total {
+		t.Fatalf("snapshot hid a stale entry owner: root %d, entry sum %d, want root < entry", root, total)
+	}
+
+	o.releaseOwner(entry, owner.id)
+}
+
+// TestOwnerMapsConsistentSnapshot_StableDuringOwnerChurn is the regression guard
+// for #72. A goroutine continuously mints and releases owners — the
+// root-then-entry insert of newOwner and the entry-then-root release of
+// releaseOwner — while the test samples both maps through the snapshot. The old
+// two-separate-lock check could read the root just before an insert and the
+// entries just after it and fail spuriously; the snapshot holds the root lock
+// across both reads, so no half-applied transition is observable and the
+// invariant never reports a false positive.
+func TestOwnerMapsConsistentSnapshot_StableDuringOwnerChurn(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
+	const entryCount = 16
+	entries := make([]*serviceEntry, 0, entryCount)
+	for i := 0; i < entryCount; i++ {
+		name := fmt.Sprintf("s-%d", i)
+		if err := o.Register(&namedSvc{}, WithName(name)); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, entryNamed(t, o, name))
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 5000; i++ {
+			e := entries[i%len(entries)]
+			o.releaseOwner(e, o.newOwner(e).id)
+		}
+	}()
+
+	close(start)
+	for i := 0; i < 5000; i++ {
+		if root, total := ownerMapsConsistentSnapshot(o); root < total {
+			t.Fatalf("owner churn produced a false positive: root %d < entry sum %d", root, total)
+		}
+	}
+	wg.Wait()
+
+	// Once the churn goroutine has completed every cycle, both maps must be
+	// empty again; the sampling above must not have perturbed the bookkeeping.
+	root, total := ownerMapsConsistentSnapshot(o)
+	if root != 0 || total != 0 {
+		t.Fatalf("after churn: root %d, entry sum %d, want 0 and 0", root, total)
+	}
 }
