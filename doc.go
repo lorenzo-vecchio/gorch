@@ -156,7 +156,8 @@
 //     dependency that is either StatusRunning or a runOnce gate in
 //     StatusSucceeded.
 //   - A teardown goroutine abandoned because a deadline won — a before-stop
-//     hook or Stop() that did not return in time, or a failed-Start wait that
+//     hook or Stop() that did not return in time, the whole-Stop final wait for
+//     the instance goroutines and the log-pump, or a failed-Start wait that
 //     outlived its rollback budget — is logged at Error level naming the
 //     service and counted in the monotonic Metrics().AbandonedGoroutines.
 //     Done() closes as soon as Stop returns even while such a goroutine still
