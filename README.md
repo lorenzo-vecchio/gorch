@@ -2,6 +2,14 @@
 
 Manage goroutine lifecycles — start, stop, cron scheduling, pub-sub messaging, dependency ordering, health checks, and self-healing — with a small, composable API.
 
+![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lorenzo-vecchio/gorch/main/.github/badges/coverage.json)
+![library LOC](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lorenzo-vecchio/gorch/main/.github/badges/loc-library.json)
+![test LOC](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lorenzo-vecchio/gorch/main/.github/badges/loc-tests.json)
+![benchmark LOC](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lorenzo-vecchio/gorch/main/.github/badges/loc-bench.json)
+![tooling LOC](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lorenzo-vecchio/gorch/main/.github/badges/loc-tooling.json)
+![examples LOC](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lorenzo-vecchio/gorch/main/.github/badges/loc-examples.json)
+![total LOC](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/lorenzo-vecchio/gorch/main/.github/badges/loc-total.json)
+
 ```go
 import "github.com/lorenzo-vecchio/gorch"
 ```
@@ -1054,6 +1062,16 @@ See the [release notes](https://github.com/lorenzo-vecchio/gorch/releases) for u
 - [`examples/pubsub/`](examples/pubsub/) — Inter-service messaging with topics.
 - [`examples/typedreq/`](examples/typedreq/) — Typed request-reply via `TypedRequest`/`TypedRespond`.
 - [`examples/advanced/`](examples/advanced/) — Groups, labels, hooks, health checks, and more.
+
+## Statistics
+
+Statement coverage and the line breakdown (code / comment / blank) by category,
+refreshed from the release tag by
+[`.github/workflows/stats.yml`](.github/workflows/stats.yml). The numbers describe
+the release named in the block, never a moving `main`; the badges above are read
+from the generated JSON, so neither needs a hand edit.
+
+<!-- stats:begin --><!-- stats:end -->
 
 ## Development
 

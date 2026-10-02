@@ -2,6 +2,9 @@
 coverage*.out
 coverage*.html
 
+# Python bytecode (the release-stats renderer under .github/scripts)
+__pycache__/
+
 # Agent tooling (BMAD, AI assistants, code intelligence)
 _bmad/
 _bmad-output/
