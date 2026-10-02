@@ -1059,9 +1059,12 @@ func (o *Orchestrator) Start() error {
 			}
 		}
 
-		// Spawn log-pump goroutine (default logger only).
+		// Spawn log-pump goroutine (default logger only). Capture the log
+		// destination here, on the Start caller's goroutine, so the pump never
+		// reads the process-global os.Stderr concurrently with a caller that
+		// reassigns it to redirect process logging.
 		if o.cfg.Logger == nil {
-			go o.logPump(logCh, logQuit, logPumpDone)
+			go o.logPump(os.Stderr, logCh, logQuit, logPumpDone)
 		}
 
 		// Set up and start the cron scheduler.

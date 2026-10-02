@@ -2,7 +2,7 @@ package gorch
 
 import (
 	"fmt"
-	"os"
+	"io"
 	"time"
 )
 
@@ -40,21 +40,26 @@ type logEntry struct {
 }
 
 // logPump drains the log channel until logQuit is closed, then signals done.
-// The channels are passed in rather than read from the Orchestrator so a
-// best-effort reset that clears the orchestrator's fields while the pump is
-// still winding down cannot race the pump.
-func (o *Orchestrator) logPump(logCh chan logEntry, logQuit, done chan struct{}) {
+// The channels and destination are passed in rather than read from the
+// Orchestrator so a best-effort reset that clears the orchestrator's fields
+// while the pump is still winding down cannot race the pump.
+//
+// The destination is captured once, when the pump starts, instead of reading
+// os.Stderr on every entry. Reading the process-global from this background
+// goroutine would race any reassignment of os.Stderr, which is a supported
+// pattern for a caller redirecting the process's logging.
+func (o *Orchestrator) logPump(out io.Writer, logCh chan logEntry, logQuit, done chan struct{}) {
 	defer close(done)
 	for {
 		select {
 		case entry := <-logCh:
-			o.emitLog(entry)
+			o.emitLog(out, entry)
 		case <-logQuit:
 			// Drain remaining buffered entries, then exit.
 			for {
 				select {
 				case entry := <-logCh:
-					o.emitLog(entry)
+					o.emitLog(out, entry)
 				default:
 					return
 				}
@@ -63,9 +68,9 @@ func (o *Orchestrator) logPump(logCh chan logEntry, logQuit, done chan struct{})
 	}
 }
 
-// emitLog formats and writes a single log entry to stderr, respecting the
+// emitLog formats and writes a single log entry to out, respecting the
 // configured minimum log level.
-func (o *Orchestrator) emitLog(entry logEntry) {
+func (o *Orchestrator) emitLog(out io.Writer, entry logEntry) {
 	if entry.level < o.cfg.LogLevel {
 		return
 	}
@@ -84,7 +89,7 @@ func (o *Orchestrator) emitLog(entry logEntry) {
 		}
 		argsStr += fmt.Sprintf("%v=(missing)", entry.args[len(entry.args)-1])
 	}
-	_, _ = fmt.Fprintf(os.Stderr, "%s %-5s %s --- %s %s\n",
+	_, _ = fmt.Fprintf(out, "%s %-5s %s --- %s %s\n",
 		ts, levelStr, entry.service, entry.msg, argsStr)
 }
 
