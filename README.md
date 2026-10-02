@@ -76,7 +76,7 @@ responsibilities between `doc.go` and this README is stated in
 - [Versioning and breaking changes](#versioning-and-breaking-changes)
 - [Upgrading](#upgrading)
   - [Breaking changes by release](#breaking-changes-by-release)
-  - [API added since v0.9.0](#api-added-since-v090)
+  - [API added in v0.10.0](#api-added-in-v0100)
   - [Silent behaviour changes](#silent-behaviour-changes)
 - [Pitfalls and gotchas](#pitfalls-and-gotchas)
 - [Performance](#performance)
@@ -1200,11 +1200,17 @@ to change.
 | v0.9.0 | Caller deadline bounds the whole stop | a blocking hook could outlast the deadline | hooks are capped and an overrun is `ErrHookTimeout` |
 | v0.9.0 | `StartService` before `Start` | panicked on a nil scheduler | returns `ErrOrchestratorNotStarted` |
 | v0.9.0 | Hot-added cron entries are staged | ticked immediately as `StatusRegistered` | registered but not scheduled until `StartService` |
+| v0.10.0 | User-code panics are contained | a panic in a hook, `Validator`, start condition or health/readiness probe unwound through the public API | recovered and returned as an error (or as unhealthy/unready) |
+| v0.10.0 | Public entry points validate instead of panicking | `Register(nil)`, a nil `RegisterFunc` start, a negative `SubscribeWithBuffer` capacity, a nil `Request` context, `StartGroup` before `Start`, and a zero-value `Orchestrator` all panicked or deferred a panic | the new `ErrNilService`, `ErrInvalidBufferSize`, `ErrNilContext`, and `ErrOrchestratorNotStarted`; a zero-value `Orchestrator` is usable |
+| v0.10.0 | `WithCron` is validated at `Register` | an empty spec silently registered a non-cron service and a malformed one was deferred to `Start` | both the static and hot-add paths reject `ErrInvalidCron` |
+| v0.10.0 | Concurrent `Start` is claimed atomically | a second caller could return `nil` while the winner's `Start` failed | the loser returns `ErrAlreadyStarted` immediately; `nil` identifies the caller that ran the start |
+| v0.10.0 | `Done()` is a shutdown-completed signal | closed when the wait group drained, which under dynamic membership could close while services were live | closes when `Stop`/`Run` returns, on every return path |
+| v0.10.0 | `Health()` probes only running services | could probe a `Registered` or `Stopped` entry | only `StatusRunning` entries are probed |
 
-### API added since v0.9.0
+### API added in v0.10.0
 
-These additions are unreleased (`main` will ship them in `v1.0.0`), and none of them renames or
-removes an existing identifier — existing code keeps compiling:
+These additions ship in `v0.10.0`, and none of them renames or removes an existing identifier —
+existing code keeps compiling:
 
 - `ReplaceService`, `UnregisterGroup`, `Orphans()`, `Dependents()`, `DependenciesOf()`,
   `CountRunning()`, and `RunningNames()`.
@@ -1219,7 +1225,7 @@ These compile and run identically but behave differently — the category that b
 compiler error.
 
 - **A stop that times out leaves `StatusStopping`, not `StatusStopped`, and is not counted in
-  `Metrics().Stops`.** Before v0.9.0 a timeout claimed `StatusStopped` even while the service
+  `Metrics().Stops`.** Before v0.10.0 a timeout claimed `StatusStopped` even while the service
   might still be alive.
 - **A self-heal crash now reports `Running -> Crashed` before the restart** (with `OnCrash` and
   the `Crashes` counter), instead of silently restarting.
