@@ -200,9 +200,11 @@ func FuzzMembershipTransitions(f *testing.F) {
 		// the root map holds at least as many owners as the entries collectively
 		// claim. A root count below that sum would mean an entry references an id
 		// the root already forgot: a stale "dead" view that could reject a later
-		// Subscribe.
+		// Subscribe. Both counts come from one atomic snapshot so a half-applied
+		// newOwner in the window between the two maps is never observed as a
+		// false positive.
 		assertOwnerMapsConsistent := func() {
-			root, total := rootOwnerCount(o), totalEntryOwnerCount(o)
+			root, total := ownerMapsConsistentSnapshot(o)
 			if root < total {
 				t.Fatalf("root owner count %d < entry owner sum %d: an entry references an id the root map lost", root, total)
 			}
