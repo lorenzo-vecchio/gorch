@@ -20,8 +20,13 @@ jobs:
             exit 1
           fi
       - run: go vet ./...
+  # The benchmark regression gate (bench.yml) runs only here, at release time:
+  # `publish` waits on it, so a benchmark regression blocks the release instead
+  # of the gate running on every push.
+  bench:
+    uses: ./.github/workflows/bench.yml
   publish:
-    needs: test
+    needs: [test, bench]
     runs-on: ubuntu-latest
     permissions:
       contents: write

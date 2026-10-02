@@ -14,16 +14,18 @@ import (
 // ── Benchmark regression gate ──
 //
 // The numbers in testdata/bench/baseline.txt are the checked-in reference point
-// for the benchmarks in this file. The "Benchmark" CI workflow (bench.yml) uses
+// for the benchmarks in this file. The "Benchmark" workflow (bench.yml) uses
 // them two ways:
 //
 //   - allocations (B/op, allocs/op) are compared directly against the baseline,
 //     since they are machine-independent; and
 //   - sec/op is compared with a large tripwire budget, so a callback that starts
 //     holding an orchestration lock — an order-of-magnitude slowdown — fails CI
-//     even though the baseline was recorded on a different machine. Fine-grained
-//     time regressions are compared against the pull request's base revision in
-//     the same CI job, where the machine is fixed.
+//     even though the baseline was recorded on a different machine.
+//
+// bench.yml is a reusable workflow called by test-and-publish.yml, whose
+// `publish` job waits on it. The comparison therefore runs only when a version
+// tag drives a release, never on every push, and a failure blocks the release.
 //
 // Regenerate the baseline with the CI toolchain and the exact CI command when a
 // change intentionally moves allocations or the tripwire numbers:

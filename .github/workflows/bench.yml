@@ -1,24 +1,25 @@
 name: Benchmark
 
-# Three regression gates over the benchmarks in bench_test.go, all enforced by
+# Two regression gates over the benchmarks in bench_test.go, enforced by
 # cmd/benchgate on `benchstat -format csv` output:
 #
-#   1. Time vs the pull request's base revision, measured in this same job, so
-#      the comparison is machine-independent and only flags a change the PR
-#      itself introduces.
-#   2. A lock-latency tripwire vs the checked-in baseline (testdata/bench): a
+#   1. A lock-latency tripwire vs the checked-in baseline (testdata/bench): a
 #      callback that starts holding an orchestration lock shows up as an
 #      order-of-magnitude slowdown, so the budget is deliberately huge.
-#   3. Allocation regressions vs the checked-in baseline. allocs/op and B/op are
+#   2. Allocation regressions vs the checked-in baseline. allocs/op and B/op are
 #      machine-independent, so this comparison is valid across runners.
+#
+# This is a reusable workflow: test-and-publish.yml calls it on a version tag and
+# its `publish` job waits on it, so the gate runs only at release time — never on
+# pull_request or on pushes to main, where a full run would add ~9 minutes to
+# every push. A failing gate blocks the release. It can still be run on demand
+# via workflow_dispatch.
 #
 # The baseline is refreshed by editing testdata/bench/baseline.txt with the
 # command documented in bench_test.go.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_call:
   workflow_dispatch:
 
 jobs:
@@ -26,8 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version: '1.25'
@@ -35,26 +34,12 @@ jobs:
       - name: Benchmark current revision
         run: go test . -run '^$' -bench . -benchmem -cpu=4 -count=6 > "$RUNNER_TEMP/current.txt"
 
-      - name: Benchmark base revision
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --no-tags origin "${{ github.base_ref }}"
-          base=$(git merge-base HEAD FETCH_HEAD)
-          git worktree add "$RUNNER_TEMP/base" "$base"
-          (cd "$RUNNER_TEMP/base" && go test . -run '^$' -bench . -benchmem -cpu=4 -count=6) > "$RUNNER_TEMP/base.txt"
-
       - name: Install benchstat
         # benchstat needs a Go newer than the module's 1.25 floor, so let the
         # toolchain switch download one; the library itself stays on 1.25.
         env:
           GOTOOLCHAIN: auto
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260929162123-406019bb8b68
-
-      - name: Time regression vs base
-        if: github.event_name == 'pull_request'
-        run: |
-          benchstat -ignore cpu -format csv "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/current.txt" > "$RUNNER_TEMP/time.csv"
-          go run ./cmd/benchgate -threshold 20 -metrics sec/op "$RUNNER_TEMP/time.csv"
 
       - name: Lock-latency tripwire vs checked-in baseline
         run: |
