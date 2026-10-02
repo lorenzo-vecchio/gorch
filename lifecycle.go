@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"sync"
 	"time"
 )
 
@@ -903,3 +905,487 @@ func (o *Orchestrator) handleServiceDone(entry *serviceEntry, sc ServiceContext,
 
 // invokeCron executes a cron-triggered service tick. Concurrency policy is
 // determined by the entry's cronMode.
+
+// Start begins the orchestrator lifecycle. Returns ErrAlreadyStarted if already started.
+// If Start fails, the orchestrator is reset and may be started again (e.g. to retry
+// after a transient dependency failure). The rollback is bounded by
+// WithFailedStartTimeout (default 30s) and shares one budget across every stop and
+// the final wait, so a service that blocks in Stop() cannot hang Start; an overrun
+// is reported as ErrStopTimeout and the reset is best-effort.
+// A persistent service that returns an error synchronously aborts Start only when a
+// start timeout is set; without one its launch is fire-and-forget by construction.
+// The whole-orchestrator lifecycle is single-shot: after a successful Stop it cannot
+// be restarted, and a subsequent Start returns ErrAlreadyStarted. Registering after
+// Stop returns ErrOrchestratorStopped instead.
+// Concurrent Start calls are claimed atomically: the caller that wins the claim runs
+// the start, and every other caller returns ErrAlreadyStarted immediately without
+// waiting for it. A nil return therefore means this call ran the start, not merely
+// that some concurrent Start did.
+// Thread-safe.
+func (o *Orchestrator) Start() error {
+	o.ensureInit()
+	// Claim the lifecycle before entering startOnce. Without the claim a second
+	// caller could pass the o.started pre-check while the winner is still inside
+	// the closure (o.started is published there), block on startOnce.Do, and then
+	// return the startErr local it never wrote — nil — even though it started
+	// nothing (issue #32). startClaimed stays set for the rest of a successful
+	// lifecycle; resetAfterStartFailure releases it on failure so a retry can
+	// claim again.
+	o.mu.Lock()
+	if o.started || o.startClaimed {
+		o.mu.Unlock()
+		return ErrAlreadyStarted
+	}
+	o.startClaimed = true
+	o.mu.Unlock()
+
+	var startErr error
+	// rollbackDeadline bounds the failed-Start cleanup. It is captured at the
+	// moment of failure (not at Start's beginning) so the synchronous startup
+	// work that preceded the failure does not consume the reset budget.
+	var rollbackDeadline time.Time
+	// entries is the graph this Start owns; it is set under o.mu inside the
+	// startOnce closure and reused by resetAfterStartFailure on a failed start.
+	var entries []*serviceEntry
+	o.startOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Only create log channels when using the default (channel-based) logger.
+		var logCh chan logEntry
+		var logQuit chan struct{}
+		var logPumpDone chan struct{}
+		if o.cfg.Logger == nil {
+			logCh = make(chan logEntry, 256)
+			logQuit = make(chan struct{})
+			logPumpDone = make(chan struct{})
+		}
+
+		// Publish the runtime fields and snapshot the graph in one critical
+		// section, before started=true is observable. A concurrent Register
+		// therefore either lands before the snapshot (and is included) or sees a
+		// live orchestrator and appends on the dynamic path under o.mu. Start then
+		// operates only on the snapshot, so it never reads a field a hot
+		// Register is mutating. membershipMu reserves every snapshotted entry
+		// (starting=true) so a StopService/Unregister racing the gap before
+		// startOneService is rejected rather than tearing an entry down mid-start
+		// (D16). The subscription is released by clearStarting once Start's
+		// synchronous work is done.
+		o.membershipMu.Lock()
+		o.mu.Lock()
+		o.started = true
+		// A no-op Stop() before Start() is harmless but consumes stopOnce; clear it
+		// now that a genuine start is under way so the real shutdown is not skipped.
+		o.stopOnce = sync.Once{}
+		o.ctx = ctx
+		o.cancel = cancel
+		o.logCh = logCh
+		o.logQuit = logQuit
+		o.logPumpDone = logPumpDone
+		o.cronSched = newCronScheduler()
+		entries = make([]*serviceEntry, len(o.entries))
+		copy(entries, o.entries)
+		nameIndex := make(map[string]*serviceEntry, len(o.nameIndex))
+		for name, e := range o.nameIndex {
+			nameIndex[name] = e
+		}
+		for _, e := range entries {
+			e.starting.Store(true)
+			// o.cronSched is brand new, so any cron id an entry still holds is
+			// stale (its scheduler was stopped by a failed Start's rollback).
+			// Clear it so setupCron re-schedules every cron entry instead of
+			// treating a dead id as live. This is what reschedules a hot-added
+			// cron survivor, which resetAfterStartFailure's snapshot does not
+			// reach, on the retry.
+			e.cronID = 0
+		}
+		o.mu.Unlock()
+		o.membershipMu.Unlock()
+		defer o.clearStarting(entries)
+
+		// Assign loggers keyed by the service name (WithName or auto "$N"), so
+		// log output correlates with Status/name lookups.
+		for _, entry := range entries {
+			if o.cfg.Logger != nil {
+				entry.setLogger(newServiceLoggerWith(entry.name, o.cfg.Logger))
+			} else {
+				entry.setLogger(newServiceLogger(entry.name, logCh, logQuit, o.cfg.LogLevel))
+			}
+		}
+
+		// Spawn log-pump goroutine (default logger only). Capture the log
+		// destination here, on the Start caller's goroutine, so the pump never
+		// reads the process-global os.Stderr concurrently with a caller that
+		// reassigns it to redirect process logging.
+		if o.cfg.Logger == nil {
+			go o.logPump(os.Stderr, logCh, logQuit, logPumpDone)
+		}
+
+		// Set up and start the cron scheduler.
+		if err := o.setupCron(entries); err != nil {
+			cancel()
+			rollbackDeadline = o.failedStartDeadline()
+			if logQuit != nil {
+				close(logQuit)
+				// Bounded wait: the reset below repeats it and surfaces
+				// ErrStopTimeout if the log-pump is still stuck.
+				_ = o.awaitDone(logPumpDone, rollbackDeadline)
+			}
+			o.cronSched.Stop()
+			startErr = errors.Join(startErr, err)
+			return
+		}
+
+		// Partition: runOnce vs persistent services.
+		var runOnce, persistent []*serviceEntry
+		for _, entry := range entries {
+			if entry.cfg.cronSpec != "" {
+				continue // cron services don't go through Start goroutine
+			}
+			if entry.cfg.runOnce {
+				runOnce = append(runOnce, entry)
+			} else {
+				persistent = append(persistent, entry)
+			}
+		}
+
+		// Phase 1: run runOnce services sequentially (they're gates).
+		for _, entry := range runOnce {
+			if err := o.startOneService(entry); err != nil {
+				startErr = errors.Join(startErr, fmt.Errorf("%s: %w", entry.name, err))
+				// runOnce failure aborts — do not start persistent services.
+				rollbackDeadline = o.failedStartDeadline()
+				startErr = errors.Join(startErr, o.stopStartedServices(entries, rollbackDeadline))
+				return
+			}
+		}
+
+		// Phase 2: persistent services in topological order.
+		levels, topoErr := o.topoSort(persistent)
+		if topoErr != nil {
+			startErr = errors.Join(startErr, topoErr)
+			rollbackDeadline = o.failedStartDeadline()
+			startErr = errors.Join(startErr, o.stopStartedServices(entries, rollbackDeadline))
+			return
+		}
+
+		for _, level := range levels {
+			// Start all services in this level in parallel.
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			var failed map[string]error
+
+			for _, entry := range level {
+				wg.Add(1)
+				go func(e *serviceEntry) {
+					defer wg.Done()
+					// Check if any dependencies failed.
+					for _, dep := range e.cfg.dependsOn {
+						depEntry := nameIndex[dep]
+						o.statusMu.RLock()
+						depStatus := depEntry.status
+						o.statusMu.RUnlock()
+						if depStatus == StatusCrashed || depStatus == StatusStopped {
+							failureMsg := fmt.Sprintf("dependency %s failed or was skipped", dep)
+							mu.Lock()
+							if failed == nil {
+								failed = make(map[string]error)
+							}
+							failed[e.name] = fmt.Errorf("%w: %s", ErrStartAborted, failureMsg)
+							mu.Unlock()
+							o.setStatus(e, StatusStopped)
+							return
+						}
+					}
+					// Soft dependencies: check if registered, skip if missing.
+					for _, dep := range e.cfg.softDependsOn {
+						depEntry, ok := nameIndex[dep]
+						if !ok {
+							continue
+						}
+						o.statusMu.RLock()
+						depStatus := depEntry.status
+						o.statusMu.RUnlock()
+						if depStatus == StatusCrashed || depStatus == StatusStopped {
+							failureMsg := fmt.Sprintf("soft dependency %s failed or was skipped", dep)
+							mu.Lock()
+							if failed == nil {
+								failed = make(map[string]error)
+							}
+							failed[e.name] = fmt.Errorf("%w: %s", ErrStartAborted, failureMsg)
+							mu.Unlock()
+							o.setStatus(e, StatusStopped)
+							return
+						}
+					}
+					if err := o.startOneService(e); err != nil {
+						mu.Lock()
+						if failed == nil {
+							failed = make(map[string]error)
+						}
+						failed[e.name] = err
+						mu.Unlock()
+					}
+				}(entry)
+			}
+			wg.Wait()
+
+			for name, err := range failed {
+				startErr = errors.Join(startErr, fmt.Errorf("%s: %w", name, err))
+			}
+
+			// If any in this level failed, stop all and skip remaining levels.
+			if len(failed) > 0 {
+				rollbackDeadline = o.failedStartDeadline()
+				startErr = errors.Join(startErr, o.stopStartedServices(entries, rollbackDeadline))
+				return
+			}
+		}
+
+		// Start health-check loop.
+		if o.cfg.HealthInterval > 0 {
+			healthCtx, hCancel := context.WithCancel(context.Background())
+			o.healthCancel = hCancel
+			o.healthDone = make(chan struct{})
+			o.wg.Add(1)
+			go o.healthCheckLoop(healthCtx)
+		}
+	})
+	if startErr != nil {
+		startErr = errors.Join(startErr, o.resetAfterStartFailure(entries, rollbackDeadline))
+	}
+	return startErr
+}
+
+// failedStartDeadline computes the deadline for a failed-Start rollback from the
+// configured failedStartTimeout. It returns the zero time.Time when the
+// effective budget is non-positive, meaning the rollback is unbounded.
+func (o *Orchestrator) failedStartDeadline() time.Time {
+	if o.cfg.failedStartTimeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(o.cfg.failedStartTimeout)
+}
+
+// resetAfterStartFailure rolls back all state mutated by a failed Start so the
+// orchestrator can be started again. It resets only the entries that Start
+// snapshotted: a service hot-added while the failing Start ran keeps its
+// registration state and logger. It first waits for all service goroutines and
+// the log-pump to fully wind down (they were signalled by stopStartedServices or
+// the cron-error path); both waits share deadline, and on expiry it joins
+// ErrStopTimeout into the returned error and still performs the reset. The reset
+// is therefore best-effort: a goroutine that ignores cancellation and outlives
+// the failed Start may keep running, but the orchestrator is left restartable so
+// Start can be retried.
+//
+// Each wait that outlives the deadline abandons a goroutine (the wait's helper
+// for the instance group, the log-pump for the log wait); each is logged at
+// Error level and counted once in Metrics().AbandonedGoroutines. The log is
+// attributed to the first snapshotted entry — the wait is orchestrator-wide, so
+// there is no single service to name.
+func (o *Orchestrator) resetAfterStartFailure(entries []*serviceEntry, deadline time.Time) error {
+	var resetErr error
+
+	// Bound the orchestrator-wide wait for instance goroutines. It is
+	// orchestrator-wide, not just the Start snapshot: a StartService that ran
+	// during the failing Start also fed o.wg, so one instance ignoring
+	// cancellation must not hang the reset.
+	var reporter *serviceEntry
+	if len(entries) > 0 {
+		reporter = entries[0]
+	}
+	wgDone := make(chan struct{})
+	go func() {
+		o.wg.Wait()
+		close(wgDone)
+	}()
+	if !o.awaitDone(wgDone, deadline) {
+		o.recordAbandoned(reporter, "abandoning failed-Start wait: instance goroutines did not exit before the deadline")
+		resetErr = errors.Join(resetErr, ErrStopTimeout)
+	}
+	// logPumpDone is nil when a custom Logger is set; awaitDone treats that as
+	// already done.
+	if !o.awaitDone(o.logPumpDone, deadline) {
+		o.recordAbandoned(reporter, "abandoning failed-Start wait: log-pump did not exit before the deadline")
+		resetErr = errors.Join(resetErr, ErrStopTimeout)
+	}
+
+	o.mu.Lock()
+	o.started = false
+	o.startClaimed = false
+	o.stopping = false
+	o.stopped = false
+	o.ctx = nil
+	o.cancel = nil
+	o.cronSched = nil
+	o.logCh = nil
+	o.logQuit = nil
+	o.logPumpDone = nil
+	o.healthCancel = nil
+	o.healthDone = nil
+
+	for _, entry := range entries {
+		// resetEntryLocked is the shared definition of "fresh"; the retry path
+		// additionally drops the logger bound to the failed Start's dead log
+		// channel, which the next Start rebinds anyway.
+		entry.resetEntryLocked()
+		entry.setLogger(nil)
+	}
+	// Reset the once gates in the same critical section as the flags above: a
+	// concurrent Start must not observe the released claim and then find a stale
+	// consumed startOnce (which would run no closure and return nil).
+	o.startOnce = sync.Once{}
+	o.stopOnce = sync.Once{}
+	o.mu.Unlock()
+	return resetErr
+}
+
+// Stop shuts down the orchestrator, bounding the whole shutdown by timeout:
+// every service's before/after-stop hooks and Stop() call, plus the wait for
+// goroutines to exit, share the one budget. Returns aggregated errors from all
+// Stop failures, or ErrStopTimeout if the deadline is exceeded.
+// Thread-safe. Safe to call on an orchestrator that was never started (no-op).
+// The whole-orchestrator lifecycle is single-shot: after a successful Stop it
+// cannot be restarted, and a subsequent Start returns ErrAlreadyStarted.
+// Registering after Stop returns ErrOrchestratorStopped instead.
+func (o *Orchestrator) Stop(timeout time.Duration) error {
+	o.ensureInit()
+	var stopErr error
+	o.stopOnce.Do(func() {
+		// Done is a shutdown-completed signal: it closes when this Stop returns,
+		// on every path (including the never-started no-op below and a Stop that
+		// timed out). It deliberately does not wait on o.wg, which a live hot add
+		// or restart reuses and which a timed-out Stop may leave non-zero.
+		defer o.signalShutdownDone()
+
+		o.mu.RLock()
+		if !o.started {
+			o.mu.RUnlock()
+			return
+		}
+		o.mu.RUnlock()
+
+		// Mark shutdown as in progress so dynamic membership ops are rejected
+		// while Stop tears the graph down (C6).
+		o.mu.Lock()
+		o.stopping = true
+		o.mu.Unlock()
+
+		// One deadline for the whole shutdown: the per-service stop sequence and
+		// the final wait share it, so a blocking hook cannot outlast the caller.
+		var stopDeadline time.Time
+		if timeout > 0 {
+			stopDeadline = time.Now().Add(timeout)
+		}
+
+		// Stop health-check loop.
+		if o.healthCancel != nil {
+			o.healthCancel()
+			<-o.healthDone // wait for health loop goroutine to exit before touching logCh
+		}
+
+		// 1. Cancel context to signal all services.
+		o.cancel()
+
+		// 2. Stop cron scheduler (waits for in-flight cron jobs).
+		if o.cronSched != nil {
+			<-o.cronSched.Stop().Done()
+		}
+
+		// 3. Call Stop() on services in reverse topological order. Each stop is
+		// recorded so its terminal status can be committed only after the final
+		// wait proves every instance goroutine exited.
+		type pendingStop struct {
+			entry     *serviceEntry
+			wasActive bool
+			completed bool
+		}
+		var pending []pendingStop
+		stopOne := func(entry *serviceEntry) {
+			wasActive, completed, err := o.stopOneServiceDeadline(entry, stopDeadline)
+			pending = append(pending, pendingStop{entry: entry, wasActive: wasActive, completed: completed})
+			if err != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("%s: %w", entry.name, err))
+			}
+		}
+		// The persistent and non-persistent sets are complements
+		// (persistentEntries vs nonPersistentEntries), so the reverse-topological
+		// pass and the remaining pass are disjoint and every entry is stopped
+		// exactly once. Both take their snapshot under o.mu before iterating, so a
+		// concurrent membership op cannot mutate the slice mid-read and no user
+		// code (hook or Stop) runs while the lock is held.
+		persistent := o.persistentEntries()
+		levels, topoErr := o.topoSortForStop(persistent)
+		// A cyclic subset still stops every persistent entry (registration-order
+		// fallback); surface the ordering failure rather than leaving them running.
+		stopErr = errors.Join(stopErr, topoErr)
+		for i := len(levels) - 1; i >= 0; i-- {
+			for _, entry := range levels[i] {
+				stopOne(entry)
+			}
+		}
+		// Cron-only and runOnce entries were excluded from the persistent snapshot
+		// above, so this pass completes the teardown without overlapping it.
+		for _, entry := range o.nonPersistentEntries() {
+			stopOne(entry)
+		}
+
+		// 4. Signal log-pump to drain and exit.
+		if o.logQuit != nil {
+			close(o.logQuit)
+		}
+
+		// 5. Clean up messenger subscriptions.
+		o.messenger.Drain()
+
+		// 6. Wait for all services + log-pump with whatever budget is left. A
+		// non-positive timeout waits indefinitely. Only once every goroutine has
+		// exited is the stop verified and its terminal status committed; on a
+		// timeout the entries stay StatusStopping rather than falsely claiming
+		// they stopped.
+		done := make(chan struct{})
+		go func() {
+			o.wg.Wait()
+			if o.logPumpDone != nil {
+				<-o.logPumpDone
+			}
+			close(done)
+		}()
+		allDone := false
+		if stopDeadline.IsZero() {
+			<-done
+			allDone = true
+		} else {
+			remaining := max(time.Until(stopDeadline), 0)
+			select {
+			case <-done:
+				allDone = true
+			case <-time.After(remaining):
+				// The final-wait helper is abandoned: it is neither counted nor
+				// logged anywhere else, so account for it here rather than
+				// under-reporting the leak this metric exists to expose. The
+				// wait is orchestrator-wide, so attribute the log to a stopped
+				// entry when one exists. Counted exactly once, monotonic.
+				var reporter *serviceEntry
+				if len(pending) > 0 {
+					reporter = pending[0].entry
+				}
+				o.recordAbandoned(reporter, "abandoning final wait: instance goroutines or the log-pump did not exit before the stop deadline")
+				stopErr = errors.Join(stopErr, ErrStopTimeout)
+			}
+		}
+		if allDone {
+			for _, p := range pending {
+				if p.completed {
+					o.finishStop(p.entry, p.wasActive)
+				}
+			}
+		}
+
+		// Shutdown is complete: persist the terminal flag so later membership
+		// ops report ErrOrchestratorStopped rather than ErrOrchestratorStopping.
+		o.mu.Lock()
+		o.stopping = false
+		o.stopped = true
+		o.mu.Unlock()
+	})
+	return stopErr
+}
