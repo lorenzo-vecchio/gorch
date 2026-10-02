@@ -99,8 +99,11 @@ These guarantees are part of the public API and are relied upon by callers.
   in-flight cron ticks are then awaited until they exit. A tick abandoned for
   outliving the deadline still has its subscriptions released: teardown drains
   every live owner id of the entry, so the release its abandoned goroutine skips
-  cannot leak the id. Owner ids are monotonic and never reused, so a drained id
-  is never minted into a later view. `Unregister` also drops
+  cannot leak the id. The failed-`Start` rollback drains the same way, so an
+  instance that ignores cancellation and outlives the rollback budget does not
+  leak its owner id (or its subscriptions) across retries. Owner ids are
+  monotonic and never reused, so a drained id is never minted into a later view.
+  `Unregister` also drops
   the cron schedule and discards the entry's per-instance state — instance and
   teardown contexts, exit channel, retry/health counters, stability window,
   liveness/accounting flags, owner ids, and cron accounting — from both the

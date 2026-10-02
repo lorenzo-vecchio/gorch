@@ -323,6 +323,113 @@ func TestCronTick_AbandonedMidFlight_OwnersDrained(t *testing.T) {
 	}
 }
 
+// abandonStartSvc subscribes and then blocks in Start, ignoring context
+// cancellation, so a failed-Start rollback abandons it with a live owner. Each
+// instance signals the test just before returning, after the test has released
+// it.
+type abandonStartSvc struct {
+	release  chan struct{}
+	subs     chan (<-chan any)
+	returned chan struct{}
+}
+
+func (s *abandonStartSvc) Start(ctx ServiceContext) error {
+	ch, _ := ctx.Messenger.Subscribe("t")
+	s.subs <- ch
+	<-s.release
+	s.returned <- struct{}{}
+	return errors.New("abandoned instance exited")
+}
+
+func (s *abandonStartSvc) Stop() error { return nil }
+
+// TestFailedStart_AbandonedInstance_OwnersDrained pins the failed-Start owner
+// obligation: a service that ignores cancellation and outlives
+// WithFailedStartTimeout never runs its deferred releaseOwner, yet after the
+// failed Start both owner maps must be back to baseline even though the
+// instance goroutine is still alive. Because a failed Start is retryable, the
+// same failed Start is repeated: no attempt may accumulate an owner id or leave
+// a subscription registered. The instances are then released to prove their own
+// deferred release stays a harmless no-op on an already-drained owner.
+func TestFailedStart_AbandonedInstance_OwnersDrained(t *testing.T) {
+	const attempts = 3
+	o := New(WithHealthChecksDisabled(), WithFailedStartTimeout(60*time.Millisecond))
+
+	release := make(chan struct{})
+	released := false
+	subs := make(chan (<-chan any), attempts)
+	returned := make(chan struct{}, attempts)
+	stubborn := &abandonStartSvc{release: release, subs: subs, returned: returned}
+	if err := o.Register(stubborn, WithName("stubborn")); err != nil {
+		t.Fatal(err)
+	}
+	// The gate starts only after stubborn (its hard dependency) and fails before
+	// its Start runs, forcing the rollback of the already-running stubborn.
+	if err := o.Register(&testSvc{startFn: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }},
+		WithName("gate"), DependsOn("stubborn"),
+		WithOnBeforeStart(func(string) error { return errors.New("gate closed") })); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+	})
+
+	entry := entryNamed(t, o, "stubborn")
+	if got := rootOwnerCount(o); got != 0 {
+		t.Fatalf("baseline root owners = %d, want 0", got)
+	}
+
+	for i := 0; i < attempts; i++ {
+		err := o.Start()
+		if !errors.Is(err, ErrStopTimeout) {
+			t.Fatalf("attempt %d: Start = %v, want ErrStopTimeout from the abandoned-instance wait", i, err)
+		}
+		// The instance is still blocked, so its own deferred releaseOwner has not
+		// run: only the rollback's drain can have cleared the maps.
+		if n := len(returned); n != 0 {
+			t.Fatalf("attempt %d: %d stubborn instance(s) returned; the rollback should have abandoned them", i, n)
+		}
+		if got := rootOwnerCount(o); got != 0 {
+			t.Fatalf("attempt %d: root owners = %d after failed Start, want 0", i, got)
+		}
+		if ids := entryOwnerIDs(entry); len(ids) != 0 {
+			t.Fatalf("attempt %d: entry owners = %v after failed Start, want none", i, ids)
+		}
+		// The drained owner's subscription must be dead: the abandoned instance
+		// can neither receive a later publish nor resubscribe on its view.
+		ch := <-subs
+		o.messenger.Publish("v", "t")
+		select {
+		case _, ok := <-ch:
+			if ok {
+				t.Fatalf("attempt %d: the abandoned instance's subscription was not drained", i)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d: the drained subscription was neither closed nor delivered", i)
+		}
+	}
+
+	// Releasing the instances lets their deferred releaseOwner run; it must be a
+	// no-op that does not resurrect a drained owner.
+	close(release)
+	released = true
+	for i := 0; i < attempts; i++ {
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatalf("abandoned instance %d did not unwind after release", i)
+		}
+	}
+	if got := rootOwnerCount(o); got != 0 {
+		t.Fatalf("root owners = %d after the abandoned instances unwound, want 0", got)
+	}
+	if ids := entryOwnerIDs(entry); len(ids) != 0 {
+		t.Fatalf("entry owners = %v after the abandoned instances unwound, want none", ids)
+	}
+}
+
 // TestOwners_DrainedOwnerCannotResubscribe asserts, per owner, the v0.8.0
 // guarantee: once an owner is drained its scoped view gets an already-closed
 // channel for Subscribe and an error for Request, so a surviving goroutine
