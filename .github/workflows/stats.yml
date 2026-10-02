@@ -1,0 +1,131 @@
+name: Stats
+
+# Refresh the release statistics the README renders: statement coverage and the
+# line counts (library / tests / benchmarks / tooling / examples / total). The
+# stats job runs on a new tag (or a manual dispatch) only, so the published
+# numbers always describe a released revision and never a work-in-progress main
+# — and because the release label is stamped into both outputs, a failed run
+# leaves the README naming the *previous* release rather than claiming numbers
+# it does not have.
+#
+# Two outputs, written by the same job:
+#   1. .github/badges/*.json — Shields "endpoint" badges. The README embeds the
+#      URL, never the number, so no manual edit is needed per release.
+#   2. The marker-delimited block in README.md — the LOC breakdown, which has
+#      five categories plus a total and does not fit legibly in a badge.
+#
+# Counts come from cloc, which splits code / comment / blank: in this module the
+# doc comments are part of the contract, so they are reported rather than
+# silently folded into a single "lines" number. Every cloc run is scoped to Go
+# so the buckets partition the repository's Go lines exactly; the exhaustiveness
+# check fails the run if a Go file stops being claimed by a bucket.
+#
+# The renderer tests run on pull requests that touch the renderer, this
+# workflow, or README.md — not just at release time: a regression that would
+# corrupt README.md must be caught before it is merged, and the stats job
+# depends on that green result.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/stats.yml'
+      - 'README.md'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release label to stamp (e.g. v0.9.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  renderer-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test the stats renderer
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+  stats:
+    needs: renderer-tests
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main        # the tag is immutable; the stats live on main
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+
+      - name: Resolve release label
+        id: rel
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            label="${GITHUB_REF_NAME}"
+          else
+            label="${{ inputs.release }}"
+          fi
+          echo "label=${label}" >> "$GITHUB_OUTPUT"
+
+      - name: Statement coverage
+        id: cov
+        run: |
+          go test . -race -count=1 -shuffle=on -coverprofile=coverage.out
+          total=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "total=${total}" >> "$GITHUB_OUTPUT"
+
+      # One cloc run per bucket, so the buckets are disjoint by construction.
+      # cmd/ and internal/ are tooling (the bench gate), not the library;
+      # examples/ is reported as its own row and counted in the total.
+      - name: Line counts (cloc)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloc
+          cloc --quiet --json --include-lang=Go --not-match-f='_test\.go$' \
+               --exclude-dir=examples,testdata,cmd,internal .       > /tmp/lib.json
+          cloc --quiet --json --include-lang=Go --match-f='_test\.go$' --not-match-f='bench_test\.go$' \
+               --exclude-dir=examples,testdata,cmd,internal .       > /tmp/test.json
+          cloc --quiet --json --include-lang=Go bench_test.go       > /tmp/bench.json
+          cloc --quiet --json --include-lang=Go cmd internal        > /tmp/tool.json
+          cloc --quiet --json --include-lang=Go examples            > /tmp/examples.json
+
+      # The six figures must account for every Go line in the repository, or the
+      # total under-reports. This fails the job when a new top-level directory
+      # grows Go code that no bucket claims.
+      - name: Exhaustiveness check
+        run: |
+          cloc --quiet --json --include-lang=Go --exclude-dir=testdata,.codegraph,.git . > /tmp/all.json
+          all=$(jq -r '.SUM.code // 0' /tmp/all.json)
+          sum=$(jq -s 'map(.SUM.code // 0) | add' \
+                  /tmp/lib.json /tmp/test.json /tmp/bench.json \
+                  /tmp/tool.json /tmp/examples.json)
+          if [ "$all" != "$sum" ]; then
+            echo "bucket sum $sum != repository total $all: a Go file is not counted"
+            exit 1
+          fi
+
+      - name: Render badges and README block
+        env:
+          LABEL: ${{ steps.rel.outputs.label }}
+          TOTAL: ${{ steps.cov.outputs.total }}
+        run: python3 .github/scripts/stats.py
+
+      - name: Commit
+        env:
+          LABEL: ${{ steps.rel.outputs.label }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/badges README.md
+          git diff --cached --quiet && { echo "stats unchanged"; exit 0; }
+          git commit -m "chore(stats): refresh release statistics for ${LABEL} [skip ci]"
+          git push
