@@ -1626,8 +1626,13 @@ func TestTearDown_BusyReservation(t *testing.T) {
 	}
 }
 
-func TestStartService_RemovingRejected(t *testing.T) {
-	o := New()
+// TestStartService_RemovingIsBusy pins the classification of a start that
+// collides with an in-flight teardown: while the entry is still registered the
+// collision is the transient ErrMembershipBusy (the caller polls Busy and
+// retries), not ErrServiceNotFound. Only once it is actually Unregistered does
+// the name become not-found.
+func TestStartService_RemovingIsBusy(t *testing.T) {
+	o := New(WithHealthChecksDisabled())
 	if err := o.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -1635,14 +1640,23 @@ func TestStartService_RemovingRejected(t *testing.T) {
 	if err := o.Register(&namedSvc{}, WithName("x")); err != nil {
 		t.Fatal(err)
 	}
-	o.mu.Lock()
-	entry := o.nameIndex["x"]
-	o.mu.Unlock()
+	entry := entryNamed(t, o, "x")
 
 	entry.removing.Store(true)
-	defer entry.removing.Store(false)
+	err := o.StartService("x")
+	entry.removing.Store(false)
+	if !errors.Is(err, ErrMembershipBusy) {
+		t.Fatalf("StartService on a removing entry = %v, want ErrMembershipBusy", err)
+	}
+	if errors.Is(err, ErrServiceNotFound) {
+		t.Fatalf("StartService on a removing (still registered) entry = %v, must not be ErrServiceNotFound", err)
+	}
+
+	if err := o.Unregister("x", time.Second); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
 	if err := o.StartService("x"); !errors.Is(err, ErrServiceNotFound) {
-		t.Errorf("StartService on removing entry = %v, want ErrServiceNotFound", err)
+		t.Fatalf("StartService after Unregister = %v, want ErrServiceNotFound", err)
 	}
 }
 

@@ -867,17 +867,27 @@ func (o *Orchestrator) lookupEntry(name string) *serviceEntry {
 }
 
 // Busy reports whether the named service is registered and currently holds an
-// in-flight membership reservation: a Start is running, a Stop is tearing it
-// down, or a group operation has reserved it. It is the predicate a caller can
-// poll to decide whether StartService/StopService/Unregister would be rejected
-// with the transient ErrMembershipBusy, instead of racing and retrying blind. It
-// returns false for an unknown name and for a registered but idle entry.
+// in-flight membership reservation: a start transaction is running, a teardown
+// is running, or a group operation has reserved it. It is the predicate a caller
+// can poll to decide whether StartService/StopService/Unregister/ReplaceService
+// would be rejected with the transient ErrMembershipBusy, instead of racing and
+// retrying blind. It returns false for an unknown name and for a registered but
+// idle entry.
 //
 // Busy is the observable for the reservation, which Status/Statuses do not
 // encode: a reserved entry still reports its prior lifecycle status (typically
 // StatusRegistered) until startOneService commits StatusStarting. That window is
 // the answer to "is anything in flight?" — Statuses reports what the entry is,
 // Busy reports that a membership operation has claimed it.
+//
+// The reservation is the membership transaction, not a service's own callback.
+// Once a persistent service's instance is spawned the transaction is complete,
+// the entry is StatusRunning and Busy is false for the rest of the instance's
+// lifetime — even while its user Start still runs. A cron entry never holds a
+// reservation while its schedule is installed, so a tick in flight does not make
+// it busy. In both cases a stop is an ordinary stop, not a reservation
+// collision; a membership op re-entered from the entry's own Start/Stop is
+// instead the permanent ErrReentrantMembership.
 // Thread-safe.
 func (o *Orchestrator) Busy(name string) bool {
 	o.ensureInit()
