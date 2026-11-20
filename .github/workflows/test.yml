@@ -20,7 +20,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'dokploy' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
